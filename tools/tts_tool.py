@@ -60,7 +60,8 @@ except ImportError:
 # Defaults
 # ===========================================================================
 DEFAULT_PROVIDER = "edge"
-DEFAULT_EDGE_VOICE = "en-US-AriaNeural"
+DEFAULT_EDGE_VOICE = "en-US-AvaMultilingualNeural"
+DEFAULT_EDGE_RATE = "125%"
 DEFAULT_ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # Adam
 DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts"
@@ -144,8 +145,17 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
     """
     edge_config = tts_config.get("edge", {})
     voice = edge_config.get("voice", DEFAULT_EDGE_VOICE)
+    rate = str(edge_config.get("rate", DEFAULT_EDGE_RATE)).strip()
+    # Edge TTS expects relative rates like "+25%". Accept "125%" in config
+    # as a user-friendly absolute speed and convert it to relative form.
+    if rate.endswith("%") and not rate.startswith(("+", "-")):
+        try:
+            rate_num = float(rate[:-1])
+            rate = f"{rate_num - 100:+g}%"
+        except ValueError:
+            rate = "+25%"
 
-    communicate = edge_tts.Communicate(text, voice)
+    communicate = edge_tts.Communicate(text, voice, rate=rate)
     await communicate.save(output_path)
     return output_path
 

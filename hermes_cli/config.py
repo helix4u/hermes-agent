@@ -90,8 +90,9 @@ DEFAULT_CONFIG = {
     "tts": {
         "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai"
         "edge": {
-            "voice": "en-US-AriaNeural",
-            # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
+            "voice": "en-US-AvaMultilingualNeural",
+            "rate": "125%",
+            # Popular: AvaMultilingualNeural, AriaNeural, JennyNeural
         },
         "elevenlabs": {
             "voice_id": "pNInz6obpgDQGcFmaJgB",  # Adam

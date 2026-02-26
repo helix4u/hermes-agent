@@ -633,7 +633,8 @@ On Telegram, audio plays as native voice bubbles (the round, inline-playable kin
 tts:
   provider: "edge"              # "edge" | "elevenlabs" | "openai"
   edge:
-    voice: "en-US-AriaNeural"   # 322 voices, 74 languages
+    voice: "en-US-AvaMultilingualNeural"
+    rate: "125%"
   elevenlabs:
     voice_id: "pNInz6obpgDQGcFmaJgB"  # Adam
     model_id: "eleven_multilingual_v2"
