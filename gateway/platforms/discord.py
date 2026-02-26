@@ -65,8 +65,10 @@ class DiscordAdapter(BasePlatformAdapter):
     - Reaction-based feedback
     """
     
-    # Discord limits: 4096 characters per embed description
-    MAX_EMBED_DESCRIPTION = 4096
+    # Keep slightly below Discord's embed description hard limit for safety.
+    MAX_EMBED_DESCRIPTION = 4000
+    CHAIN_SEND_DELAY_SECONDS = 0.5
+    CHAIN_SEND_MAX_RETRIES = 5
     
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
@@ -343,13 +345,60 @@ class DiscordAdapter(BasePlatformAdapter):
             
             for i, chunk in enumerate(chunks):
                 embed = discord.Embed(description=chunk)
+                # Attach listen controls to every chunk so each embed remains
+                # independently actionable in long chained responses.
                 view = ListenButtonView(self)
-                msg = await channel.send(
-                    embed=embed,
-                    view=view,
-                    reference=reference if i == 0 else None,
-                )
-                message_ids.append(str(msg.id))
+
+                last_err: Optional[Exception] = None
+                for attempt in range(1, self.CHAIN_SEND_MAX_RETRIES + 1):
+                    try:
+                        msg = await channel.send(
+                            embed=embed,
+                            view=view,
+                            reference=reference if i == 0 else None,
+                        )
+                        message_ids.append(str(msg.id))
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        status = getattr(e, "status", None)
+                        code = getattr(e, "code", None)
+                        retry_after = getattr(e, "retry_after", None)
+                        response_obj = getattr(e, "response", None)
+                        if retry_after is None and response_obj is not None:
+                            try:
+                                header_val = response_obj.headers.get("Retry-After")
+                                retry_after = float(header_val) if header_val else None
+                            except Exception:
+                                retry_after = None
+
+                        logger.warning(
+                            "[discord] chunk send failed (%d/%d, chunk %d/%d, len=%d, status=%s, code=%s, retry_after=%s): %s",
+                            attempt,
+                            self.CHAIN_SEND_MAX_RETRIES,
+                            i + 1,
+                            len(chunks),
+                            len(chunk),
+                            status,
+                            code,
+                            retry_after,
+                            e,
+                        )
+                        if attempt < self.CHAIN_SEND_MAX_RETRIES:
+                            # Respect Discord/API-provided backoff when present (429).
+                            if retry_after is not None:
+                                delay = max(float(retry_after), self.CHAIN_SEND_DELAY_SECONDS)
+                            else:
+                                delay = self.CHAIN_SEND_DELAY_SECONDS * attempt
+                            await asyncio.sleep(delay)
+
+                if last_err is not None:
+                    raise last_err
+
+                # Add slight pacing between chained sends to reduce burst failures.
+                if i < (len(chunks) - 1):
+                    await asyncio.sleep(self.CHAIN_SEND_DELAY_SECONDS)
             
             return SendResult(
                 success=True,
@@ -358,6 +407,11 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
         except Exception as e:
+            logger.exception(
+                "[discord] send failed chat_id=%s content_len=%d",
+                chat_id,
+                len(content or ""),
+            )
             return SendResult(success=False, error=str(e))
 
     async def edit_message(self, chat_id: str, message_id: str, content: str) -> None:

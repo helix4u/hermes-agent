@@ -1464,6 +1464,7 @@ All variables go in `~/.hermes/.env`. Run `hermes config set VAR value` to set t
 | Variable | Description |
 |----------|-------------|
 | `HERMES_MAX_ITERATIONS` | Max tool-calling iterations per conversation (default: 60) |
+| `HERMES_MAX_TOKENS` | Max output tokens per gateway response (default: 32768 when unset; set `0` to use provider/model default) |
 | `HERMES_TOOL_PROGRESS` | Send progress messages when using tools (`true`/`false`) |
 | `HERMES_TOOL_PROGRESS_MODE` | `all` (every call, default) or `new` (only when tool changes) |
 

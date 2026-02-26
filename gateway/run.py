@@ -935,7 +935,8 @@ class GatewayRunner:
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
         args = event.get_command_args().strip().lower()
-        
+
+        config = {}
         try:
             import yaml
             config_path = Path.home() / '.hermes' / 'config.yaml'
@@ -960,7 +961,30 @@ class GatewayRunner:
             return "\n".join(lines)
         
         if args in personalities:
-            os.environ["HERMES_PERSONALITY"] = personalities[args]
+            selected_prompt = personalities[args]
+            # Backward-compatible legacy env var (not read by current runtime).
+            os.environ["HERMES_PERSONALITY"] = selected_prompt
+            # Runtime-consumed ephemeral prompt env var.
+            os.environ["HERMES_EPHEMERAL_SYSTEM_PROMPT"] = selected_prompt
+            # Keep current GatewayRunner instance in sync immediately.
+            self._ephemeral_system_prompt = selected_prompt
+
+            # Persist as agent.system_prompt so restarts keep the selected personality.
+            try:
+                import yaml
+                config_path = Path.home() / '.hermes' / 'config.yaml'
+                if config_path.exists():
+                    with open(config_path, 'r') as f:
+                        persisted = yaml.safe_load(f) or {}
+                else:
+                    persisted = {}
+                persisted.setdefault("agent", {})
+                persisted["agent"]["system_prompt"] = selected_prompt
+                with open(config_path, 'w') as f:
+                    yaml.dump(persisted, f, default_flow_style=False)
+            except Exception as e:
+                logger.warning("Failed to persist selected personality prompt: %s", e)
+
             return f"🎭 Personality set to **{args}**\n_(takes effect on next message)_"
         
         available = ", ".join(f"`{n}`" for n in personalities.keys())
@@ -1459,6 +1483,16 @@ class GatewayRunner:
 
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "60"))
+            max_tokens_env = os.getenv("HERMES_MAX_TOKENS", "").strip()
+            if max_tokens_env == "0":
+                max_tokens = None  # use model default
+            elif max_tokens_env:
+                max_tokens = int(max_tokens_env)
+            else:
+                max_tokens = 32768
+            # Default 32768 when unset so long replies aren't cut off when the model
+            # uses reasoning/thinking (which consumes tokens). Set HERMES_MAX_TOKENS=0
+            # to use the model default; set to a number (e.g. 8192, 32768) to override.
             
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
@@ -1472,6 +1506,7 @@ class GatewayRunner:
             agent = AIAgent(
                 model=_resolve_gateway_model(),
                 max_iterations=max_iterations,
+                max_tokens=max_tokens,
                 quiet_mode=True,
                 enabled_toolsets=enabled_toolsets,
                 ephemeral_system_prompt=combined_ephemeral or None,

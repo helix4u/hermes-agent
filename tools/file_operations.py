@@ -398,6 +398,13 @@ class ShellFileOperations(FileOperations):
             if os.path.exists(candidate):
                 return candidate
         return candidates[0] if candidates else os.path.normpath(expanded)
+
+    def _is_windows_local_backend(self) -> bool:
+        """True when running on Windows host with local backend file access."""
+        if os.name != "nt":
+            return False
+        module_name = getattr(self.env.__class__, "__module__", "")
+        return module_name.endswith(".local")
     
     def _escape_shell_arg(self, arg: str) -> str:
         """Escape a string for safe use in shell commands."""
@@ -743,6 +750,11 @@ class ShellFileOperations(FileOperations):
         Returns:
             WriteResult with bytes written or error
         """
+        # Windows local backend: avoid shell aliases (cat/Get-Content) and
+        # write directly with Python file APIs.
+        if self._is_windows_local_backend():
+            return self._write_file_windows(path, content)
+
         # Expand ~ and other shell paths
         path = self._expand_path(path)
         
@@ -777,6 +789,25 @@ class ShellFileOperations(FileOperations):
             bytes_written=bytes_written,
             dirs_created=dirs_created
         )
+
+    def _write_file_windows(self, path: str, content: str) -> WriteResult:
+        """Windows-native file write path for local backend."""
+        try:
+            resolved = self._resolve_windows_path(path)
+            parent = os.path.dirname(resolved)
+            dirs_created = False
+            if parent and not os.path.exists(parent):
+                os.makedirs(parent, exist_ok=True)
+                dirs_created = True
+
+            with open(resolved, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+                f.flush()
+
+            bytes_written = os.path.getsize(resolved)
+            return WriteResult(bytes_written=bytes_written, dirs_created=dirs_created)
+        except Exception as e:
+            return WriteResult(error=f"Failed to write file: {type(e).__name__}: {e}")
     
     # =========================================================================
     # PATCH Implementation (Replace Mode)

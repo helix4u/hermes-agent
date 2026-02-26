@@ -192,10 +192,11 @@ def build_local_subprocess_invocation(
     if work_dir:
         cmd_dir = to_windows_path(work_dir)
         cmd_command = f'cd /d "{cmd_dir}" && {command}'
+    comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe") or "cmd.exe"
     return (
-        cmd_command,
+        [comspec, "/d", "/s", "/c", cmd_command],
         {
-            "shell": True,
+            "shell": False,
             "creationflags": creationflags,
         },
         mode,

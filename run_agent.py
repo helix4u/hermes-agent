@@ -439,28 +439,6 @@ class AIAgent:
             else:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
     
-    def _has_content_after_think_block(self, content: str) -> bool:
-        """
-        Check if content has actual text after any <think></think> blocks.
-        
-        This detects cases where the model only outputs reasoning but no actual
-        response, which indicates an incomplete generation that should be retried.
-        
-        Args:
-            content: The assistant message content to check
-            
-        Returns:
-            True if there's meaningful content after think blocks, False otherwise
-        """
-        if not content:
-            return False
-        
-        # Remove all <think>...</think> blocks (including nested ones, non-greedy)
-        cleaned = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
-        
-        # Check if there's any non-whitespace content remaining
-        return bool(cleaned.strip())
-    
     def _strip_think_blocks(self, content: str) -> str:
         """Remove <think>...</think> blocks from content, returning only visible text."""
         if not content:
@@ -2285,7 +2263,7 @@ class AIAgent:
                     # answer and calls memory/skill tools as a side-effect in the same
                     # turn. If the follow-up turn after tools is empty, we use this.
                     turn_content = assistant_message.content or ""
-                    if turn_content and self._has_content_after_think_block(turn_content):
+                    if turn_content and turn_content.strip():
                         self._last_content_with_tools = turn_content
                         # Show intermediate commentary so the user can follow along
                         if self.quiet_mode:
@@ -2316,17 +2294,16 @@ class AIAgent:
                     # No tool calls - this is the final response
                     final_response = assistant_message.content or ""
                     
-                    # Check if response only has think block with no actual content after it
-                    if not self._has_content_after_think_block(final_response):
+                    # Retry only when the model returned truly empty content.
+                    if not final_response.strip():
                         # Track retries for empty-after-think responses
                         if not hasattr(self, '_empty_content_retries'):
                             self._empty_content_retries = 0
                         self._empty_content_retries += 1
                         
-                        # Show the reasoning/thinking content so the user can see
-                        # what the model was thinking even though content is empty
+                        # Show any reasoning/thinking content for debugging context.
                         reasoning_text = self._extract_reasoning(assistant_message)
-                        print(f"{self.log_prefix}⚠️  Response only contains think block with no content after it")
+                        print(f"{self.log_prefix}⚠️  Response content was empty")
                         if reasoning_text:
                             reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
                             print(f"{self.log_prefix}   Reasoning: {reasoning_preview}")
