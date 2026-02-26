@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
@@ -33,16 +34,28 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
+def _ensure_utf8_stdio():
+    """Best-effort UTF-8 stdout/stderr on Windows to avoid print crashes."""
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+_ensure_utf8_stdio()
+
 # Load .env file
-from dotenv import load_dotenv
+from agent.env_loader import load_dotenv_with_fallback, read_env_text_with_fallback
 env_path = PROJECT_ROOT / '.env'
 if env_path.exists():
     try:
-        load_dotenv(dotenv_path=env_path, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(dotenv_path=env_path, encoding="latin-1")
-
-import logging
+        load_dotenv_with_fallback(env_path, logger=logging.getLogger(__name__))
+    except ValueError as exc:
+        print(f"Failed to load {env_path}: {exc}", file=sys.stderr)
+        sys.exit(2)
 
 from hermes_cli import __version__
 from hermes_constants import OPENROUTER_BASE_URL
@@ -62,7 +75,8 @@ def _has_any_provider_configured() -> bool:
     env_file = get_env_path()
     if env_file.exists():
         try:
-            for line in env_file.read_text().splitlines():
+            content, _ = read_env_text_with_fallback(env_file)
+            for line in content.splitlines():
                 line = line.strip()
                 if line.startswith("#") or "=" not in line:
                     continue
@@ -234,7 +248,7 @@ def _prompt_provider_choice(choices):
         idx = menu.show()
         print()
         return idx
-    except (ImportError, NotImplementedError):
+    except ImportError:
         pass
 
     # Fallback: numbered list

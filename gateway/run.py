@@ -29,15 +29,26 @@ from typing import Dict, Optional, Any, List
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Load environment variables from ~/.hermes/.env first
-from dotenv import load_dotenv
+from agent.env_loader import load_dotenv_with_fallback
 _env_path = Path.home() / '.hermes' / '.env'
 if _env_path.exists():
     try:
-        load_dotenv(_env_path, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(_env_path, encoding="latin-1")
+        load_dotenv_with_fallback(_env_path, logger=logging.getLogger(__name__))
+    except ValueError as exc:
+        print(f"Failed to load {_env_path}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 # Also try project .env as fallback
-load_dotenv()
+_project_env = Path(__file__).parent.parent / '.env'
+if _project_env.exists():
+    try:
+        load_dotenv_with_fallback(
+            _project_env,
+            override=False,
+            logger=logging.getLogger(__name__),
+        )
+    except ValueError as exc:
+        print(f"Failed to load {_project_env}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # Values already set in the environment (from .env or shell) take precedence.
@@ -276,11 +287,11 @@ class GatewayRunner:
                 if success:
                     self.adapters[platform] = adapter
                     connected_count += 1
-                    logger.info("✓ %s connected", platform.value)
+                    logger.info("ok: %s connected", platform.value)
                 else:
-                    logger.warning("✗ %s failed to connect", platform.value)
+                    logger.warning("x: %s failed to connect", platform.value)
             except Exception as e:
-                logger.error("✗ %s error: %s", platform.value, e)
+                logger.error("x: %s error: %s", platform.value, e)
         
         if connected_count == 0:
             logger.warning("No messaging platforms connected.")
@@ -323,9 +334,9 @@ class GatewayRunner:
         for platform, adapter in self.adapters.items():
             try:
                 await adapter.disconnect()
-                logger.info("✓ %s disconnected", platform.value)
+                logger.info("%s disconnected", platform.value)
             except Exception as e:
-                logger.error("✗ %s disconnect error: %s", platform.value, e)
+                logger.error("%s disconnect error: %s", platform.value, e)
         
         self.adapters.clear()
         self._shutdown_event.set()
@@ -444,9 +455,24 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+        logger.info(
+            "Gateway message received: platform=%s chat_type=%s chat_id=%s user_id=%s text_len=%s",
+            source.platform.value if source.platform else "unknown",
+            source.chat_type,
+            source.chat_id,
+            source.user_id,
+            len(event.text or ""),
+        )
+        authorized = self._is_user_authorized(source)
+        logger.info(
+            "Gateway auth check: platform=%s user_id=%s authorized=%s",
+            source.platform.value if source.platform else "unknown",
+            source.user_id,
+            authorized,
+        )
         
         # Check if user is authorized
-        if not self._is_user_authorized(source):
+        if not authorized:
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if source.chat_type == "dm":
@@ -494,6 +520,8 @@ class GatewayRunner:
         
         # Check for commands
         command = event.get_command()
+        if command:
+            logger.info("Gateway command detected: /%s from user_id=%s", command, source.user_id)
         if command in ["new", "reset"]:
             return await self._handle_reset_command(event)
         
@@ -1379,48 +1407,8 @@ class GatewayRunner:
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
             
-            # Re-read .env and config for fresh credentials (gateway is long-lived,
-            # keys may change without restart).
-            try:
-                load_dotenv(_env_path, override=True, encoding="utf-8")
-            except UnicodeDecodeError:
-                load_dotenv(_env_path, override=True, encoding="latin-1")
-            except Exception:
-                pass
-
-            api_key = os.getenv("OPENROUTER_API_KEY", "")
-            base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-            model = os.getenv("HERMES_MODEL", "anthropic/claude-opus-4.6")
-
-            try:
-                import yaml as _y
-                _cfg_path = Path.home() / ".hermes" / "config.yaml"
-                if _cfg_path.exists():
-                    with open(_cfg_path) as _f:
-                        _cfg = _y.safe_load(_f) or {}
-                    _model_cfg = _cfg.get("model", {})
-                    if isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        model = _model_cfg.get("default", model)
-                        base_url = _model_cfg.get("base_url", base_url)
-                    # Check if provider is nous — resolve OAuth credentials
-                    provider = _model_cfg.get("provider", "") if isinstance(_model_cfg, dict) else ""
-                    if provider == "nous":
-                        try:
-                            from hermes_cli.auth import resolve_nous_runtime_credentials
-                            creds = resolve_nous_runtime_credentials(min_key_ttl_seconds=5 * 60)
-                            api_key = creds.get("api_key", api_key)
-                            base_url = creds.get("base_url", base_url)
-                        except Exception as nous_err:
-                            logger.warning("Nous Portal credential resolution failed: %s", nous_err)
-            except Exception:
-                pass
-
             agent = AIAgent(
-                model=model,
-                api_key=api_key,
-                base_url=base_url,
+                model=os.getenv("HERMES_MODEL", "anthropic/claude-opus-4.6"),
                 max_iterations=max_iterations,
                 quiet_mode=True,
                 enabled_toolsets=enabled_toolsets,

@@ -769,9 +769,27 @@ class HermesCLI:
         
         # Base URL: custom endpoint (OPENAI_BASE_URL) takes precedence over OpenRouter
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", CLI_CONFIG["model"]["base_url"])
-        
-        # API key: custom endpoint (OPENAI_API_KEY) takes precedence over OpenRouter
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+
+        # API key selection:
+        # - If caller explicitly provided one, always use it.
+        # - For OpenRouter base URLs, prefer OPENROUTER_API_KEY.
+        # - For custom OpenAI-compatible endpoints, prefer OPENAI_API_KEY.
+        # This avoids accidentally sending an OpenAI key to OpenRouter when both are set.
+        if api_key:
+            self.api_key = api_key
+        else:
+            openai_key = os.getenv("OPENAI_API_KEY")
+            openrouter_key = os.getenv("OPENROUTER_API_KEY")
+            custom_base_url = base_url or os.getenv("OPENAI_BASE_URL")
+            base_url_lower = (self.base_url or "").lower()
+            is_openrouter_base = "openrouter.ai" in base_url_lower
+
+            if custom_base_url and openai_key:
+                self.api_key = openai_key
+            elif is_openrouter_base and openrouter_key:
+                self.api_key = openrouter_key
+            else:
+                self.api_key = openai_key or openrouter_key
 
         # Provider resolution: determines whether to use OAuth credentials or env var keys
         from hermes_cli.auth import resolve_provider
@@ -1118,6 +1136,12 @@ class HermesCLI:
         print()
         print("  -- Terminal --")
         print(f"  Environment:  {terminal_env}")
+        if terminal_env == "local":
+            try:
+                from tools.environments.shell_utils import get_local_shell_mode
+                print(f"  Local Shell:  {get_local_shell_mode()}")
+            except Exception:
+                pass
         if terminal_env == "ssh":
             ssh_host = os.getenv("TERMINAL_SSH_HOST", "not set")
             ssh_user = os.getenv("TERMINAL_SSH_USER", "not set")

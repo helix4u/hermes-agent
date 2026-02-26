@@ -21,6 +21,7 @@ from typing import Dict, Any, Optional, List, Tuple
 import yaml
 
 from hermes_cli.colors import Colors, color
+from agent.env_loader import read_env_text_with_fallback
 
 
 # =============================================================================
@@ -334,11 +335,46 @@ OPTIONAL_ENV_VARS = {
 }
 
 
-def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
+def _is_optional_env_var_enabled(var_name: str, config: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    Return whether an optional env var is currently enabled by config.
+
+    This is used by setup/migration flows that should only treat active
+    optional integrations as "missing". Optional keys for integrations that
+    are not selected should remain non-blocking.
+    """
+    if config is None:
+        config = load_config()
+
+    tts_cfg = config.get("tts", {}) if isinstance(config, dict) else {}
+    tts_provider = str(tts_cfg.get("provider", "edge")).strip().lower()
+
+    if var_name == "ELEVENLABS_API_KEY":
+        return tts_provider == "elevenlabs"
+
+    if var_name == "VOICE_TOOLS_OPENAI_KEY":
+        return tts_provider == "openai"
+
+    # Other optional integrations are opt-in via setup checklists; they should
+    # not block setup completion when unset.
+    return False
+
+
+def get_missing_env_vars(
+    required_only: bool = False,
+    enabled_only: bool = False,
+    config: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """
     Check which environment variables are missing.
-    
-    Returns list of dicts with var info for missing variables.
+
+    Args:
+        required_only: If True, return only required vars.
+        enabled_only: If True, include only optional vars enabled by config.
+        config: Optional config dict to use when evaluating enabled-only logic.
+
+    Returns:
+        List of metadata dicts for missing variables.
     """
     missing = []
     
@@ -349,7 +385,10 @@ def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
     
     # Check optional vars (if not required_only)
     if not required_only:
+        effective_config = config if config is not None else (load_config() if enabled_only else None)
         for var_name, info in OPTIONAL_ENV_VARS.items():
+            if enabled_only and not _is_optional_env_var_enabled(var_name, effective_config):
+                continue
             if not get_env_value(var_name):
                 missing.append({"name": var_name, **info, "is_required": False})
     
@@ -577,12 +616,16 @@ def load_env() -> Dict[str, str]:
     env_vars = {}
     
     if env_path.exists():
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, _, value = line.partition('=')
-                    env_vars[key.strip()] = value.strip().strip('"\'')
+        try:
+            content, _ = read_env_text_with_fallback(env_path)
+        except Exception:
+            content = ""
+
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, _, value = line.partition('=')
+                env_vars[key.strip()] = value.strip().strip('"\'')
     
     return env_vars
 
@@ -595,8 +638,11 @@ def save_env_value(key: str, value: str):
     # Load existing
     lines = []
     if env_path.exists():
-        with open(env_path) as f:
-            lines = f.readlines()
+        try:
+            content, _ = read_env_text_with_fallback(env_path)
+            lines = content.splitlines(keepends=True)
+        except Exception:
+            lines = []
     
     # Find and update or append
     found = False
@@ -612,7 +658,8 @@ def save_env_value(key: str, value: str):
             lines[-1] += "\n"
         lines.append(f"{key}={value}\n")
     
-    with open(env_path, 'w') as f:
+    # Normalize to UTF-8 so future loads are deterministic across platforms.
+    with open(env_path, 'w', encoding='utf-8', newline='') as f:
         f.writelines(lines)
 
 
@@ -688,6 +735,12 @@ def show_config():
     print(f"  Backend:      {terminal.get('backend', 'local')}")
     print(f"  Working dir:  {terminal.get('cwd', '.')}")
     print(f"  Timeout:      {terminal.get('timeout', 60)}s")
+    if terminal.get('backend', 'local') == 'local':
+        try:
+            from tools.environments.shell_utils import get_local_shell_mode
+            print(f"  Local shell:  {get_local_shell_mode()}")
+        except Exception:
+            pass
     
     if terminal.get('backend') == 'docker':
         print(f"  Docker image: {terminal.get('docker_image', 'python:3.11-slim')}")

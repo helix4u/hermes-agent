@@ -31,6 +31,33 @@ from hermes_cli.config import (
 
 from hermes_cli.colors import Colors, color
 
+def _has_any_provider_configured() -> bool:
+    """Check whether at least one inference provider is currently usable."""
+    # API-key based providers (treat blank values as not configured)
+    if (
+        get_env_value("OPENROUTER_API_KEY")
+        or get_env_value("OPENAI_API_KEY")
+        or get_env_value("ANTHROPIC_API_KEY")
+    ):
+        return True
+
+    # OAuth providers (e.g., Nous Portal)
+    auth_file = get_hermes_home() / "auth.json"
+    if auth_file.exists():
+        try:
+            import json
+
+            auth = json.loads(auth_file.read_text(encoding="utf-8"))
+            active = auth.get("active_provider")
+            if active:
+                state = auth.get("providers", {}).get(active, {})
+                if state.get("access_token") or state.get("refresh_token"):
+                    return True
+        except Exception:
+            pass
+
+    return False
+
 def print_header(title: str):
     """Print a section header."""
     print()
@@ -100,7 +127,7 @@ def prompt_choice(question: str, choices: list, default: int = 0) -> int:
         return idx
         
     except (ImportError, NotImplementedError):
-        # Fallback to number-based selection (simple_term_menu doesn't support Windows)
+        # Fallback to number-based selection
         for i, choice in enumerate(choices):
             marker = "●" if i == default else "○"
             if i == default:
@@ -193,7 +220,7 @@ def prompt_checklist(title: str, items: list, pre_selected: list = None) -> list
         return selected
         
     except (ImportError, NotImplementedError):
-        # Fallback: numbered toggle interface (simple_term_menu doesn't support Windows)
+        # Fallback: numbered toggle interface
         selected = set(pre_selected)
         
         while True:
@@ -394,16 +421,21 @@ def run_setup_wizard(args):
     from hermes_cli.config import (
         get_missing_env_vars, get_missing_config_fields,
         check_config_version, migrate_config,
-        REQUIRED_ENV_VARS, OPTIONAL_ENV_VARS
     )
     
     # Check what's missing
-    missing_required = [v for v in get_missing_env_vars(required_only=False) if v.get("is_required")]
-    missing_optional = [v for v in get_missing_env_vars(required_only=False) if not v.get("is_required")]
+    missing_env = get_missing_env_vars(required_only=False, enabled_only=True, config=config)
+    missing_required = [v for v in missing_env if v.get("is_required")]
+    missing_optional = [v for v in missing_env if not v.get("is_required")]
     missing_config = get_missing_config_fields()
     current_ver, latest_ver = check_config_version()
     
-    has_missing = missing_required or missing_optional or missing_config or current_ver < latest_ver
+    has_provider = _has_any_provider_configured()
+    provider_missing = not has_provider
+    has_missing = (
+        bool(missing_required or missing_optional or missing_config or current_ver < latest_ver)
+        or provider_missing
+    )
     
     print()
     print(color("┌─────────────────────────────────────────────────────────┐", Colors.MAGENTA))
@@ -418,7 +450,12 @@ def run_setup_wizard(args):
     if is_existing and has_missing:
         print()
         print_header("Existing Installation Detected")
-        print_success("You already have Hermes configured!")
+        if provider_missing:
+            print_warning("Provider setup is incomplete.")
+            print_info("No usable inference provider was detected.")
+            print_info("You'll need to select a provider before Hermes can chat.")
+        else:
+            print_success("You already have Hermes configured!")
         print()
         
         if missing_required:
@@ -439,22 +476,25 @@ def run_setup_wizard(args):
             print_info(f"  {len(missing_config)} new config option(s) available")
         
         print()
-        
-        setup_choices = [
-            "Quick setup - just configure missing items",
-            "Full setup - reconfigure everything",
-            "Skip - exit setup"
-        ]
-        
-        choice = prompt_choice("What would you like to do?", setup_choices, 0)
-        
-        if choice == 0:
-            quick_mode = True
-        elif choice == 2:
-            print()
-            print_info("Exiting. Run 'hermes setup' again when ready.")
-            return
-        # choice == 1 continues with full setup
+
+        if provider_missing:
+            print_info("Continuing to full setup so you can choose a provider.")
+        else:
+            setup_choices = [
+                "Quick setup - just configure missing items",
+                "Full setup - reconfigure everything",
+                "Skip - exit setup"
+            ]
+
+            choice = prompt_choice("What would you like to do?", setup_choices, 0)
+
+            if choice == 0:
+                quick_mode = True
+            elif choice == 2:
+                print()
+                print_info("Exiting. Run 'hermes setup' again when ready.")
+                return
+            # choice == 1 continues with full setup
         
     elif is_existing and not has_missing:
         print()

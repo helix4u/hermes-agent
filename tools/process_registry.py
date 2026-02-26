@@ -41,6 +41,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from tools.environments.shell_utils import (
+    build_local_subprocess_invocation,
+    is_windows,
+    terminate_process_tree,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -124,6 +130,11 @@ class ProcessRegistry:
         )
 
         if use_pty:
+            if is_windows():
+                logger.warning("PTY mode is not supported on Windows local backend, falling back to pipe mode")
+                use_pty = False
+
+        if use_pty:
             # Try PTY mode for interactive CLI tools
             try:
                 import ptyprocess
@@ -160,18 +171,19 @@ class ProcessRegistry:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
+        popen_args, popen_platform_kwargs, _ = build_local_subprocess_invocation(
+            command, session.cwd
+        )
         proc = subprocess.Popen(
-            command,
-            shell=True,
+            popen_args,
             text=True,
-            cwd=session.cwd,
             env=os.environ | (env_vars or {}),
             encoding="utf-8",
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE,
-            preexec_fn=os.setsid,
+            **popen_platform_kwargs,
         )
 
         session.process = proc
@@ -517,10 +529,11 @@ class ProcessRegistry:
                         os.kill(session.pid, signal.SIGTERM)
             elif session.process:
                 # Local process -- kill the process group
+                terminate_process_tree(session.process, force=False)
                 try:
-                    os.killpg(os.getpgid(session.process.pid), signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    session.process.kill()
+                    session.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    terminate_process_tree(session.process, force=True)
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)

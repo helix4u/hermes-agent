@@ -1,12 +1,15 @@
 """Local execution environment with interrupt support and non-blocking I/O."""
 
 import os
-import signal
 import subprocess
 import threading
 import time
 
 from tools.environments.base import BaseEnvironment
+from tools.environments.shell_utils import (
+    build_local_subprocess_invocation,
+    terminate_process_tree,
+)
 
 
 class LocalEnvironment(BaseEnvironment):
@@ -32,18 +35,19 @@ class LocalEnvironment(BaseEnvironment):
         exec_command = self._prepare_command(command)
 
         try:
+            popen_args, popen_platform_kwargs, _ = build_local_subprocess_invocation(
+                exec_command, work_dir
+            )
             proc = subprocess.Popen(
-                exec_command,
-                shell=True,
+                popen_args,
                 text=True,
-                cwd=work_dir,
                 env=os.environ | self.env,
                 encoding="utf-8",
                 errors="replace",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-                preexec_fn=os.setsid,
+                **popen_platform_kwargs,
             )
 
             if stdin_data is not None:
@@ -75,25 +79,22 @@ class LocalEnvironment(BaseEnvironment):
 
             while proc.poll() is None:
                 if _interrupt_event.is_set():
+                    terminate_process_tree(proc, force=False)
                     try:
-                        pgid = os.getpgid(proc.pid)
-                        os.killpg(pgid, signal.SIGTERM)
-                        try:
-                            proc.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(pgid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        proc.kill()
+                        proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        terminate_process_tree(proc, force=True)
                     reader.join(timeout=2)
                     return {
                         "output": "".join(_output_chunks) + "\n[Command interrupted — user sent a new message]",
                         "returncode": 130,
                     }
                 if time.monotonic() > deadline:
+                    terminate_process_tree(proc, force=False)
                     try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                    except (ProcessLookupError, PermissionError):
-                        proc.kill()
+                        proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        terminate_process_tree(proc, force=True)
                     reader.join(timeout=2)
                     return self._timeout_result(effective_timeout)
                 time.sleep(0.2)

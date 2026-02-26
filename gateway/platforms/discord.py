@@ -7,7 +7,10 @@ Uses discord.py library for:
 - Handling threads and channels
 """
 
+from __future__ import annotations
+
 import asyncio
+from contextlib import suppress
 import logging
 import os
 from typing import Dict, List, Optional, Any
@@ -66,6 +69,7 @@ class DiscordAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
+        self._client_task: Optional[asyncio.Task] = None
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
     
@@ -79,37 +83,42 @@ class DiscordAdapter(BasePlatformAdapter):
             print(f"[{self.name}] No bot token configured")
             return False
         
-        try:
-            # Set up intents -- members intent needed for username-to-ID resolution
+        # Parse allowed user entries (may contain usernames or IDs)
+        allowed_env = os.getenv("DISCORD_ALLOWED_USERS", "")
+        if allowed_env:
+            self._allowed_user_ids = {
+                uid.strip() for uid in allowed_env.split(",") if uid.strip()
+            }
+
+        # Username resolution requires guild member listing (privileged members intent).
+        needs_members_intent = any(not entry.isdigit() for entry in self._allowed_user_ids)
+
+        async def _attempt_connect(*, message_content: bool, members: bool) -> tuple[bool, Optional[Exception]]:
+            """Try one connect profile and return (success, startup_exception)."""
+            self._ready_event.clear()
+
             intents = Intents.default()
-            intents.message_content = True
+            intents.message_content = message_content
             intents.dm_messages = True
             intents.guild_messages = True
-            intents.members = True
-            
-            # Create bot
+            intents.members = members
+
             self._client = commands.Bot(
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
             )
-            
-            # Parse allowed user entries (may contain usernames or IDs)
-            allowed_env = os.getenv("DISCORD_ALLOWED_USERS", "")
-            if allowed_env:
-                self._allowed_user_ids = {
-                    uid.strip() for uid in allowed_env.split(",") if uid.strip()
-                }
-            
+
             adapter_self = self  # capture for closure
-            
-            # Register event handlers
+
             @self._client.event
             async def on_ready():
                 print(f"[{adapter_self.name}] Connected as {adapter_self._client.user}")
-                
+
                 # Resolve any usernames in the allowed list to numeric IDs
-                await adapter_self._resolve_allowed_usernames()
-                
+                # only if members intent is enabled.
+                if members:
+                    await adapter_self._resolve_allowed_usernames()
+
                 # Sync slash commands with Discord
                 try:
                     synced = await adapter_self._client.tree.sync()
@@ -117,28 +126,88 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception as e:
                     print(f"[{adapter_self.name}] Slash command sync failed: {e}")
                 adapter_self._ready_event.set()
-            
+
             @self._client.event
             async def on_message(message: DiscordMessage):
                 # Ignore bot's own messages
                 if message.author == self._client.user:
                     return
-                await self._handle_message(message)
-            
-            # Register slash commands
+                logger.info(
+                    "[discord] on_message event: msg_id=%s user_id=%s channel_id=%s",
+                    str(message.id),
+                    str(message.author.id),
+                    str(message.channel.id),
+                )
+                try:
+                    await self._handle_message(message)
+                except Exception:
+                    logger.exception("[discord] message handler crashed")
+
             self._register_slash_commands()
-            
-            # Start the bot in background
-            asyncio.create_task(self._client.start(self.config.token))
-            
-            # Wait for ready
-            await asyncio.wait_for(self._ready_event.wait(), timeout=30)
-            
-            self._running = True
-            return True
-            
-        except asyncio.TimeoutError:
-            print(f"[{self.name}] Timeout waiting for connection")
+
+            start_task = asyncio.create_task(self._client.start(self.config.token))
+            ready_task = asyncio.create_task(self._ready_event.wait())
+
+            try:
+                done, pending = await asyncio.wait(
+                    {start_task, ready_task},
+                    timeout=30,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if ready_task in done and self._ready_event.is_set():
+                    self._running = True
+                    # Keep the Discord client task alive for the session lifetime.
+                    self._client_task = start_task
+                    return True, None
+
+                if start_task in done:
+                    if not ready_task.done():
+                        ready_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await ready_task
+                    exc = start_task.exception()
+                    if exc:
+                        return False, exc
+                    return False, RuntimeError("Discord client exited before ready")
+
+                # Timeout waiting for readiness: shut down this attempt cleanly.
+                ready_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await ready_task
+                if not start_task.done():
+                    start_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await start_task
+                return False, asyncio.TimeoutError("Timeout waiting for Discord ready event")
+            finally:
+                if not self._running and self._client:
+                    try:
+                        await self._client.close()
+                    except Exception:
+                        pass
+
+        try:
+            # First attempt: normal behavior (message content + optional members intent)
+            ok, err = await _attempt_connect(message_content=True, members=needs_members_intent)
+            if ok:
+                return True
+
+            # If Discord rejects privileged intents, retry without them so DMs and slash
+            # commands can still function.
+            err_text = str(err) if err else ""
+            if err and "PrivilegedIntentsRequired" in err.__class__.__name__ or "PrivilegedIntentsRequired" in err_text:
+                print(f"[{self.name}] Privileged intents not enabled; retrying with reduced intents.")
+                ok, err = await _attempt_connect(message_content=False, members=False)
+                if ok:
+                    return True
+
+            if isinstance(err, asyncio.TimeoutError):
+                print(f"[{self.name}] Timeout waiting for connection")
+            elif err:
+                print(f"[{self.name}] Failed to connect: {err}")
+            else:
+                print(f"[{self.name}] Failed to connect")
             return False
         except Exception as e:
             print(f"[{self.name}] Failed to connect: {e}")
@@ -151,8 +220,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._client.close()
             except Exception as e:
                 print(f"[{self.name}] Error during disconnect: {e}")
+        if self._client_task and not self._client_task.done():
+            self._client_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._client_task
         
         self._running = False
+        self._client_task = None
         self._client = None
         self._ready_event.clear()
         print(f"[{self.name}] Disconnected")
@@ -595,6 +669,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _handle_message(self, message: DiscordMessage) -> None:
         """Handle incoming Discord messages."""
+        logger.info(
+            "[discord] incoming message: user_id=%s chat_id=%s is_dm=%s content_len=%s",
+            str(message.author.id),
+            str(message.channel.id),
+            isinstance(message.channel, discord.DMChannel),
+            len(message.content or ""),
+        )
         # In server channels (not DMs), require the bot to be @mentioned
         # UNLESS the channel is in the free-response list.
         #

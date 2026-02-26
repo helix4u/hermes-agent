@@ -65,6 +65,31 @@ function Write-Err {
     Write-Host "✗ $Message" -ForegroundColor Red
 }
 
+function Invoke-GitCommand {
+    param([Parameter(Mandatory = $true)][string[]]$Args)
+
+    $oldErrorActionPreference = $ErrorActionPreference
+    try {
+        # Clone fallback paths intentionally probe and can fail.
+        $ErrorActionPreference = "Continue"
+        $output = & git @Args 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldErrorActionPreference
+    }
+
+    return [PSCustomObject]@{
+        ExitCode = $exitCode
+        Output = @($output)
+    }
+}
+
+function Test-IsHermesOriginSsh {
+    param([string]$Url)
+    if (-not $Url) { return $false }
+    return $Url -match "^(git@github\.com:NousResearch/hermes-agent(\.git)?|ssh://git@github\.com/NousResearch/hermes-agent(\.git)?)$"
+}
+
 # ============================================================================
 # Dependency checks
 # ============================================================================
@@ -384,7 +409,22 @@ function Install-Repository {
         if (Test-Path "$InstallDir\.git") {
             Write-Info "Existing installation found, updating..."
             Push-Location $InstallDir
-            git fetch origin
+
+            $originUrl = (& git remote get-url origin 2>$null)
+            $fetchResult = Invoke-GitCommand -Args @("fetch", "origin")
+            if ($fetchResult.ExitCode -ne 0 -and (Test-IsHermesOriginSsh -Url $originUrl)) {
+                Write-Warn "SSH fetch failed, switching origin remote to HTTPS..."
+                $setUrlResult = Invoke-GitCommand -Args @("remote", "set-url", "origin", $RepoUrlHttps)
+                if ($setUrlResult.ExitCode -eq 0) {
+                    $fetchResult = Invoke-GitCommand -Args @("fetch", "origin")
+                }
+            }
+            if ($fetchResult.ExitCode -ne 0) {
+                Pop-Location
+                Write-Err "Failed to fetch updates from origin"
+                exit 1
+            }
+
             git checkout $Branch
             git pull origin $Branch
             Pop-Location
@@ -394,27 +434,28 @@ function Install-Repository {
             exit 1
         }
     } else {
-        # Try SSH first (for private repo access), fall back to HTTPS.
-        # GIT_SSH_COMMAND with BatchMode=yes prevents SSH from hanging
-        # when no key is configured (fails immediately instead of prompting).
-        Write-Info "Trying SSH clone..."
-        $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o ConnectTimeout=5"
-        $sshResult = git clone --branch $Branch --recurse-submodules $RepoUrlSsh $InstallDir 2>&1
-        $sshExitCode = $LASTEXITCODE
-        $env:GIT_SSH_COMMAND = $null
-        
-        if ($sshExitCode -eq 0) {
-            Write-Success "Cloned via SSH"
+        # Prefer HTTPS (works without SSH keys), fall back to SSH for private access
+        Write-Info "Trying HTTPS clone..."
+        $httpsResult = Invoke-GitCommand -Args @(
+            "clone", "--branch", $Branch, "--recurse-submodules", $RepoUrlHttps, $InstallDir
+        )
+
+        if ($httpsResult.ExitCode -eq 0) {
+            Write-Success "Cloned via HTTPS"
         } else {
-            # Clean up partial SSH clone before retrying
-            if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-            Write-Info "SSH failed, trying HTTPS..."
-            $httpsResult = git clone --branch $Branch --recurse-submodules $RepoUrlHttps $InstallDir 2>&1
-            
-            if ($LASTEXITCODE -eq 0) {
-                Write-Success "Cloned via HTTPS"
+            Write-Info "HTTPS failed, trying SSH..."
+            $sshResult = Invoke-GitCommand -Args @(
+                "clone", "--branch", $Branch, "--recurse-submodules", $RepoUrlSsh, $InstallDir
+            )
+
+            if ($sshResult.ExitCode -eq 0) {
+                Write-Success "Cloned via SSH"
             } else {
                 Write-Err "Failed to clone repository"
+                Write-Info "If this is a public install, HTTPS should work without SSH keys."
+                Write-Info "For private repo access, configure GitHub authentication:"
+                Write-Info "  gh auth login"
+                Write-Info "  # or configure SSH and test with: ssh -T git@github.com"
                 exit 1
             }
         }
@@ -735,8 +776,8 @@ function Write-Completion {
     Write-Host "View/edit configuration"
     Write-Host "   hermes config edit  " -NoNewline -ForegroundColor Green
     Write-Host "Open config in editor"
-    Write-Host "   hermes gateway      " -NoNewline -ForegroundColor Green
-    Write-Host "Start messaging gateway (Telegram, Discord, etc.)"
+    Write-Host "   hermes gateway install " -NoNewline -ForegroundColor Green
+    Write-Host "Install gateway service (messaging + cron)"
     Write-Host "   hermes update       " -NoNewline -ForegroundColor Green
     Write-Host "Update to latest version"
     Write-Host ""

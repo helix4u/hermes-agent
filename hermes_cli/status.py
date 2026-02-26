@@ -137,6 +137,12 @@ def show_status(args):
         except Exception:
             terminal_env = "local"
     print(f"  Backend:      {terminal_env}")
+    if terminal_env == "local":
+        try:
+            from tools.environments.shell_utils import get_local_shell_mode
+            print(f"  Local shell:  {get_local_shell_mode()}")
+        except Exception:
+            pass
     
     if terminal_env == "ssh":
         ssh_host = os.getenv("TERMINAL_SSH_HOST", "")
