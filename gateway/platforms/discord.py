@@ -972,7 +972,7 @@ if DISCORD_AVAILABLE:
                     )
                     return
 
-                await interaction.followup.send("Sent audio for this message.", ephemeral=True)
+                # Success is silent: audio delivery in channel is the confirmation.
             except Exception:
                 logger.exception("[discord] listen button handler failed")
                 try:
