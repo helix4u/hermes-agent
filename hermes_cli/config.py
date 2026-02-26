@@ -58,7 +58,7 @@ def ensure_hermes_home():
 # =============================================================================
 
 DEFAULT_CONFIG = {
-    "model": "anthropic/claude-opus-4.6",
+    "model": "google/gemini-2.0-flash-001:free",
     "toolsets": ["hermes-cli"],
     "max_turns": 100,
     

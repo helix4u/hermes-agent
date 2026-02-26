@@ -144,7 +144,7 @@ def load_cli_config() -> Dict[str, Any]:
     # Default configuration
     defaults = {
         "model": {
-            "default": "anthropic/claude-opus-4.6",
+            "default": "google/gemini-2.0-flash-001:free",
             "base_url": OPENROUTER_BASE_URL,
             "provider": "auto",
         },
@@ -471,7 +471,7 @@ def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dic
     
     Args:
         console: Rich Console instance for printing
-        model: The current model name (e.g., "anthropic/claude-opus-4")
+        model: The current model name (e.g., "anthropic/claude-sonnet-4")
         cwd: Current working directory
         tools: List of tool definitions
         enabled_toolsets: List of enabled toolset names
@@ -702,12 +702,24 @@ def save_config_value(key_path: str, value: any) -> bool:
                 config = yaml.safe_load(f) or {}
         else:
             config = {}
+
+        # Guard against malformed configs (e.g. root scalar/list)
+        if not isinstance(config, dict):
+            logger.warning(
+                "Config root is %s; resetting to dict before writing %s",
+                type(config).__name__,
+                key_path,
+            )
+            config = {}
         
         # Navigate to the key and set value
         keys = key_path.split('.')
         current = config
         for key in keys[:-1]:
-            if key not in current:
+            # If an intermediate node exists but is not a mapping (for example,
+            # legacy configs where model: "provider/model"), replace it with a dict
+            # so nested writes like model.default succeed.
+            if key not in current or not isinstance(current.get(key), dict):
                 current[key] = {}
             current = current[key]
         current[keys[-1]] = value
@@ -2616,7 +2628,7 @@ def main(
         query: Single query to execute (then exit). Alias: -q
         q: Shorthand for --query
         toolsets: Comma-separated list of toolsets to enable (e.g., "web,terminal")
-        model: Model to use (default: anthropic/claude-opus-4-20250514)
+        model: Model to use (default: google/gemini-2.0-flash-001:free)
         provider: Inference provider ("auto", "openrouter", "nous")
         api_key: API key for authentication
         base_url: Base URL for the API

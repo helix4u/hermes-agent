@@ -813,7 +813,7 @@ def run_setup_wizard(args):
     if selected_provider != "custom":  # Custom already prompted for model name
         print_header("Default Model")
 
-        current_model = config.get('model', 'anthropic/claude-opus-4.6')
+        current_model = config.get('model', 'google/gemini-2.0-flash-001:free')
         print_info(f"Current: {current_model}")
 
         if selected_provider == "nous" and nous_models:
@@ -856,7 +856,7 @@ def run_setup_wizard(args):
                 config['model'] = ids[model_idx]
                 save_env_value("LLM_MODEL", ids[model_idx])
             elif model_idx == len(ids):  # Custom
-                custom = prompt("Enter model name (e.g., anthropic/claude-opus-4.6)")
+                custom = prompt("Enter model name (e.g., anthropic/claude-sonnet-4 or google/gemini-2.0-flash-001:free)")
                 if custom:
                     config['model'] = custom
                     save_env_value("LLM_MODEL", custom)
@@ -927,7 +927,10 @@ def run_setup_wizard(args):
         print_info("  The CLI always uses the directory you run 'hermes' from")
         print_info("  But messaging bots need a static starting directory")
         
-        current_cwd = get_env_value('MESSAGING_CWD') or str(Path.home())
+        default_msg_cwd = Path.home() / ".hermes"
+        if not default_msg_cwd.exists():
+            default_msg_cwd = Path.home()
+        current_cwd = get_env_value('MESSAGING_CWD') or str(default_msg_cwd)
         print_info(f"  Current: {current_cwd}")
         
         cwd_input = prompt("  Messaging working directory", current_cwd)

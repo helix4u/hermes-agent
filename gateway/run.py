@@ -71,9 +71,14 @@ os.environ["HERMES_QUIET"] = "1"
 os.environ["HERMES_EXEC_ASK"] = "1"
 
 # Set terminal working directory for messaging platforms
-# Uses MESSAGING_CWD if set, otherwise defaults to home directory
-# This is separate from CLI which uses the directory where `hermes` is run
-messaging_cwd = os.getenv("MESSAGING_CWD") or str(Path.home())
+# Uses MESSAGING_CWD if set, otherwise defaults to ~/.hermes when it exists,
+# falling back to the user's home directory. This keeps the agent's work
+# isolated in its own project directory by default.
+# This is separate from CLI which uses the directory where `hermes` is run.
+_default_messaging_cwd = Path.home() / ".hermes"
+if not _default_messaging_cwd.exists():
+    _default_messaging_cwd = Path.home()
+messaging_cwd = os.getenv("MESSAGING_CWD") or str(_default_messaging_cwd)
 os.environ["TERMINAL_CWD"] = messaging_cwd
 
 from gateway.config import (
@@ -92,6 +97,36 @@ from gateway.delivery import DeliveryRouter, DeliveryTarget
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 
 logger = logging.getLogger(__name__)
+
+# Default model when nothing is configured (must match hermes_cli.config DEFAULT_CONFIG / CLI fallback)
+_DEFAULT_MODEL = "google/gemini-2.0-flash-001:free"
+
+
+def _resolve_gateway_model() -> str:
+    """
+    Resolve the model for gateway agents. Same priority as CLI so gateway and
+    CLI share one source of truth: HERMES_MODEL (session override) > LLM_MODEL
+    > OPENAI_MODEL > config.yaml model > default.
+    """
+    model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL")
+    if model:
+        return model.strip()
+    try:
+        import yaml as _yaml
+        cfg_path = Path.home() / ".hermes" / "config.yaml"
+        if cfg_path.exists():
+            with open(cfg_path) as _f:
+                cfg = _yaml.safe_load(_f) or {}
+            m = cfg.get("model")
+            if isinstance(m, str) and m.strip():
+                return m.strip()
+            if isinstance(m, dict):
+                default = (m.get("default") or "").strip()
+                if default:
+                    return default
+    except Exception:
+        pass
+    return _DEFAULT_MODEL
 
 
 class GatewayRunner:
@@ -728,7 +763,7 @@ class GatewayRunner:
                     {
                         "role": "session_meta",
                         "tools": tool_defs or [],
-                        "model": os.getenv("HERMES_MODEL", ""),
+                        "model": _resolve_gateway_model(),
                         "platform": source.platform.value if source.platform else "",
                         "timestamp": ts,
                     }
@@ -795,7 +830,7 @@ class GatewayRunner:
                     loop = asyncio.get_event_loop()
                     def _do_flush():
                         tmp_agent = AIAgent(
-                            model=os.getenv("HERMES_MODEL", "anthropic/claude-opus-4.6"),
+                            model=_resolve_gateway_model(),
                             max_iterations=5,
                             quiet_mode=True,
                             enabled_toolsets=["memory"],
@@ -888,7 +923,7 @@ class GatewayRunner:
     async def _handle_model_command(self, event: MessageEvent) -> str:
         """Handle /model command - show or change the current model."""
         args = event.get_command_args().strip()
-        current = os.getenv("HERMES_MODEL", "anthropic/claude-opus-4.6")
+        current = _resolve_gateway_model()
         
         if not args:
             return f"🤖 **Current model:** `{current}`\n\nTo change: `/model provider/model-name`"
@@ -1408,7 +1443,7 @@ class GatewayRunner:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
             
             agent = AIAgent(
-                model=os.getenv("HERMES_MODEL", "anthropic/claude-opus-4.6"),
+                model=_resolve_gateway_model(),
                 max_iterations=max_iterations,
                 quiet_mode=True,
                 enabled_toolsets=enabled_toolsets,
