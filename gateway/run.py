@@ -70,12 +70,13 @@ os.environ["HERMES_QUIET"] = "1"
 # Enable interactive exec approval for dangerous commands on messaging platforms
 os.environ["HERMES_EXEC_ASK"] = "1"
 
-# Set terminal working directory for messaging platforms
-# Uses MESSAGING_CWD if set, otherwise defaults to ~/.hermes when it exists,
-# falling back to the user's home directory. This keeps the agent's work
-# isolated in its own project directory by default.
+# Set terminal working directory for messaging platforms.
+# Uses MESSAGING_CWD if set. Otherwise prefer ~/.hermes/workspace (where
+# project files are commonly located), then ~/.hermes, then home.
 # This is separate from CLI which uses the directory where `hermes` is run.
-_default_messaging_cwd = Path.home() / ".hermes"
+_default_messaging_cwd = Path.home() / ".hermes" / "workspace"
+if not _default_messaging_cwd.exists():
+    _default_messaging_cwd = Path.home() / ".hermes"
 if not _default_messaging_cwd.exists():
     _default_messaging_cwd = Path.home()
 messaging_cwd = os.getenv("MESSAGING_CWD") or str(_default_messaging_cwd)
@@ -1396,12 +1397,38 @@ class GatewayRunner:
             adapter = self.adapters.get(source.platform)
             if not adapter:
                 return
-            
+
+            # Keep track of a single in-flight progress message so we can edit
+            # it in place instead of spamming the channel with many updates.
+            progress_message_id: str | None = None
+
             while True:
                 try:
                     # Non-blocking check with small timeout
                     msg = progress_queue.get_nowait()
-                    await adapter.send(chat_id=source.chat_id, content=msg)
+                    # For platforms that support edits (Discord/Telegram/etc.),
+                    # send the first progress message and then edit it in place
+                    # for subsequent updates. Fallback platforms will simply
+                    # get multiple messages.
+                    if progress_message_id is None:
+                        # First progress message: send normally
+                        result = await adapter.send(chat_id=source.chat_id, content=msg)
+                        if result and result.success and result.message_id:
+                            progress_message_id = result.message_id
+                    else:
+                        # Subsequent updates: try to edit the existing message
+                        try:
+                            await adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=progress_message_id,
+                                content=msg,
+                            )
+                        except Exception:
+                            # If edit fails (platform limitation or message gone),
+                            # fall back to a fresh message and track its ID.
+                            result = await adapter.send(chat_id=source.chat_id, content=msg)
+                            if result and result.success and result.message_id:
+                                progress_message_id = result.message_id
                     # Restore typing indicator after sending progress message
                     await asyncio.sleep(0.3)
                     await adapter.send_typing(source.chat_id)
@@ -1544,6 +1571,44 @@ class GatewayRunner:
                         if tag not in seen:
                             seen.add(tag)
                             unique_tags.append(tag)
+
+                    # Drop media tags that point to files no longer on disk.
+                    # This prevents stale-session replay from repeatedly trying
+                    # to send deleted TTS artifacts on startup/new turns.
+                    existing_tags = []
+                    missing_count = 0
+                    for tag in unique_tags:
+                        raw_path = tag.removeprefix("MEDIA:")
+                        if os.path.exists(raw_path):
+                            existing_tags.append(tag)
+                        else:
+                            missing_count += 1
+                    if missing_count:
+                        logger.warning(
+                            "Dropped %d stale media tag(s) with missing file path(s)",
+                            missing_count,
+                        )
+                    unique_tags = existing_tags
+
+                    # Safety valve: cap auto-appended audio attachments to one
+                    # per response (keep the most recent) to prevent TTS floods
+                    # when the model triggers multiple text_to_speech calls.
+                    audio_idx = []
+                    for i, tag in enumerate(unique_tags):
+                        path = tag.removeprefix("MEDIA:").lower()
+                        if path.endswith((".ogg", ".opus", ".mp3", ".wav", ".m4a", ".webm")):
+                            audio_idx.append(i)
+                    if len(audio_idx) > 1:
+                        keep = audio_idx[-1]
+                        unique_tags = [
+                            tag for i, tag in enumerate(unique_tags)
+                            if i == keep or i not in audio_idx
+                        ]
+                        logger.warning(
+                            "Capped auto media delivery: dropped %d extra audio tag(s)",
+                            len(audio_idx) - 1,
+                        )
+
                     if has_voice_directive:
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
@@ -1708,13 +1773,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None) -> bool:
     Returns True if the gateway ran successfully, False if it failed to start.
     A False return causes a non-zero exit code so systemd can auto-restart.
     """
-    # Configure rotating file log so gateway output is persisted for debugging
+    # Configure rotating file log so gateway output is persisted for debugging.
+    # Use UTF-8 for file; on Windows, reconfigure stderr to UTF-8 so emoji/Unicode
+    # in log messages (e.g. Discord reaction ❌) don't cause UnicodeEncodeError (cp1252).
+    if sys.stderr and getattr(sys.stderr, 'reconfigure', None) is not None:
+        try:
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
     log_dir = Path.home() / '.hermes' / 'logs'
     log_dir.mkdir(parents=True, exist_ok=True)
     file_handler = RotatingFileHandler(
         log_dir / 'gateway.log',
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
+        encoding='utf-8',
     )
     file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
     logging.getLogger().addHandler(file_handler)
@@ -1727,11 +1800,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None) -> bool:
         asyncio.create_task(runner.stop())
     
     loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, signal_handler)
-        except NotImplementedError:
-            pass
+    # On POSIX, integrate SIGINT/SIGTERM with the event loop so a signal
+    # triggers a graceful shutdown. On Windows we deliberately do NOT
+    # override SIGINT handling here and instead rely on the default
+    # KeyboardInterrupt behaviour in `hermes_cli.gateway.run_gateway`,
+    # which already catches Ctrl+C and exits cleanly.
+    if os.name != "nt":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, signal_handler)
+            except NotImplementedError:
+                pass
     
     # Start the gateway
     success = await runner.start()

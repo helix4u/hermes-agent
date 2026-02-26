@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import json
 import logging
 import os
+import time
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -63,8 +65,8 @@ class DiscordAdapter(BasePlatformAdapter):
     - Reaction-based feedback
     """
     
-    # Discord message limits
-    MAX_MESSAGE_LENGTH = 2000
+    # Discord limits: 4096 characters per embed description
+    MAX_EMBED_DESCRIPTION = 4096
     
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
@@ -72,6 +74,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._client_task: Optional[asyncio.Task] = None
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
+        self._seen_message_ids: Dict[int, float] = {}
     
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -102,6 +105,11 @@ class DiscordAdapter(BasePlatformAdapter):
             intents.dm_messages = True
             intents.guild_messages = True
             intents.members = members
+            # Needed for reaction-based moderation controls.
+            if hasattr(intents, "reactions"):
+                intents.reactions = True
+            if hasattr(intents, "dm_reactions"):
+                intents.dm_reactions = True
 
             self._client = commands.Bot(
                 command_prefix="!",  # Not really used, we handle raw messages
@@ -129,8 +137,28 @@ class DiscordAdapter(BasePlatformAdapter):
 
             @self._client.event
             async def on_message(message: DiscordMessage):
-                # Ignore bot's own messages
-                if message.author == self._client.user:
+                # Drop duplicate deliveries of the same Discord message ID.
+                # This protects against occasional repeated gateway dispatch.
+                now = time.time()
+                msg_id = int(getattr(message, "id", 0) or 0)
+                if msg_id:
+                    last = self._seen_message_ids.get(msg_id)
+                    if last and (now - last) < 120:
+                        logger.info("[discord] duplicate message ignored: msg_id=%s", str(msg_id))
+                        return
+                    self._seen_message_ids[msg_id] = now
+                    # Lightweight TTL cleanup
+                    if len(self._seen_message_ids) > 2000:
+                        cutoff = now - 300
+                        self._seen_message_ids = {
+                            k: v for k, v in self._seen_message_ids.items() if v >= cutoff
+                        }
+
+                # Ignore all bot-authored messages (including ourselves) to
+                # prevent feedback loops from bot attachments/reposts.
+                if getattr(message.author, "bot", False):
+                    return
+                if self._client.user and getattr(message.author, "id", None) == self._client.user.id:
                     return
                 logger.info(
                     "[discord] on_message event: msg_id=%s user_id=%s channel_id=%s",
@@ -142,6 +170,50 @@ class DiscordAdapter(BasePlatformAdapter):
                     await self._handle_message(message)
                 except Exception:
                     logger.exception("[discord] message handler crashed")
+
+            @self._client.event
+            async def on_raw_reaction_add(payload):
+                """
+                Delete this bot's messages when a user reacts with :x: / ❌.
+                Uses raw events so this works even when the message isn't cached.
+                """
+                try:
+                    logger.info(
+                        "[discord] reaction add: user_id=%s channel_id=%s message_id=%s emoji=%s",
+                        str(payload.user_id),
+                        str(payload.channel_id),
+                        str(payload.message_id),
+                        str(getattr(payload.emoji, "name", "") or ""),
+                    )
+                    if self._client.user and payload.user_id == self._client.user.id:
+                        return
+
+                    emoji_name = getattr(payload.emoji, "name", "") or ""
+                    if emoji_name not in {"❌", "x", "✖", "✖️"}:
+                        return
+
+                    channel = self._client.get_channel(payload.channel_id)
+                    if channel is None:
+                        channel = await self._client.fetch_channel(payload.channel_id)
+                    if channel is None:
+                        return
+
+                    message = await channel.fetch_message(payload.message_id)
+                    if message is None:
+                        return
+                    # Delete only this bot's own messages.
+                    if not self._client.user or getattr(message.author, "id", None) != self._client.user.id:
+                        return
+
+                    await message.delete()
+                    logger.info(
+                        "[discord] deleted bot message %s via %s reaction by user %s",
+                        str(message.id),
+                        emoji_name,
+                        str(payload.user_id),
+                    )
+                except Exception:
+                    logger.exception("[discord] reaction delete handler failed")
 
             self._register_slash_commands()
 
@@ -238,7 +310,11 @@ class DiscordAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
-        """Send a message to a Discord channel."""
+        """Send a message to a Discord channel using chained embeds.
+        
+        Large responses are split across multiple embeds, each with a
+        description capped at MAX_EMBED_DESCRIPTION characters.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
         
@@ -251,9 +327,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
             
-            # Format and split message if needed
+            # Format and split message into embed-sized chunks
             formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            chunks = self.truncate_message(formatted, self.MAX_EMBED_DESCRIPTION)
             
             message_ids = []
             reference = None
@@ -266,8 +342,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.debug("Could not fetch reply-to message: %s", e)
             
             for i, chunk in enumerate(chunks):
+                embed = discord.Embed(description=chunk)
+                view = ListenButtonView(self)
                 msg = await channel.send(
-                    content=chunk,
+                    embed=embed,
+                    view=view,
                     reference=reference if i == 0 else None,
                 )
                 message_ids.append(str(msg.id))
@@ -277,9 +356,28 @@ class DiscordAdapter(BasePlatformAdapter):
                 message_id=message_ids[0] if message_ids else None,
                 raw_response={"message_ids": message_ids}
             )
-            
+
         except Exception as e:
             return SendResult(success=False, error=str(e))
+
+    async def edit_message(self, chat_id: str, message_id: str, content: str) -> None:
+        """Edit an existing message's embed description, used for tool progress."""
+        if not self._client:
+            return
+        channel = self._client.get_channel(int(chat_id))
+        if not channel:
+            channel = await self._client.fetch_channel(int(chat_id))
+        if not channel:
+            return
+        try:
+            msg = await channel.fetch_message(int(message_id))
+        except Exception:
+            return
+        embed = discord.Embed(description=self.format_message(content))
+        try:
+            await msg.edit(embed=embed)
+        except Exception:
+            return
     
     async def send_voice(
         self,
@@ -811,6 +909,79 @@ class DiscordAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 if DISCORD_AVAILABLE:
+
+    class ListenButtonView(discord.ui.View):
+        """Button view that reads the current embed text aloud via TTS."""
+
+        def __init__(self, adapter: "DiscordAdapter"):
+            super().__init__(timeout=3600)  # 1 hour
+            self.adapter = adapter
+
+        @discord.ui.button(label="Listen", style=discord.ButtonStyle.secondary, emoji="🔊")
+        async def listen(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            try:
+                if not interaction.message:
+                    await interaction.response.send_message(
+                        "No message context available for TTS.", ephemeral=True
+                    )
+                    return
+
+                # Use embed description first (gateway uses embeds for normal replies).
+                text = ""
+                if interaction.message.embeds:
+                    text = (interaction.message.embeds[0].description or "").strip()
+                if not text:
+                    text = (interaction.message.content or "").strip()
+                if not text:
+                    await interaction.response.send_message(
+                        "Nothing to read from this message.", ephemeral=True
+                    )
+                    return
+
+                await interaction.response.defer(ephemeral=True, thinking=False)
+
+                from tools.tts_tool import text_to_speech_tool
+                tts_json = await asyncio.to_thread(text_to_speech_tool, text)
+                data = json.loads(tts_json)
+                if not data.get("success"):
+                    await interaction.followup.send(
+                        f"TTS failed: {data.get('error', 'unknown error')}",
+                        ephemeral=True,
+                    )
+                    return
+
+                audio_path = str(data.get("file_path", "")).strip()
+                if not audio_path:
+                    await interaction.followup.send(
+                        "TTS returned no output file path.",
+                        ephemeral=True,
+                    )
+                    return
+
+                result = await self.adapter.send_voice(
+                    chat_id=str(interaction.channel_id),
+                    audio_path=audio_path,
+                    reply_to=str(interaction.message.id),
+                )
+                if not result.success:
+                    await interaction.followup.send(
+                        f"Failed to send audio: {result.error}",
+                        ephemeral=True,
+                    )
+                    return
+
+                await interaction.followup.send("Sent audio for this message.", ephemeral=True)
+            except Exception:
+                logger.exception("[discord] listen button handler failed")
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send("TTS failed unexpectedly.", ephemeral=True)
+                    else:
+                        await interaction.response.send_message("TTS failed unexpectedly.", ephemeral=True)
+                except Exception:
+                    pass
 
     class ExecApprovalView(discord.ui.View):
         """

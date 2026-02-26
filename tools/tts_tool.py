@@ -276,6 +276,18 @@ def text_to_speech_tool(
     # produce Opus natively (no ffmpeg needed).  Edge TTS always outputs MP3
     # and needs ffmpeg for conversion.
     platform = os.getenv("HERMES_SESSION_PLATFORM", "").lower()
+    # Safety default: disable TTS on Discord unless explicitly re-enabled.
+    # This prevents self-reinforcing audio loops in bot chats.
+    if platform == "discord":
+        allow_discord_tts = os.getenv("HERMES_ALLOW_DISCORD_TTS", "false").strip().lower()
+        if allow_discord_tts not in ("1", "true", "yes", "on"):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "text_to_speech is disabled for Discord by safety guard. "
+                    "Set HERMES_ALLOW_DISCORD_TTS=true to re-enable."
+                ),
+            }, ensure_ascii=False)
     want_opus = (platform == "telegram")
 
     # Determine output path

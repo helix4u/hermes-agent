@@ -242,8 +242,6 @@ Create a markdown summary that captures all key information in a well-organized,
             if _aux_async_client is None:
                 logger.warning("No auxiliary model available for web content processing")
                 return None
-            from agent.auxiliary_client import get_auxiliary_extra_body
-            _extra = get_auxiliary_extra_body()
             response = await _aux_async_client.chat.completions.create(
                 model=model,
                 messages=[
@@ -252,7 +250,6 @@ Create a markdown summary that captures all key information in a well-organized,
                 ],
                 temperature=0.1,
                 max_tokens=max_tokens,
-                **({} if not _extra else {"extra_body": _extra}),
             )
             return response.choices[0].message.content.strip()
         except Exception as api_error:
@@ -365,8 +362,6 @@ Create a single, unified markdown summary."""
                 fallback = fallback[:max_output_size] + "\n\n[... truncated ...]"
             return fallback
 
-        from agent.auxiliary_client import get_auxiliary_extra_body
-        _extra = get_auxiliary_extra_body()
         response = await _aux_async_client.chat.completions.create(
             model=model,
             messages=[
@@ -375,7 +370,6 @@ Create a single, unified markdown summary."""
             ],
             temperature=0.1,
             max_tokens=4000,
-            **({} if not _extra else {"extra_body": _extra}),
         )
         final_summary = response.choices[0].message.content.strip()
         

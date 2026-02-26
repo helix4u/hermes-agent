@@ -260,8 +260,18 @@ class ShellFileOperations(FileOperations):
         # IMPORTANT: do NOT fall back to os.getcwd() -- that's the HOST's local
         # path which doesn't exist inside container/cloud backends (modal, docker).
         # If nothing provides a cwd, use "/" as a safe universal default.
-        self.cwd = cwd or getattr(terminal_env, 'cwd', None) or \
-                   getattr(getattr(terminal_env, 'config', None), 'cwd', None) or "/"
+        resolved_cwd = (
+            cwd
+            or getattr(terminal_env, "cwd", None)
+            or getattr(getattr(terminal_env, "config", None), "cwd", None)
+        )
+        if not resolved_cwd:
+            resolved_cwd = os.path.expanduser("~") if os.name == "nt" else "/"
+        # Normalize "~" style working directories on Windows so relative file
+        # paths like "agents/worldview.md" resolve correctly.
+        if os.name == "nt":
+            resolved_cwd = str(Path(str(resolved_cwd)).expanduser())
+        self.cwd = resolved_cwd
         
         # Cache for command availability checks
         self._command_cache: Dict[str, bool] = {}
@@ -289,8 +299,12 @@ class ShellFileOperations(FileOperations):
     def _has_command(self, cmd: str) -> bool:
         """Check if a command exists in the environment (cached)."""
         if cmd not in self._command_cache:
-            result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
-            self._command_cache[cmd] = result.stdout.strip() == 'yes'
+            if os.name == "nt":
+                # PowerShell/cmd path: "where" is available by default.
+                result = self._exec(f"where {cmd} >nul 2>nul && echo yes")
+            else:
+                result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
+            self._command_cache[cmd] = result.stdout.strip().lower() == "yes"
         return self._command_cache[cmd]
     
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
@@ -338,6 +352,9 @@ class ShellFileOperations(FileOperations):
         """
         if not path:
             return path
+        # Native expansion on Windows local backends.
+        if os.name == "nt":
+            return os.path.expandvars(os.path.expanduser(path))
         
         # Handle ~ and ~user
         if path.startswith('~'):
@@ -355,6 +372,32 @@ class ShellFileOperations(FileOperations):
                     return expand_result.stdout.strip()
         
         return path
+
+    def _resolve_windows_path(self, path: str) -> str:
+        """
+        Resolve a potentially relative Windows path with workspace-aware fallback.
+
+        Resolution order for relative paths:
+        1) <cwd>/<path>
+        2) <cwd>/workspace/<path>
+        3) ~/.hermes/workspace/<path>
+        Returns the first existing path, else the first candidate.
+        """
+        expanded = self._expand_path(path)
+        if os.path.isabs(expanded):
+            return os.path.normpath(expanded)
+
+        candidates = []
+        if self.cwd:
+            candidates.append(os.path.normpath(os.path.join(self.cwd, expanded)))
+            candidates.append(os.path.normpath(os.path.join(self.cwd, "workspace", expanded)))
+        hermes_ws = os.path.normpath(os.path.expanduser(r"~/.hermes/workspace"))
+        candidates.append(os.path.normpath(os.path.join(hermes_ws, expanded)))
+
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        return candidates[0] if candidates else os.path.normpath(expanded)
     
     def _escape_shell_arg(self, arg: str) -> str:
         """Escape a string for safe use in shell commands."""
@@ -377,17 +420,11 @@ class ShellFileOperations(FileOperations):
     # =========================================================================
     
     def read_file(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
-        """
-        Read a file with pagination, binary detection, and line numbers.
-        
-        Args:
-            path: File path (absolute or relative to cwd)
-            offset: Line number to start from (1-indexed, default 1)
-            limit: Maximum lines to return (default 500, max 2000)
-        
-        Returns:
-            ReadResult with content, metadata, or error info
-        """
+        # Windows backend: use native Python/os calls instead of POSIX shell
+        # tools like stat/head/sed, which aren't available in PowerShell.
+        if os.name == "nt":
+            return self._read_file_windows(path, offset, limit)
+        # POSIX path: use shell tools for compatibility with container/remote backends.
         # Expand ~ and other shell paths
         path = self._expand_path(path)
         
@@ -464,6 +501,72 @@ class ShellFileOperations(FileOperations):
             truncated=truncated,
             hint=hint
         )
+
+    def _read_file_windows(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
+        """
+        Windows implementation of read_file using native os/file APIs.
+        
+        Avoids reliance on POSIX tools like stat/head/sed which are not
+        available in PowerShell-backed environments.
+        """
+        # Resolve to absolute path relative to the current working directory
+        # of the terminal backend.
+        path = self._resolve_windows_path(path)
+        
+        if not os.path.exists(path):
+            return self._suggest_similar_files(path)
+        
+        # Directories are not readable as files; return a helpful error.
+        if os.path.isdir(path):
+            try:
+                entries = os.listdir(path)
+            except OSError:
+                entries = []
+            # Show a small sample of children as a hint
+            sample = entries[:20]
+            hint = None
+            if sample:
+                hint = "Directory contents:\n" + "\n".join(f"- {name}" for name in sample)
+            return ReadResult(
+                error="Path is a directory, not a file.",
+                hint=hint,
+                similar_files=[os.path.join(path, name) for name in sample] if sample else [],
+            )
+        
+        try:
+            file_size = os.path.getsize(path)
+        except OSError:
+            file_size = 0
+        
+        # Clamp limit
+        limit = min(limit, MAX_LINES)
+        if offset < 1:
+            offset = 1
+        
+        # Read all lines once, then slice for pagination
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except Exception as e:
+            return ReadResult(error=f"Failed to read file: {type(e).__name__}: {e}")
+        
+        total_lines = len(lines)
+        start_idx = offset - 1
+        end_idx = start_idx + limit
+        page_lines = lines[start_idx:end_idx] if start_idx < total_lines else []
+        truncated = end_idx < total_lines
+        hint = None
+        if truncated:
+            hint = f"Use offset={end_idx + 1} to continue reading (showing {offset}-{end_idx} of {total_lines} lines)"
+        
+        content = "".join(page_lines)
+        return ReadResult(
+            content=self._add_line_numbers(content, offset),
+            total_lines=total_lines,
+            file_size=file_size,
+            truncated=truncated,
+            hint=hint,
+        )
     
     # Images larger than this are too expensive to inline as base64 in the
     # conversation context. Return metadata only and suggest vision_analyze.
@@ -534,6 +637,8 @@ class ShellFileOperations(FileOperations):
     
     def _suggest_similar_files(self, path: str) -> ReadResult:
         """Suggest similar files when the requested file is not found."""
+        if os.name == "nt":
+            return self._suggest_similar_files_windows(path)
         # Get directory and filename
         dir_path = os.path.dirname(path) or "."
         filename = os.path.basename(path)
@@ -555,6 +660,68 @@ class ShellFileOperations(FileOperations):
         return ReadResult(
             error=f"File not found: {path}",
             similar_files=similar[:5]  # Limit to 5 suggestions
+        )
+
+    def _suggest_similar_files_windows(self, path: str) -> ReadResult:
+        """Windows-native similar-file suggestions (no shell dependencies)."""
+        dir_path = os.path.dirname(path) or self.cwd or "."
+        filename = os.path.basename(path)
+        try:
+            candidates = os.listdir(dir_path)
+        except OSError:
+            candidates = []
+        similar = []
+        target_lower = filename.lower()
+        for name in candidates:
+            common = set(target_lower) & set(name.lower())
+            if filename and len(common) >= max(1, int(len(filename) * 0.5)):
+                similar.append(os.path.join(dir_path, name))
+
+        # If directory-local suggestions are empty, scan common roots to give
+        # the model concrete existing paths instead of repeated blind reads.
+        if not similar:
+            roots = []
+            if self.cwd:
+                roots.append(self.cwd)
+                roots.append(os.path.join(self.cwd, "workspace"))
+            roots.append(os.path.expanduser(r"~/.hermes/workspace"))
+            roots.append(os.path.expanduser(r"~/.hermes"))
+
+            needle = (os.path.splitext(filename)[0] or filename).lower()
+            seen = set()
+            for root in roots:
+                if not root or not os.path.isdir(root):
+                    continue
+                try:
+                    for walk_root, _, files in os.walk(root):
+                        for name in files:
+                            lname = name.lower()
+                            if needle and needle in lname:
+                                full = os.path.normpath(os.path.join(walk_root, name))
+                                if full not in seen:
+                                    similar.append(full)
+                                    seen.add(full)
+                                    if len(similar) >= 8:
+                                        break
+                        if len(similar) >= 8:
+                            break
+                except Exception:
+                    continue
+                if len(similar) >= 8:
+                    break
+
+        hint = None
+        if similar:
+            hint_lines = "\n".join(f"- {p}" for p in similar[:5])
+            hint = (
+                "Closest existing files:\n"
+                f"{hint_lines}\n"
+                "Tip: prefer these exact paths or read the containing directory first."
+            )
+        return ReadResult(
+            error=f"File not found: {path}",
+            similar_files=similar[:5],
+            hint=hint,
         )
     
     # =========================================================================
@@ -759,12 +926,116 @@ class ShellFileOperations(FileOperations):
         """
         # Expand ~ and other shell paths
         path = self._expand_path(path)
+        if os.name == "nt":
+            return self._search_windows(
+                pattern=pattern,
+                path=path,
+                target=target,
+                file_glob=file_glob,
+                limit=limit,
+                offset=offset,
+                output_mode=output_mode,
+                context=context,
+            )
         
         if target == "files":
             return self._search_files(pattern, path, limit, offset)
         else:
             return self._search_content(pattern, path, file_glob, limit, offset, 
                                         output_mode, context)
+
+    def _search_windows(
+        self,
+        pattern: str,
+        path: str,
+        target: str,
+        file_glob: Optional[str],
+        limit: int,
+        offset: int,
+        output_mode: str,
+        context: int,
+    ) -> SearchResult:
+        """Windows-native search implementation (no grep/find dependency)."""
+        import fnmatch
+        import re as _re
+
+        base_path = self._resolve_windows_path(path or ".")
+        if not os.path.exists(base_path):
+            return SearchResult(error=f"Path not found: {base_path}")
+
+        if target == "files":
+            search_pattern = pattern
+            if not any(ch in search_pattern for ch in ["*", "?", "[", "]"]):
+                search_pattern = f"*{search_pattern}*"
+            matches = []
+            if os.path.isfile(base_path):
+                matches = [base_path] if fnmatch.fnmatch(os.path.basename(base_path), search_pattern) else []
+            else:
+                for root, _, files in os.walk(base_path):
+                    for name in files:
+                        if fnmatch.fnmatch(name, search_pattern):
+                            full = os.path.join(root, name)
+                            matches.append((full, os.path.getmtime(full)))
+                matches.sort(key=lambda x: x[1], reverse=True)
+                matches = [m[0] for m in matches]
+            total = len(matches)
+            page = matches[offset:offset + limit]
+            return SearchResult(files=page, total_count=total, truncated=total > offset + limit)
+
+        try:
+            regex = _re.compile(pattern)
+        except _re.error as e:
+            return SearchResult(error=f"Invalid regex pattern: {e}")
+
+        if os.path.isfile(base_path):
+            files_to_scan = [base_path]
+        else:
+            files_to_scan = []
+            for root, _, files in os.walk(base_path):
+                for name in files:
+                    if file_glob and not fnmatch.fnmatch(name, file_glob):
+                        continue
+                    files_to_scan.append(os.path.join(root, name))
+
+        content_matches: List[SearchMatch] = []
+        files_only = set()
+        counts: Dict[str, int] = {}
+
+        for file_path in files_to_scan:
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+            except Exception:
+                continue
+            hit_count = 0
+            for idx, line in enumerate(lines, start=1):
+                if regex.search(line):
+                    hit_count += 1
+                    if output_mode == "content":
+                        content_matches.append(
+                            SearchMatch(
+                                path=file_path,
+                                line_number=idx,
+                                content=line.rstrip("\r\n")[:500],
+                            )
+                        )
+            if hit_count:
+                files_only.add(file_path)
+                counts[file_path] = hit_count
+
+        if output_mode == "files_only":
+            all_files = sorted(files_only)
+            total = len(all_files)
+            page = all_files[offset:offset + limit]
+            return SearchResult(files=page, total_count=total, truncated=total > offset + limit)
+
+        if output_mode == "count":
+            # Keep full counts map and total count for parity with grep mode.
+            return SearchResult(counts=counts, total_count=sum(counts.values()))
+
+        total = len(content_matches)
+        page = content_matches[offset:offset + limit]
+        return SearchResult(matches=page, total_count=total, truncated=total > offset + limit)
     
     def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name pattern (glob-like)."""
@@ -775,11 +1046,11 @@ class ShellFileOperations(FileOperations):
                       "On Windows, use Git Bash, WSL, or install Unix tools."
             )
         
-        # Auto-prepend **/ for recursive search if not already present
-        if not pattern.startswith('**/') and '/' not in pattern:
-            search_pattern = pattern
-        else:
-            search_pattern = pattern.split('/')[-1]
+        # If the pattern is a plain token (no glob chars), treat it as
+        # substring match for better UX (e.g., "worldview" -> "*worldview*").
+        search_pattern = pattern.split('/')[-1]
+        if not any(ch in search_pattern for ch in ["*", "?", "[", "]"]):
+            search_pattern = f"*{search_pattern}*"
         
         # Use find with modification time sorting
         # -printf '%T@ %p\n' outputs: timestamp path

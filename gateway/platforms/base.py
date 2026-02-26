@@ -564,6 +564,9 @@ class BasePlatformAdapter(ABC):
                 
                 # Send extracted audio/voice files as native attachments
                 for audio_path, is_voice in media_files:
+                    if not os.path.exists(audio_path):
+                        print(f"[{self.name}] Skipping stale voice path (missing file): {audio_path}")
+                        continue
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
@@ -746,3 +749,13 @@ class BasePlatformAdapter(ABC):
             ]
 
         return chunks
+
+    async def edit_message(self, chat_id: str, message_id: str, content: str) -> None:
+        """
+        Optional hook for platforms that support in-place message edits.
+        
+        Default implementation is a no-op; adapters like Discord/Telegram
+        can override this to update a single progress/status message instead
+        of sending many separate updates.
+        """
+        return None
