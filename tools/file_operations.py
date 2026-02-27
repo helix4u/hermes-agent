@@ -410,6 +410,17 @@ class ShellFileOperations(FileOperations):
         """Escape a string for safe use in shell commands."""
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
+
+    @staticmethod
+    def _looks_like_file_glob(pattern: str) -> bool:
+        """Heuristic: pattern appears to be a filename glob, not content regex."""
+        if not pattern:
+            return False
+        # Common glob indicators
+        has_glob = any(ch in pattern for ch in ("*", "?", "[", "]"))
+        # Typical filename-ish suffixes
+        has_ext_hint = "." in pattern and "/" not in pattern and "\\" not in pattern
+        return has_glob and has_ext_hint
     
     def _unified_diff(self, old_content: str, new_content: str, filename: str) -> str:
         """Generate unified diff between old and new content."""
@@ -957,6 +968,12 @@ class ShellFileOperations(FileOperations):
         """
         # Expand ~ and other shell paths
         path = self._expand_path(path)
+
+        # Common model mistake: using grep with a glob pattern (e.g. "*.html").
+        # Treat this as file search to avoid regex parse errors and retry loops.
+        if target == "content" and not file_glob and self._looks_like_file_glob(pattern):
+            target = "files"
+
         if os.name == "nt":
             return self._search_windows(
                 pattern=pattern,
