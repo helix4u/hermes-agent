@@ -44,7 +44,7 @@ def test_cmd_mode_strips_trailing_backslash_in_cd(monkeypatch):
 
     args, kwargs, mode = shell_utils.build_local_subprocess_invocation(
         command="echo hello",
-        work_dir=r"C:\Users\btgil\.hermes\workspace\\",
+        work_dir=r"C:\hermes\workspace\\",
     )
 
     assert mode == "cmd"

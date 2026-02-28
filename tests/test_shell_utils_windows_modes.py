@@ -49,13 +49,13 @@ def test_build_local_subprocess_invocation_powershell_payload(monkeypatch):
 
     args, kwargs, mode = shell_utils.build_local_subprocess_invocation(
         command="echo hello",
-        work_dir=r"C:\Users\btgil\.hermes\workspace\\",
+        work_dir=r"C:\hermes\workspace\\",
     )
 
     assert mode == "powershell"
     assert args[0].lower().endswith("powershell.exe")
     assert "-Command" in args
     ps_command = args[-1]
-    assert "Set-Location -LiteralPath 'C:\\Users\\btgil\\.hermes\\workspace'; echo hello" == ps_command
+    assert "Set-Location -LiteralPath 'C:\\hermes\\workspace'; echo hello" == ps_command
     assert kwargs["shell"] is False
 
