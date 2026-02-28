@@ -2595,7 +2595,7 @@ class AIAgent:
                     response_item_id if isinstance(response_item_id, str) else None,
                 )
 
-                tool_calls.append({
+                tc_dict = {
                     "id": call_id,
                     "call_id": call_id,
                     "response_item_id": response_item_id,
@@ -2605,7 +2605,17 @@ class AIAgent:
                         "arguments": tool_call.function.arguments
                     },
                 }
-                )
+
+                # Preserve extra_content (e.g. Gemini thought_signature) so it
+                # is sent back on subsequent API calls for compatible models.
+                extra = getattr(tool_call, "extra_content", None)
+                if extra is not None:
+                    if hasattr(extra, "model_dump"):
+                        extra = extra.model_dump()
+                    tc_dict["extra_content"] = extra
+
+                tool_calls.append(tc_dict)
+
             msg["tool_calls"] = tool_calls
 
         return msg
