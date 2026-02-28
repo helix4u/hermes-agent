@@ -698,6 +698,18 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
 
+        @tree.command(name="terminal", description="Show or change the local terminal shell (Windows)")
+        @discord.app_commands.describe(mode="powershell, wsl, auto, or cmd. Leave empty to show current.")
+        async def slash_terminal(interaction: discord.Interaction, mode: str = ""):
+            await interaction.response.defer(ephemeral=True)
+            text = f"/terminal {mode}".strip()
+            event = self._build_slash_event(interaction, text)
+            await self.handle_message(event)
+            try:
+                await interaction.followup.send("Terminal mode updated (or shown)~", ephemeral=True)
+            except Exception as e:
+                logger.debug("Discord followup failed: %s", e)
+
         @tree.command(name="personality", description="Set a personality")
         @discord.app_commands.describe(name="Personality name. Leave empty to list available.")
         async def slash_personality(interaction: discord.Interaction, name: str = ""):

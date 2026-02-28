@@ -542,17 +542,14 @@ class SessionStore:
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
         
-        # Also write legacy JSONL (keeps existing tooling working during transition)
+        # Also write legacy JSONL (keeps existing tooling working during transition).
+        # Always use encoding="utf-8" and errors="replace" so we never raise on Windows
+        # (default cp1252) or on odd Unicode in tool output, and the gateway always
+        # gets to send the response to the user.
         transcript_path = self.get_transcript_path(session_id)
         line = json.dumps(message, ensure_ascii=False) + "\n"
-        try:
-            with open(transcript_path, "a", encoding="utf-8", newline="") as f:
-                f.write(line)
-        except UnicodeEncodeError:
-            # Defensive fallback for misconfigured Windows consoles/locales.
-            # We prefer lossy write over dropping the entire transcript append.
-            with open(transcript_path, "a", encoding="utf-8", errors="replace", newline="") as f:
-                f.write(line)
+        with open(transcript_path, "a", encoding="utf-8", errors="replace", newline="") as f:
+            f.write(line)
     
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript."""

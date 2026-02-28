@@ -1094,12 +1094,12 @@ For more help on a command:
                 if not data:
                     print(f"Session '{args.session_id}' not found.")
                     return
-                with open(args.output, "w") as f:
+                with open(args.output, "w", encoding="utf-8", newline="") as f:
                     f.write(_json.dumps(data, ensure_ascii=False) + "\n")
                 print(f"Exported 1 session to {args.output}")
             else:
                 sessions = db.export_all(source=args.source)
-                with open(args.output, "w") as f:
+                with open(args.output, "w", encoding="utf-8", newline="") as f:
                     for s in sessions:
                         f.write(_json.dumps(s, ensure_ascii=False) + "\n")
                 print(f"Exported {len(sessions)} sessions to {args.output}")

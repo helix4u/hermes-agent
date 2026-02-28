@@ -258,7 +258,7 @@ def load_gateway_config() -> GatewayConfig:
     gateway_config_path = Path.home() / ".hermes" / "gateway.json"
     if gateway_config_path.exists():
         try:
-            with open(gateway_config_path, "r") as f:
+            with open(gateway_config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 config = GatewayConfig.from_dict(data)
         except Exception as e:
@@ -383,5 +383,5 @@ def save_gateway_config(config: GatewayConfig) -> None:
     gateway_config_path = Path.home() / ".hermes" / "gateway.json"
     gateway_config_path.parent.mkdir(parents=True, exist_ok=True)
     
-    with open(gateway_config_path, "w") as f:
+    with open(gateway_config_path, "w", encoding="utf-8", newline="") as f:
         json.dump(config.to_dict(), f, indent=2)

@@ -83,6 +83,49 @@ from agent.trajectory import (
 )
 
 
+def _repair_terminal_tool_args(tool_name: str, raw_args: str) -> Optional[str]:
+    """If the tool is 'terminal' and raw_args is broken JSON, try to salvage the command.
+
+    LLMs often produce invalid JSON for terminal (e.g. unescaped quotes in the command
+    string, or truncated output). This tries to extract the "command" value and return
+    valid JSON so we don't have to retry the whole API call.
+    """
+    if tool_name != "terminal" or not raw_args or not raw_args.strip():
+        return None
+    raw = raw_args.strip()
+
+    def try_return(cmd: str) -> Optional[str]:
+        if not cmd:
+            return None
+        try:
+            return json.dumps({"command": cmd})
+        except (TypeError, ValueError):
+            return None
+
+    # 1) Strict: value with only proper \" escapes (stops at first unescaped ")
+    m = re.search(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+    if m:
+        return try_return(m.group(1))
+
+    # 2) Unescaped quote in value (e.g. "command": "powershell -Command "Get-Location..."):
+    #    capture from first " to last " before "}" or ", "
+    m = re.search(r'"command"\s*:\s*"(.*)"\s*[,}]', raw)
+    if m:
+        return try_return(m.group(1))
+
+    # 3) Truncated: "command": " to end
+    m2 = re.search(r'"command"\s*:\s*"(.*)', raw, re.DOTALL)
+    if m2:
+        cmd = m2.group(1).rstrip()
+        if cmd.endswith('"}'):
+            cmd = cmd[:-2]
+        elif cmd.endswith('"'):
+            cmd = cmd[:-1]
+        cmd = re.sub(r'["}\],\s]+$', '', cmd)
+        return try_return(cmd) if cmd else None
+    return None
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -1077,7 +1120,7 @@ class AIAgent:
             context_files_prompt = build_context_files_prompt()
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
-
+        
         now = datetime.now()
         prompt_parts.append(
             f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
@@ -1088,6 +1131,62 @@ class AIAgent:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
 
         return "\n\n".join(prompt_parts)
+    
+    def _build_environment_hint(self) -> str:
+        """
+        Build a per-call environment hint describing the local shell/OS.
+
+        This is injected via the ephemeral system prompt so that changes to
+        HERMES_WINDOWS_SHELL (for example, switching between PowerShell and WSL)
+        take effect on the very next turn without requiring a new session.
+        """
+        # Only add explicit hints for Windows hosts; POSIX shells are already
+        # implied by the environment and less likely to conflict.
+        if os.name != "nt":
+            return ""
+
+        from tools.environments.shell_utils import get_local_shell_mode
+
+        mode = get_local_shell_mode()
+        override = os.getenv("HERMES_WINDOWS_SHELL", "auto").strip().lower() or "auto"
+
+        if mode == "powershell":
+            return (
+                "Environment: You are running on a Windows host with a PowerShell local terminal "
+                f"(HERMES_WINDOWS_SHELL={override}). For commands that run in the *local* terminal, "
+                "use PowerShell syntax and Windows-style paths. Prefer `Get-ChildItem` instead of "
+                "`ls`, `Select-String` instead of `grep`, and `New-Item -ItemType Directory -Force` "
+                "instead of `mkdir -p`. POSIX commands are only appropriate when a tool explicitly "
+                "targets a remote or containerized Unix environment. "
+                "To verify the active shell, run: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell — "
+                "it prints CMD in cmd.exe and PowerShell in PowerShell."
+            )
+        if mode == "wsl":
+            return (
+                "Environment: You are on a Windows host but the local terminal is WSL (Linux) "
+                f"(HERMES_WINDOWS_SHELL={override}). Commands run in a POSIX shell with tools like "
+                "`ls`, `grep`, and `mkdir -p` available, and the Windows filesystem is visible under "
+                "`/mnt/<drive>/...` (for example, `/mnt/c/Users/...`). Use POSIX paths inside WSL, "
+                "not raw `C:\\`-style paths."
+            )
+        if mode == "cmd":
+            return (
+                "Environment: You are running on Windows with a cmd.exe local terminal "
+                f"(HERMES_WINDOWS_SHELL={override}). Run commands *directly in cmd*: use `dir`, `type`, "
+                "`cd`, `mkdir`, `echo %VAR%` for env vars, and `C:\\`-style paths. Do NOT invoke "
+                "powershell.exe or use PowerShell syntax (no `powershell -Command ...`). Do NOT use "
+                "POSIX commands (`pwd`, `uname`, `ls`, `grep`). If a command fails (exit non-zero), "
+                "do not repeat it; try a different approach or report the error. "
+                "To verify the active shell, run: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell — "
+                "it prints CMD in cmd.exe and PowerShell in PowerShell."
+            )
+
+        # Fallback for unexpected modes.
+        return (
+            f"Environment: You are running on Windows with local shell mode '{mode}' "
+            f"(HERMES_WINDOWS_SHELL={override}). Choose command syntax appropriate for this shell "
+            "and do not assume a Unix/POSIX environment unless explicitly indicated."
+        )
     
     def _invalidate_system_prompt(self):
         """
@@ -1583,8 +1682,16 @@ class AIAgent:
         try:
             api_messages = messages.copy()
             effective_system = self._cached_system_prompt or ""
+
+            # Attach ephemeral system prompt and environment hint at API-call time.
+            extra_ephemeral = []
             if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+                extra_ephemeral.append(self.ephemeral_system_prompt)
+            env_hint = self._build_environment_hint()
+            if env_hint:
+                extra_ephemeral.append(env_hint)
+            if extra_ephemeral:
+                effective_system = (effective_system + "\n\n" + "\n\n".join(extra_ephemeral)).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
             if self.prefill_messages:
@@ -1774,12 +1881,18 @@ class AIAgent:
                 # The signature field helps maintain reasoning continuity
                 api_messages.append(api_msg)
             
-            # Build the final system message: cached prompt + ephemeral system prompt.
-            # The ephemeral part is appended here (not baked into the cached prompt)
-            # so it stays out of the session DB and logs.
+            # Build the final system message: cached prompt + ephemeral system prompt
+            # + environment hint. The ephemeral parts are appended here (not baked
+            # into the cached prompt) so they stay out of the session DB and logs.
             effective_system = active_system_prompt or ""
+            extra_ephemeral = []
             if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+                extra_ephemeral.append(self.ephemeral_system_prompt)
+            env_hint = self._build_environment_hint()
+            if env_hint:
+                extra_ephemeral.append(env_hint)
+            if extra_ephemeral:
+                effective_system = (effective_system + "\n\n" + "\n\n".join(extra_ephemeral)).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
             
@@ -2213,6 +2326,7 @@ class AIAgent:
                     
                     # Validate tool call arguments are valid JSON
                     # Handle empty strings as empty objects (common model quirk)
+                    # For "terminal", try to repair common LLM JSON errors (unescaped quotes, truncation)
                     invalid_json_args = []
                     for tc in assistant_message.tool_calls:
                         args = tc.function.arguments
@@ -2223,7 +2337,11 @@ class AIAgent:
                         try:
                             json.loads(args)
                         except json.JSONDecodeError as e:
-                            invalid_json_args.append((tc.function.name, str(e)))
+                            repaired = _repair_terminal_tool_args(tc.function.name, args)
+                            if repaired is not None:
+                                tc.function.arguments = repaired
+                            else:
+                                invalid_json_args.append((tc.function.name, str(e)))
                     
                     if invalid_json_args:
                         # Track retries for invalid JSON arguments

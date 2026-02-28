@@ -592,7 +592,7 @@ def load_config() -> Dict[str, Any]:
     
     if config_path.exists():
         try:
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 user_config = yaml.safe_load(f) or {}
             
             config = _deep_merge(config, user_config)
@@ -607,7 +607,7 @@ def save_config(config: Dict[str, Any]):
     ensure_hermes_home()
     config_path = get_config_path()
     
-    with open(config_path, 'w') as f:
+    with open(config_path, 'w', encoding='utf-8', newline='') as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
 
@@ -838,7 +838,7 @@ def set_config_value(key: str, value: str):
     user_config = {}
     if config_path.exists():
         try:
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 user_config = yaml.safe_load(f) or {}
         except Exception:
             user_config = {}
@@ -866,7 +866,7 @@ def set_config_value(key: str, value: str):
     
     # Write only user config back (not the full merged defaults)
     ensure_hermes_home()
-    with open(config_path, 'w') as f:
+    with open(config_path, 'w', encoding='utf-8', newline='') as f:
         yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
     
     print(f"✓ Set {key} = {value} in {config_path}")

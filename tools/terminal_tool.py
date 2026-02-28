@@ -349,12 +349,15 @@ def _build_terminal_tool_description() -> str:
         elif mode == "powershell":
             windows_note = (
                 "Windows note: with terminal.backend=local, commands run in PowerShell. "
-                "Use PowerShell syntax and Windows paths (e.g. C:\\Users\\... or D:\\...).\n\n"
+                "Use PowerShell syntax and Windows paths (e.g. C:\\Users\\... or D:\\...). "
+                "To detect shell: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell (prints CMD or PowerShell).\n\n"
             )
         else:
             windows_note = (
                 "Windows note: with terminal.backend=local, commands run in cmd.exe. "
-                "Use cmd-compatible syntax and Windows paths (e.g. C:\\Users\\... or D:\\...).\n\n"
+                "Run commands directly in cmd (dir, type, cd, echo %VAR%); do NOT use "
+                "powershell -Command or POSIX (pwd, uname, ls). Use Windows paths (e.g. C:\\Users\\...). "
+                "To detect shell: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell (prints CMD or PowerShell).\n\n"
             )
 
     return windows_note + """Execute shell commands in the configured terminal backend. Filesystem persists between calls.
@@ -801,6 +804,19 @@ def terminal_tool(
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
+        if env_type == "local":
+            logger.info(
+                "Terminal execution request: backend=%s HERMES_WINDOWS_SHELL=%s TERMINAL_CWD=%s",
+                env_type,
+                os.getenv("HERMES_WINDOWS_SHELL", "auto"),
+                config.get("cwd", ""),
+            )
+        else:
+            logger.info(
+                "Terminal execution request: backend=%s cwd=%s",
+                env_type,
+                config.get("cwd", ""),
+            )
 
         # Use task_id for environment isolation
         effective_task_id = task_id or "default"
@@ -1038,7 +1054,13 @@ def terminal_tool(
             # Extract output
             output = result.get("output", "")
             returncode = result.get("returncode", 0)
-            
+            if returncode != 0:
+                logger.info(
+                    "Terminal command failed: exit_code=%s command=%s output=%s",
+                    returncode,
+                    command[:200] + ("..." if len(command) > 200 else ""),
+                    (output[:500] + "..." if len(output) > 500 else output) or "(no output)",
+                )
             # Add helpful message for sudo failures in messaging context
             output = _handle_sudo_failure(output, env_type)
             

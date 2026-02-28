@@ -177,7 +177,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             import yaml
             _cfg_path = os.path.expanduser("~/.hermes/config.yaml")
             if os.path.exists(_cfg_path):
-                with open(_cfg_path) as _f:
+                with open(_cfg_path, encoding="utf-8") as _f:
                     _cfg = yaml.safe_load(_f) or {}
                 _model_cfg = _cfg.get("model", {})
                 if isinstance(_model_cfg, str):
@@ -267,7 +267,7 @@ def tick(verbose: bool = True) -> int:
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
     try:
-        lock_fd = open(_LOCK_FILE, "w")
+        lock_fd = open(_LOCK_FILE, "w", encoding="utf-8")
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:

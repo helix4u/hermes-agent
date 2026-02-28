@@ -85,7 +85,11 @@ def get_local_shell_mode() -> str:
     if _last_logged_mode != mode:
         if is_windows():
             override_label = os.getenv("HERMES_WINDOWS_SHELL", "auto")
-            logger.info("Local shell mode selected: %s (HERMES_WINDOWS_SHELL=%s)", mode, override_label)
+            logger.info(
+                "Local shell mode selected: %s (HERMES_WINDOWS_SHELL=%s)",
+                mode,
+                override_label,
+            )
         else:
             logger.info("Local shell mode selected: %s", mode)
         _last_logged_mode = mode
@@ -123,6 +127,51 @@ def to_windows_path(path: str) -> str:
     if rest:
         return f"{drive}:\\{rest}"
     return f"{drive}:\\"
+
+
+def _windows_path_safe_for_quotes(path: str) -> str:
+    """Return path safe to embed in cmd double-quotes or PowerShell LiteralPath.
+
+    On Windows, \" inside double-quotes escapes the quote, so C:\\path\\
+    becomes invalid. Strip trailing backslash (and slash) so we never pass that.
+    """
+    if not path:
+        return path
+    # Keep drive roots intact (C:\, C:/, or repeated trailing slashes).
+    normalized = path.replace("/", "\\")
+    if re.match(r"^[A-Za-z]:\\*$", normalized):
+        return normalized[:2] + "\\"
+    s = path.rstrip("\\/")
+    return s if s else path
+
+
+def _windows_safe_cwd(work_dir: str | None) -> str:
+    """Return a directory that exists for use as Popen cwd on Windows.
+
+    If the gateway was started from a dir that no longer exists (e.g. removed drive),
+    subprocesses inherit that cwd and fail with 'The filename, directory name, or
+    volume label syntax is incorrect.' So we always pass an explicit cwd that exists.
+    """
+    if work_dir:
+        try:
+            resolved = os.path.abspath(os.path.expanduser(work_dir))
+            if os.path.isdir(resolved):
+                return resolved
+        except (OSError, ValueError):
+            pass
+    try:
+        home = os.path.expanduser("~")
+        if home and os.path.isdir(home):
+            return home
+    except (OSError, ValueError):
+        pass
+    for fallback in ("C:\\", "C:\\Users", "."):
+        try:
+            if os.path.isdir(fallback):
+                return os.path.abspath(fallback)
+        except (OSError, ValueError):
+            continue
+    return os.getcwd()
 
 
 def build_local_subprocess_invocation(
@@ -165,11 +214,28 @@ def build_local_subprocess_invocation(
             mode,
         )
 
+    # Windows cmd/PowerShell: pass explicit cwd so we never inherit a broken gateway cwd
+    safe_cwd = _windows_safe_cwd(work_dir) if is_windows() else None
+    try:
+        work_dir_exists = bool(
+            work_dir
+            and os.path.isdir(os.path.abspath(os.path.expanduser(work_dir)))
+        )
+    except (OSError, ValueError, TypeError):
+        work_dir_exists = False
+
     if mode == "powershell":
         ps_command = command
-        if work_dir:
-            ps_dir = to_windows_path(work_dir).replace("'", "''")
+        if work_dir_exists:
+            raw = to_windows_path(work_dir)
+            ps_dir = _windows_path_safe_for_quotes(raw).replace("'", "''")
             ps_command = f"Set-Location -LiteralPath '{ps_dir}'; {command}"
+        logger.info(
+            "Local invocation: mode=%s cwd=%r ps_command=%s",
+            mode,
+            safe_cwd,
+            ps_command[:300] + ("..." if len(ps_command) > 300 else ""),
+        )
         return (
             [
                 _powershell_executable(),
@@ -184,20 +250,29 @@ def build_local_subprocess_invocation(
             {
                 "shell": False,
                 "creationflags": creationflags,
+                "cwd": safe_cwd,
             },
             mode,
         )
 
+    # Rely on Popen cwd=safe_cwd for working directory. Do not embed "cd /d \"path\""
+    # in the /c argument: subprocess escapes the inner quotes when building the
+    # Windows command line, so cmd sees \"...\" and fails with "The filename,
+    # directory name, or volume label syntax is incorrect."
     cmd_command = command
-    if work_dir:
-        cmd_dir = to_windows_path(work_dir)
-        cmd_command = f'cd /d "{cmd_dir}" && {command}'
     comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe") or "cmd.exe"
+    logger.info(
+        "Local invocation: mode=%s cwd=%r cmd_command=%s",
+        mode,
+        safe_cwd,
+        cmd_command[:300] + ("..." if len(cmd_command) > 300 else ""),
+    )
     return (
         [comspec, "/d", "/s", "/c", cmd_command],
         {
             "shell": False,
             "creationflags": creationflags,
+            "cwd": safe_cwd,
         },
         mode,
     )

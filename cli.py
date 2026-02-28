@@ -30,21 +30,21 @@ os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
 import yaml
 
-# prompt_toolkit for fixed input area TUI
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.styles import Style as PTStyle
-from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.application import Application
-from prompt_toolkit.layout import Layout, HSplit, Window, FormattedTextControl, ConditionalContainer
-from prompt_toolkit.layout.processors import Processor, Transformation, PasswordProcessor, ConditionalProcessor
-from prompt_toolkit.filters import Condition
-from prompt_toolkit.layout.dimension import Dimension
-from prompt_toolkit.layout.menus import CompletionsMenu
-from prompt_toolkit.widgets import TextArea
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit import print_formatted_text as _pt_print
-from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
+# prompt_toolkit for fixed input area TUI (optional dependency; type checker may not resolve)
+from prompt_toolkit.history import FileHistory  # type: ignore[import-untyped]
+from prompt_toolkit.styles import Style as PTStyle  # type: ignore[import-untyped]
+from prompt_toolkit.patch_stdout import patch_stdout  # type: ignore[import-untyped]
+from prompt_toolkit.application import Application  # type: ignore[import-untyped]
+from prompt_toolkit.layout import Layout, HSplit, Window, FormattedTextControl, ConditionalContainer  # type: ignore[import-untyped]
+from prompt_toolkit.layout.processors import Processor, Transformation, PasswordProcessor, ConditionalProcessor  # type: ignore[import-untyped]
+from prompt_toolkit.filters import Condition  # type: ignore[import-untyped]
+from prompt_toolkit.layout.dimension import Dimension  # type: ignore[import-untyped]
+from prompt_toolkit.layout.menus import CompletionsMenu  # type: ignore[import-untyped]
+from prompt_toolkit.widgets import TextArea  # type: ignore[import-untyped]
+from prompt_toolkit.key_binding import KeyBindings  # type: ignore[import-untyped]
+from prompt_toolkit.completion import Completer, Completion  # type: ignore[import-untyped]
+from prompt_toolkit import print_formatted_text as _pt_print  # type: ignore[import-untyped]
+from prompt_toolkit.formatted_text import ANSI as _PT_ANSI  # type: ignore[import-untyped]
 import threading
 import queue
 
@@ -215,7 +215,7 @@ def load_cli_config() -> Dict[str, Any]:
     # Load from file if exists
     if config_path.exists():
         try:
-            with open(config_path, "r") as f:
+            with open(config_path, "r", encoding="utf-8") as f:
                 file_config = yaml.safe_load(f) or {}
             
             _file_has_terminal_config = "terminal" in file_config
@@ -331,7 +331,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-import fire
+import fire  # type: ignore[import-untyped]
 
 # Import the agent and tool systems
 from run_agent import AIAgent
@@ -699,7 +699,7 @@ def save_config_value(key_path: str, value: any) -> bool:
         
         # Load existing config
         if config_path.exists():
-            with open(config_path, 'r') as f:
+            with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f) or {}
         else:
             config = {}
@@ -726,7 +726,7 @@ def save_config_value(key_path: str, value: any) -> bool:
         current[keys[-1]] = value
         
         # Save back
-        with open(config_path, 'w') as f:
+        with open(config_path, 'w', encoding='utf-8', newline='') as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
         
         return True

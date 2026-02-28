@@ -373,6 +373,46 @@ class ShellFileOperations(FileOperations):
         
         return path
 
+    @staticmethod
+    def _normalize_apostrophes(s: str) -> str:
+        """Normalize Unicode apostrophe variants to ASCII so path matching works across sources."""
+        if not s:
+            return s
+        for c in ("\u2018", "\u2019", "\u201a", "\u201b", "`"):
+            s = s.replace(c, "'")
+        return s
+
+    def _resolve_windows_path_apostrophe_fallback(self, path: str) -> Optional[str]:
+        """
+        When path does not exist, look for a file whose name matches when apostrophe
+        variants are normalized (e.g. YouTube titles with '). Tries the path's
+        parent dir, then cwd, workspace, and ~/.hermes/workspace. Returns the first
+        matching existing path, or None.
+        """
+        expanded = self._expand_path(path)
+        requested_name = os.path.basename(expanded) or expanded
+        normalized_requested = self._normalize_apostrophes(requested_name).lower()
+        parents_to_try = []
+        if os.path.isabs(expanded):
+            parents_to_try.append(os.path.dirname(expanded))
+        else:
+            if self.cwd:
+                parents_to_try.append(self.cwd)
+                parents_to_try.append(os.path.join(self.cwd, "workspace"))
+            parents_to_try.append(os.path.normpath(os.path.expanduser(r"~/.hermes/workspace")))
+        for parent in parents_to_try:
+            if not parent or not os.path.isdir(parent):
+                continue
+            try:
+                for name in os.listdir(parent):
+                    if self._normalize_apostrophes(name).lower() == normalized_requested:
+                        full = os.path.normpath(os.path.join(parent, name))
+                        if os.path.isfile(full):
+                            return full
+            except OSError:
+                continue
+        return None
+
     def _resolve_windows_path(self, path: str) -> str:
         """
         Resolve a potentially relative Windows path with workspace-aware fallback.
@@ -382,22 +422,32 @@ class ShellFileOperations(FileOperations):
         2) <cwd>/workspace/<path>
         3) ~/.hermes/workspace/<path>
         Returns the first existing path, else the first candidate.
+        If none exist, tries apostrophe-normalized match in the same directory (e.g. YouTube .vtt files).
         """
         expanded = self._expand_path(path)
         if os.path.isabs(expanded):
-            return os.path.normpath(expanded)
+            resolved = os.path.normpath(expanded)
+        else:
+            candidates = []
+            if self.cwd:
+                candidates.append(os.path.normpath(os.path.join(self.cwd, expanded)))
+                candidates.append(os.path.normpath(os.path.join(self.cwd, "workspace", expanded)))
+            hermes_ws = os.path.normpath(os.path.expanduser(r"~/.hermes/workspace"))
+            candidates.append(os.path.normpath(os.path.join(hermes_ws, expanded)))
 
-        candidates = []
-        if self.cwd:
-            candidates.append(os.path.normpath(os.path.join(self.cwd, expanded)))
-            candidates.append(os.path.normpath(os.path.join(self.cwd, "workspace", expanded)))
-        hermes_ws = os.path.normpath(os.path.expanduser(r"~/.hermes/workspace"))
-        candidates.append(os.path.normpath(os.path.join(hermes_ws, expanded)))
+            resolved = None
+            for candidate in candidates:
+                if os.path.exists(candidate):
+                    resolved = candidate
+                    break
+            if resolved is None:
+                resolved = candidates[0] if candidates else os.path.normpath(expanded)
 
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                return candidate
-        return candidates[0] if candidates else os.path.normpath(expanded)
+        if not os.path.exists(resolved):
+            fallback = self._resolve_windows_path_apostrophe_fallback(resolved)
+            if fallback is not None:
+                return fallback
+        return resolved
 
     def _is_windows_local_backend(self) -> bool:
         """True when running on Windows host with local backend file access."""
@@ -705,7 +755,9 @@ class ShellFileOperations(FileOperations):
             roots.append(os.path.expanduser(r"~/.hermes/workspace"))
             roots.append(os.path.expanduser(r"~/.hermes"))
 
-            needle = (os.path.splitext(filename)[0] or filename).lower()
+            needle = self._normalize_apostrophes(
+                (os.path.splitext(filename)[0] or filename).lower()
+            )
             seen = set()
             for root in roots:
                 if not root or not os.path.isdir(root):
@@ -713,7 +765,7 @@ class ShellFileOperations(FileOperations):
                 try:
                     for walk_root, _, files in os.walk(root):
                         for name in files:
-                            lname = name.lower()
+                            lname = self._normalize_apostrophes(name.lower())
                             if needle and needle in lname:
                                 full = os.path.normpath(os.path.join(walk_root, name))
                                 if full not in seen:

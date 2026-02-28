@@ -56,7 +56,7 @@ _config_path = Path.home() / '.hermes' / 'config.yaml'
 if _config_path.exists():
     try:
         import yaml as _yaml
-        with open(_config_path) as _f:
+        with open(_config_path, encoding="utf-8") as _f:
             _cfg = _yaml.safe_load(_f) or {}
         for _key, _val in _cfg.items():
             if isinstance(_val, (str, int, float, bool)) and _key not in os.environ:
@@ -116,7 +116,7 @@ def _resolve_gateway_model() -> str:
         import yaml as _yaml
         cfg_path = Path.home() / ".hermes" / "config.yaml"
         if cfg_path.exists():
-            with open(cfg_path) as _f:
+            with open(cfg_path, encoding="utf-8") as _f:
                 cfg = _yaml.safe_load(_f) or {}
             m = cfg.get("model")
             if isinstance(m, str) and m.strip():
@@ -190,7 +190,7 @@ class GatewayRunner:
                 import yaml as _y
                 cfg_path = Path.home() / ".hermes" / "config.yaml"
                 if cfg_path.exists():
-                    with open(cfg_path) as _f:
+                    with open(cfg_path, encoding="utf-8") as _f:
                         cfg = _y.safe_load(_f) or {}
                     file_path = cfg.get("prefill_messages_file", "")
             except Exception:
@@ -228,7 +228,7 @@ class GatewayRunner:
             import yaml as _y
             cfg_path = Path.home() / ".hermes" / "config.yaml"
             if cfg_path.exists():
-                with open(cfg_path) as _f:
+                with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
                 return (cfg.get("agent", {}).get("system_prompt", "") or "").strip()
         except Exception:
@@ -249,7 +249,7 @@ class GatewayRunner:
                 import yaml as _y
                 cfg_path = Path.home() / ".hermes" / "config.yaml"
                 if cfg_path.exists():
-                    with open(cfg_path) as _f:
+                    with open(cfg_path, encoding="utf-8") as _f:
                         cfg = _y.safe_load(_f) or {}
                     effort = str(cfg.get("agent", {}).get("reasoning_effort", "") or "").strip()
             except Exception:
@@ -575,6 +575,9 @@ class GatewayRunner:
         
         if command == "personality":
             return await self._handle_personality_command(event)
+        
+        if command in ["terminal", "shell"]:
+            return await self._handle_terminal_command(event)
         
         if command == "retry":
             return await self._handle_retry_command(event)
@@ -941,7 +944,7 @@ class GatewayRunner:
             import yaml
             config_path = Path.home() / '.hermes' / 'config.yaml'
             if config_path.exists():
-                with open(config_path, 'r') as f:
+                with open(config_path, 'r', encoding='utf-8') as f:
                     config = yaml.safe_load(f) or {}
                 personalities = config.get("agent", {}).get("personalities", {})
             else:
@@ -974,13 +977,13 @@ class GatewayRunner:
                 import yaml
                 config_path = Path.home() / '.hermes' / 'config.yaml'
                 if config_path.exists():
-                    with open(config_path, 'r') as f:
+                    with open(config_path, 'r', encoding='utf-8') as f:
                         persisted = yaml.safe_load(f) or {}
                 else:
                     persisted = {}
                 persisted.setdefault("agent", {})
                 persisted["agent"]["system_prompt"] = selected_prompt
-                with open(config_path, 'w') as f:
+                with open(config_path, 'w', encoding='utf-8', newline='') as f:
                     yaml.dump(persisted, f, default_flow_style=False)
             except Exception as e:
                 logger.warning("Failed to persist selected personality prompt: %s", e)
@@ -989,6 +992,94 @@ class GatewayRunner:
         
         available = ", ".join(f"`{n}`" for n in personalities.keys())
         return f"Unknown personality: `{args}`\n\nAvailable: {available}"
+    
+    async def _handle_terminal_command(self, event: MessageEvent) -> str:
+        """Handle /terminal command - show or change the current Windows shell mode.
+
+        Syntax (Windows only):
+          /terminal windows   -> HERMES_WINDOWS_SHELL=powershell
+          /terminal wsl       -> HERMES_WINDOWS_SHELL=wsl
+          /terminal auto      -> HERMES_WINDOWS_SHELL=auto (WSL > PowerShell > cmd)
+          /terminal cmd       -> HERMES_WINDOWS_SHELL=cmd
+        
+        On non-Windows hosts this command is a no-op and reports that only POSIX
+        shells are available.
+        """
+        args = event.get_command_args().strip().lower()
+
+        if os.name != "nt":
+            return (
+                "Terminal mode only applies when the **gateway** runs on Windows. "
+                "Right now the gateway is running on Linux/WSL, so local commands "
+                "always use your default (POSIX) shell. Setting PowerShell here has no effect; "
+                "to use PowerShell for commands, start the gateway from Windows (e.g. PowerShell or cmd)."
+            )
+
+        current = os.getenv("HERMES_WINDOWS_SHELL", "auto")
+        if not args:
+            return (
+                "🖥️ **Current terminal mode:** "
+                f"`{current}`\n\n"
+                "Usage: `/terminal powershell`, `/terminal wsl`, `/terminal auto`, `/terminal cmd`"
+            )
+
+        mode_map = {
+            "windows": "powershell",
+            "pwsh": "powershell",
+            "powershell": "powershell",
+            "wsl": "wsl",
+            "linux": "wsl",
+            "auto": "auto",
+            "cmd": "cmd",
+            "cmd.exe": "cmd",
+        }
+
+        if args not in mode_map:
+            return (
+                f"Unknown terminal mode: `{args}`\n\n"
+                "Valid options on Windows are: `powershell`, `wsl`, `auto`, `cmd` "
+                "(aliases like `windows` and `pwsh` also map to `powershell`)."
+            )
+
+        new_value = mode_map[args]
+        os.environ["HERMES_WINDOWS_SHELL"] = new_value
+        logger.info(
+            "Terminal mode switched to %s (HERMES_WINDOWS_SHELL=%s) by user",
+            new_value,
+            new_value,
+        )
+
+        # Persist into ~/.hermes/config.yaml so restarts keep the selected mode.
+        try:
+            import yaml
+            config_path = Path.home() / ".hermes" / "config.yaml"
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    persisted = yaml.safe_load(f) or {}
+            else:
+                persisted = {}
+
+            # Top-level key so shell_utils can see it even without nested terminal config.
+            persisted["HERMES_WINDOWS_SHELL"] = new_value
+
+            with open(config_path, "w", encoding="utf-8", newline="") as f:
+                yaml.dump(persisted, f, default_flow_style=False)
+        except Exception as e:
+            logger.warning("Failed to persist terminal mode to config.yaml: %s", e)
+
+        human_mode = {
+            "powershell": "PowerShell",
+            "wsl": "WSL (Linux shell)",
+            "cmd": "cmd.exe",
+            "auto": "auto (WSL > PowerShell > cmd)",
+        }.get(new_value, new_value)
+
+        return (
+            f"🖥️ Terminal mode set to **{human_mode}** "
+            f"(`HERMES_WINDOWS_SHELL={new_value}`).\n"
+            "Future *local* commands will use this shell. "
+            "Remote/Unix environments (Docker/SSH/etc.) still use POSIX shells."
+        )
     
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""
@@ -1062,10 +1153,10 @@ class GatewayRunner:
             config_path = Path.home() / '.hermes' / 'config.yaml'
             user_config = {}
             if config_path.exists():
-                with open(config_path) as f:
+                with open(config_path, encoding='utf-8') as f:
                     user_config = yaml.safe_load(f) or {}
             user_config[env_key] = chat_id
-            with open(config_path, 'w') as f:
+            with open(config_path, 'w', encoding='utf-8', newline='') as f:
                 yaml.dump(user_config, f, default_flow_style=False)
             # Also set in the current environment so it takes effect immediately
             os.environ[env_key] = str(chat_id)
@@ -1324,7 +1415,7 @@ class GatewayRunner:
             config_path = Path.home() / '.hermes' / 'config.yaml'
             if config_path.exists():
                 import yaml
-                with open(config_path, 'r') as f:
+                with open(config_path, 'r', encoding='utf-8') as f:
                     user_config = yaml.safe_load(f) or {}
                 platform_toolsets_config = user_config.get("platform_toolsets", {})
         except Exception as e:
@@ -1477,6 +1568,21 @@ class GatewayRunner:
         tools_holder = [None]   # Mutable container for the tool definitions
         
         def run_sync():
+            # Do NOT overwrite mode from config on every turn.
+            # /terminal updates os.environ immediately; config is only persistence for restarts.
+            if os.name == "nt":
+                current_shell = os.environ.get("HERMES_WINDOWS_SHELL", "auto")
+                logger.info(
+                    "Agent run: using in-memory HERMES_WINDOWS_SHELL=%s",
+                    current_shell,
+                )
+                # Force next get_local_shell_mode() call to emit a mode log entry.
+                try:
+                    import tools.environments.shell_utils as _sh
+                    _sh._last_logged_mode = None
+                except Exception:
+                    pass
+
             # Pass session_key to process registry via env var so background
             # processes can be mapped back to this gateway session
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
@@ -1892,7 +1998,7 @@ def main():
     config = None
     if args.config:
         import json
-        with open(args.config) as f:
+        with open(args.config, encoding="utf-8") as f:
             data = json.load(f)
             config = GatewayConfig.from_dict(data)
     

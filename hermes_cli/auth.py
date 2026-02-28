@@ -153,7 +153,7 @@ def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
     lock_path = _auth_lock_path()
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with lock_path.open("a+") as lock_file:
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
         if fcntl is None:
             yield
             return
