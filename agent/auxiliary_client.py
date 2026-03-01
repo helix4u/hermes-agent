@@ -38,6 +38,14 @@ _OR_HEADERS = {
     "X-OpenRouter-Categories": "productivity,cli-agent",
 }
 
+# Nous Portal extra_body for product attribution.
+# Callers should pass this as extra_body in chat.completions.create()
+# when the auxiliary client is backed by Nous Portal.
+NOUS_EXTRA_BODY = {"tags": ["product=hermes-agent"]}
+
+# Set at resolve time — True if the auxiliary client points to Nous Portal
+auxiliary_is_nous: bool = False
+
 # Default auxiliary models per provider
 _OPENROUTER_MODEL = "google/gemini-3-flash-preview"
 _NOUS_MODEL = "gemini-3-flash"
@@ -285,6 +293,9 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
 
     Falls through OpenRouter -> Nous Portal -> custom endpoint -> Codex OAuth -> (None, None).
     """
+    global auxiliary_is_nous
+    auxiliary_is_nous = False
+
     # 1. OpenRouter
     or_key = os.getenv("OPENROUTER_API_KEY")
     if or_key:
@@ -295,6 +306,7 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
     # 2. Nous Portal
     nous = _read_nous_auth()
     if nous:
+        auxiliary_is_nous = True
         logger.debug("Auxiliary text client: Nous Portal")
         return (
             OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url()),

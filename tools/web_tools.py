@@ -154,8 +154,8 @@ async def process_content_with_llm(
         return processed_content
         
     except Exception as e:
-        logger.debug("Error processing content with LLM: %s", e)
-        return f"[Failed to process content: {str(e)[:100]}. Content size: {len(content):,} chars]"
+        logger.info("LLM processing failed for content (%d chars): %s", len(content), str(e)[:200])
+        return None  # Caller falls back to raw content
 
 
 async def _call_summarizer_llm(
@@ -317,7 +317,7 @@ async def _process_large_content_chunked(
     
     if not summaries:
         logger.debug("All chunk summarizations failed")
-        return "[Failed to process large content: all chunk summarizations failed]"
+        return None  # Caller falls back to raw content
     
     logger.info("Got %d/%d chunk summaries", len(summaries), len(chunks))
     
