@@ -589,7 +589,7 @@ class SessionStore:
             return []
         
         messages = []
-        with open(transcript_path, "r", encoding="utf-8") as f:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if line:

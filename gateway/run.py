@@ -1188,12 +1188,12 @@ class GatewayRunner:
         try:
             user_config = {}
             if config_path.exists():
-                with open(config_path) as f:
+                with open(config_path, encoding="utf-8") as f:
                     user_config = yaml.safe_load(f) or {}
             if "model" not in user_config or not isinstance(user_config["model"], dict):
                 user_config["model"] = {}
             user_config["model"]["default"] = args
-            with open(config_path, 'w') as f:
+            with open(config_path, "w", encoding="utf-8", newline="") as f:
                 yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
         except Exception as e:
             return f"⚠️ Failed to save model change: {e}"
@@ -1713,7 +1713,7 @@ class GatewayRunner:
             _tp_cfg_path = _hermes_home / "config.yaml"
             if _tp_cfg_path.exists():
                 import yaml as _tp_yaml
-                with open(_tp_cfg_path) as _tp_f:
+                with open(_tp_cfg_path, encoding="utf-8") as _tp_f:
                     _tp_data = _tp_yaml.safe_load(_tp_f) or {}
                 _progress_cfg = _tp_data.get("display", {})
         except Exception:
@@ -1912,11 +1912,9 @@ class GatewayRunner:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
-            # keys may change without restart).
+            # keys may change without restart). Use encoding-safe loader.
             try:
-                load_dotenv(_env_path, override=True, encoding="utf-8")
-            except UnicodeDecodeError:
-                load_dotenv(_env_path, override=True, encoding="latin-1")
+                load_dotenv_with_fallback(_env_path, override=True, logger=logging.getLogger(__name__))
             except Exception:
                 pass
 

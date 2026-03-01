@@ -48,16 +48,15 @@ def _ensure_utf8_stdio():
 
 _ensure_utf8_stdio()
 
-# Load .env from ~/.hermes/.env first, then project root as dev fallback
-from dotenv import load_dotenv
+# Load .env from ~/.hermes/.env first, then project root as dev fallback (encoding-safe on Windows)
+from agent.env_loader import load_dotenv_with_fallback
 from hermes_cli.config import get_env_path, get_hermes_home
 _user_env = get_env_path()
 if _user_env.exists():
-    try:
-        load_dotenv(dotenv_path=_user_env, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(dotenv_path=_user_env, encoding="latin-1")
-load_dotenv(dotenv_path=PROJECT_ROOT / '.env', override=False)
+    load_dotenv_with_fallback(_user_env, logger=logging.getLogger(__name__))
+_project_env = PROJECT_ROOT / ".env"
+if _project_env.exists():
+    load_dotenv_with_fallback(_project_env, override=False, logger=logging.getLogger(__name__))
 
 # Point mini-swe-agent at ~/.hermes/ so it shares our config
 os.environ.setdefault("MSWEA_GLOBAL_CONFIG_DIR", str(get_hermes_home()))

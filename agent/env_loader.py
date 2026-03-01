@@ -60,7 +60,9 @@ def _parse_env_line(raw_line: str) -> tuple[str, str] | None:
     return key, value
 
 
-def _validate_sensitive_values(env_text: str, path: Path) -> None:
+def _validate_sensitive_values(
+    env_text: str, path: Path, *, encoding_used: str, logger: Optional[logging.Logger] = None
+) -> None:
     invalid_keys: list[str] = []
     for raw in env_text.splitlines():
         parsed = _parse_env_line(raw)
@@ -72,21 +74,33 @@ def _validate_sensitive_values(env_text: str, path: Path) -> None:
         if not PRINTABLE_ASCII_RE.fullmatch(value):
             invalid_keys.append(key)
 
-    if invalid_keys:
-        key_list = ", ".join(sorted(set(invalid_keys)))
-        raise ValueError(
-            f"Invalid non-ASCII bytes detected in sensitive .env values ({key_list}) at {path}. "
-            "Re-save ~/.hermes/.env as UTF-8 and re-enter affected keys."
-        )
+    if not invalid_keys:
+        return
+    key_list = ", ".join(sorted(set(invalid_keys)))
+    # When we used fallback decoding (not UTF-8), .env likely has encoding issues;
+    # warn but allow startup so the gateway runs and user can fix .env later.
+    if encoding_used not in ("utf-8", "utf-8-sig"):
+        if logger:
+            logger.warning(
+                "Non-ASCII in sensitive .env keys (%s) at %s (decoded as %s). "
+                "Re-save ~/.hermes/.env as UTF-8 to fix.",
+                key_list, path, encoding_used,
+            )
+        return
+    raise ValueError(
+        f"Invalid non-ASCII bytes detected in sensitive .env values ({key_list}) at {path}. "
+        "Re-save ~/.hermes/.env as UTF-8 and re-enter affected keys."
+    )
 
 
 def read_env_text_with_fallback(
     path: Path,
     encodings: Optional[Iterable[str]] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> Tuple[str, str]:
     """Read `.env` text with fallback decoding and secret validation."""
     text, encoding_used = read_text_with_fallback(path, encodings=encodings)
-    _validate_sensitive_values(text, path)
+    _validate_sensitive_values(text, path, encoding_used=encoding_used, logger=logger)
     return text, encoding_used
 
 
@@ -105,7 +119,7 @@ def load_dotenv_with_fallback(
     if not path.exists():
         return False
 
-    text, encoding_used = read_env_text_with_fallback(path)
+    text, encoding_used = read_env_text_with_fallback(path, logger=logger)
 
     changed = load_dotenv(stream=io.StringIO(text), override=override)
 

@@ -73,7 +73,7 @@ def _find_session_id(platform: str, chat_id: str) -> Optional[str]:
         return None
 
     try:
-        with open(_SESSIONS_INDEX, encoding="utf-8") as f:
+        with open(_SESSIONS_INDEX, encoding="utf-8", errors="replace") as f:
             data = json.load(f)
     except Exception:
         return None

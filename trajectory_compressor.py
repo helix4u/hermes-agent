@@ -46,9 +46,12 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.console import Console
 from hermes_constants import OPENROUTER_BASE_URL
 
-# Load environment variables
-from dotenv import load_dotenv
-load_dotenv()
+# Load environment variables (encoding-safe on Windows)
+from agent.env_loader import load_dotenv_with_fallback
+for _p in (Path.home() / ".hermes" / ".env", Path.cwd() / ".env"):
+    if _p.exists():
+        load_dotenv_with_fallback(_p)
+        break
 
 
 @dataclass
@@ -97,7 +100,7 @@ class CompressionConfig:
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "CompressionConfig":
         """Load configuration from YAML file."""
-        with open(yaml_path, 'r') as f:
+        with open(yaml_path, "r", encoding="utf-8", errors="replace") as f:
             data = yaml.safe_load(f)
         
         config = cls()

@@ -272,7 +272,7 @@ def load_gateway_config() -> GatewayConfig:
         import yaml
         config_yaml_path = Path.home() / ".hermes" / "config.yaml"
         if config_yaml_path.exists():
-            with open(config_yaml_path) as f:
+            with open(config_yaml_path, encoding="utf-8") as f:
                 yaml_cfg = yaml.safe_load(f) or {}
             sr = yaml_cfg.get("session_reset")
             if sr and isinstance(sr, dict):

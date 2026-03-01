@@ -10,23 +10,19 @@ import subprocess
 import shutil
 from pathlib import Path
 
-from dotenv import load_dotenv
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
-from agent.env_loader import read_env_text_with_fallback
+from agent.env_loader import load_dotenv_with_fallback, read_env_text_with_fallback
 
 PROJECT_ROOT = get_project_root()
 HERMES_HOME = get_hermes_home()
 _ENV_LOAD_ERROR = ""
 
-# Load environment variables from ~/.hermes/.env so API key checks work
+# Load environment variables (encoding-safe on Windows)
 _env_path = get_env_path()
 if _env_path.exists():
-    try:
-        load_dotenv(_env_path, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(_env_path, encoding="latin-1")
-# Also try project .env as dev fallback
-load_dotenv(PROJECT_ROOT / ".env", override=False, encoding="utf-8")
+    load_dotenv_with_fallback(_env_path)
+if (PROJECT_ROOT / ".env").exists():
+    load_dotenv_with_fallback(PROJECT_ROOT / ".env", override=False)
 
 # Point mini-swe-agent at ~/.hermes/ so it shares our config
 os.environ.setdefault("MSWEA_GLOBAL_CONFIG_DIR", str(HERMES_HOME))
