@@ -1783,6 +1783,10 @@ class HermesCLI:
             self._show_gateway_status()
         elif cmd_lower == "/verbose":
             self._toggle_verbose()
+        elif cmd_lower == "/compress":
+            self._manual_compress()
+        elif cmd_lower == "/usage":
+            self._show_usage()
         else:
             # Check for skill slash commands (/gif-search, /axolotl, etc.)
             base_cmd = cmd_lower.split()[0]
@@ -1823,6 +1827,77 @@ class HermesCLI:
             "verbose": "[bold green]Tool progress: VERBOSE[/] — full args, results, and debug logs.",
         }
         self.console.print(labels.get(self.tool_progress_mode, ""))
+
+    def _manual_compress(self):
+        """Manually trigger context compression on the current conversation."""
+        if not self.conversation_history or len(self.conversation_history) < 4:
+            print("(._.) Not enough conversation to compress (need at least 4 messages).")
+            return
+
+        if not self.agent:
+            print("(._.) No active agent -- send a message first.")
+            return
+
+        if not self.agent.compression_enabled:
+            print("(._.) Compression is disabled in config.")
+            return
+
+        original_count = len(self.conversation_history)
+        try:
+            from agent.model_metadata import estimate_messages_tokens_rough
+            approx_tokens = estimate_messages_tokens_rough(self.conversation_history)
+            print(f"🗜️  Compressing {original_count} messages (~{approx_tokens:,} tokens)...")
+
+            compressed, new_system = self.agent._compress_context(
+                self.conversation_history,
+                self.agent._cached_system_prompt or "",
+                approx_tokens=approx_tokens,
+            )
+            self.conversation_history = compressed
+            new_count = len(self.conversation_history)
+            new_tokens = estimate_messages_tokens_rough(self.conversation_history)
+            print(
+                f"  ✅ Compressed: {original_count} → {new_count} messages "
+                f"(~{approx_tokens:,} → ~{new_tokens:,} tokens)"
+            )
+        except Exception as e:
+            print(f"  ❌ Compression failed: {e}")
+
+    def _show_usage(self):
+        """Show cumulative token usage for the current session."""
+        if not self.agent:
+            print("(._.) No active agent -- send a message first.")
+            return
+
+        agent = self.agent
+        prompt = agent.session_prompt_tokens
+        completion = agent.session_completion_tokens
+        total = agent.session_total_tokens
+        calls = agent.session_api_calls
+
+        if calls == 0:
+            print("(._.) No API calls made yet in this session.")
+            return
+
+        # Current context window state
+        compressor = agent.context_compressor
+        last_prompt = compressor.last_prompt_tokens
+        ctx_len = compressor.context_length
+        pct = (last_prompt / ctx_len * 100) if ctx_len else 0
+        compressions = compressor.compression_count
+
+        msg_count = len(self.conversation_history)
+
+        print(f"  📊 Session Token Usage")
+        print(f"  {'─' * 40}")
+        print(f"  Prompt tokens (input):     {prompt:>10,}")
+        print(f"  Completion tokens (output): {completion:>9,}")
+        print(f"  Total tokens:              {total:>10,}")
+        print(f"  API calls:                 {calls:>10,}")
+        print(f"  {'─' * 40}")
+        print(f"  Current context:  {last_prompt:,} / {ctx_len:,} ({pct:.0f}%)")
+        print(f"  Messages:         {msg_count}")
+        print(f"  Compressions:     {compressions}")
 
         if self.verbose:
             logging.getLogger().setLevel(logging.DEBUG)
