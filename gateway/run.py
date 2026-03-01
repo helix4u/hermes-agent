@@ -1933,6 +1933,11 @@ class GatewayRunner:
                         model = _model_cfg
                     elif isinstance(_model_cfg, dict):
                         model = _model_cfg.get("default", model)
+                    # Apply persisted terminal mode so /terminal choice wins over .env.
+                    # Otherwise load_dotenv(override=True) can overwrite in-memory wsl with .env's value.
+                    _shell = _cfg.get("HERMES_WINDOWS_SHELL")
+                    if isinstance(_shell, str) and _shell.strip():
+                        os.environ["HERMES_WINDOWS_SHELL"] = _shell.strip().lower()
             except Exception:
                 pass
 

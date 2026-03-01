@@ -24,6 +24,25 @@ def test_get_local_shell_mode_powershell_falls_back_to_cmd(monkeypatch):
     assert shell_utils.get_local_shell_mode() == "cmd"
 
 
+def test_get_local_shell_mode_switching_follows_env(monkeypatch):
+    """Terminal switching: mode must follow HERMES_WINDOWS_SHELL (no stale cache)."""
+    _set_windows(monkeypatch)
+    monkeypatch.setattr(shell_utils, "_wsl_available", lambda: True)
+    monkeypatch.setattr(shell_utils, "_powershell_executable", lambda: "powershell.exe")
+
+    monkeypatch.setenv("HERMES_WINDOWS_SHELL", "wsl")
+    shell_utils._last_logged_mode = None
+    assert shell_utils.get_local_shell_mode() == "wsl"
+
+    monkeypatch.setenv("HERMES_WINDOWS_SHELL", "powershell")
+    shell_utils._last_logged_mode = None
+    assert shell_utils.get_local_shell_mode() == "powershell"
+
+    monkeypatch.setenv("HERMES_WINDOWS_SHELL", "wsl")
+    shell_utils._last_logged_mode = None
+    assert shell_utils.get_local_shell_mode() == "wsl"
+
+
 def test_build_local_subprocess_invocation_wsl_payload(monkeypatch):
     _set_windows(monkeypatch)
     monkeypatch.setattr(shell_utils, "get_local_shell_mode", lambda: "wsl")

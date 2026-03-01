@@ -347,12 +347,27 @@ class AIAgent:
             client_kwargs["base_url"] = OPENROUTER_BASE_URL
         
         # Handle API key - OpenRouter is the primary provider
-        if api_key:
-            client_kwargs["api_key"] = api_key
+        if api_key and str(api_key).strip():
+            client_kwargs["api_key"] = api_key.strip()
         else:
             # Primary: OPENROUTER_API_KEY, fallback to direct provider keys
-            client_kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY", "")
-        
+            client_kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
+        # Last-resort: load ~/.hermes/.env if key still empty (e.g. env not loaded before this process)
+        if not (client_kwargs.get("api_key") and str(client_kwargs["api_key"]).strip()):
+            try:
+                from dotenv import load_dotenv
+                _hermes_home = os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes"))
+                _env_path = os.path.join(_hermes_home, ".env")
+                if os.path.isfile(_env_path):
+                    load_dotenv(dotenv_path=_env_path, encoding="utf-8")
+                    client_kwargs["api_key"] = os.getenv("OPENROUTER_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
+            except Exception:
+                pass
+        if not (client_kwargs.get("api_key") and str(client_kwargs["api_key"]).strip()):
+            raise ValueError(
+                "No API key available. Set OPENROUTER_API_KEY (or OPENAI_API_KEY) in ~/.hermes/.env or pass api_key= to AIAgent."
+            )
+
         # OpenRouter app attribution — shows hermes-agent in rankings/analytics
         effective_base = client_kwargs.get("base_url", "")
         if "openrouter" in effective_base.lower():

@@ -72,12 +72,15 @@ def _resolve_openrouter_runtime(
         or OPENROUTER_BASE_URL
     ).rstrip("/")
 
-    api_key = (
-        explicit_api_key
-        or os.getenv("OPENAI_API_KEY")
-        or os.getenv("OPENROUTER_API_KEY")
-        or ""
-    )
+    # Use the key that matches the endpoint: OpenRouter expects OPENROUTER_API_KEY,
+    # not OPENAI_API_KEY (e.g. sk-proj-...), or we get 401 Missing Authentication.
+    is_openrouter = "openrouter" in (base_url or "").lower()
+    if explicit_api_key and (explicit_api_key or "").strip():
+        api_key = explicit_api_key.strip()
+    elif is_openrouter:
+        api_key = (os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+    else:
+        api_key = (os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY") or "").strip()
 
     source = "explicit" if (explicit_api_key or explicit_base_url) else "env/config"
 
@@ -110,29 +113,37 @@ def resolve_runtime_provider(
             min_key_ttl_seconds=max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))),
             timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
         )
-        return {
-            "provider": "nous",
-            "api_mode": "chat_completions",
-            "base_url": creds.get("base_url", "").rstrip("/"),
-            "api_key": creds.get("api_key", ""),
-            "source": creds.get("source", "portal"),
-            "expires_at": creds.get("expires_at"),
-            "requested_provider": requested_provider,
-        }
+        api_key = (creds.get("api_key") or "").strip()
+        if api_key:
+            return {
+                "provider": "nous",
+                "api_mode": "chat_completions",
+                "base_url": creds.get("base_url", "").rstrip("/"),
+                "api_key": api_key,
+                "source": creds.get("source", "portal"),
+                "expires_at": creds.get("expires_at"),
+                "requested_provider": requested_provider,
+            }
+        # Nous token missing/expired: fall back to OpenRouter so env keys work
+        provider = "openrouter"
 
     if provider == "openai-codex":
         creds = resolve_codex_runtime_credentials()
-        return {
-            "provider": "openai-codex",
-            "api_mode": "codex_responses",
-            "base_url": creds.get("base_url", "").rstrip("/"),
-            "api_key": creds.get("api_key", ""),
-            "source": creds.get("source", "codex-auth-json"),
-            "auth_file": creds.get("auth_file"),
-            "codex_home": creds.get("codex_home"),
-            "last_refresh": creds.get("last_refresh"),
-            "requested_provider": requested_provider,
-        }
+        api_key = (creds.get("api_key") or "").strip()
+        if api_key:
+            return {
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "base_url": creds.get("base_url", "").rstrip("/"),
+                "api_key": api_key,
+                "source": creds.get("source", "codex-auth-json"),
+                "auth_file": creds.get("auth_file"),
+                "codex_home": creds.get("codex_home"),
+                "last_refresh": creds.get("last_refresh"),
+                "requested_provider": requested_provider,
+            }
+        # Codex not logged in: fall back to OpenRouter
+        provider = "openrouter"
 
     runtime = _resolve_openrouter_runtime(
         requested_provider=requested_provider,

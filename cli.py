@@ -878,8 +878,6 @@ class HermesCLI:
             or os.getenv("OPENROUTER_BASE_URL", CLI_CONFIG["model"]["base_url"])
         )
         self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-        # Max turns priority: CLI arg > env var > config file (agent.max_turns or root max_turns) > default
-        if max_turns != 60:  # CLI arg was explicitly set
         self._nous_key_expires_at: Optional[str] = None
         self._nous_key_source: Optional[str] = None
         # Max turns priority: CLI arg > config file > env var > default
@@ -1041,6 +1039,24 @@ class HermesCLI:
             except Exception:
                 pass
         
+        # Last-resort: ensure API key is set (env may have been loaded after provider resolution)
+        if not (self.api_key and str(self.api_key).strip()):
+            from dotenv import load_dotenv
+            from hermes_cli.config import get_env_path
+            env_path = get_env_path()
+            if env_path.exists():
+                try:
+                    load_dotenv(dotenv_path=env_path, encoding="utf-8")
+                except Exception:
+                    pass
+            self.api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+            self.base_url = self.base_url or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        if not (self.api_key and str(self.api_key).strip()):
+            self.console.print(
+                "[bold red]No API key found. Set OPENROUTER_API_KEY in ~/.hermes/.env or run 'hermes setup'.[/]"
+            )
+            return False
+
         try:
             self.agent = AIAgent(
                 model=self.model,
