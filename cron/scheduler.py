@@ -34,8 +34,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output
 
+# Resolve Hermes home directory (respects HERMES_HOME override)
+_hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
-_LOCK_DIR = Path.home() / ".hermes" / "cron"
+_LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
 
 
@@ -165,17 +168,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # changes take effect without a gateway restart.
         from dotenv import load_dotenv
         try:
-            load_dotenv(os.path.expanduser("~/.hermes/.env"), override=True, encoding="utf-8")
+            load_dotenv(str(_hermes_home / ".env"), override=True, encoding="utf-8")
         except UnicodeDecodeError:
-            load_dotenv(os.path.expanduser("~/.hermes/.env"), override=True, encoding="latin-1")
+            load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
 
-        model = os.getenv("HERMES_MODEL", "google/gemini-2.0-flash-001:free")
-        api_key = os.getenv("OPENROUTER_API_KEY", "")
-        base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
 
         try:
             import yaml
-            _cfg_path = os.path.expanduser("~/.hermes/config.yaml")
+            _cfg_path = str(_hermes_home / "config.yaml")
             if os.path.exists(_cfg_path):
                 with open(_cfg_path, encoding="utf-8") as _f:
                     _cfg = yaml.safe_load(_f) or {}
@@ -184,14 +185,27 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     model = _model_cfg
                 elif isinstance(_model_cfg, dict):
                     model = _model_cfg.get("default", model)
-                    base_url = _model_cfg.get("base_url", base_url)
         except Exception:
             pass
 
+        from hermes_cli.runtime_provider import (
+            resolve_runtime_provider,
+            format_runtime_provider_error,
+        )
+        try:
+            runtime = resolve_runtime_provider(
+                requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+            )
+        except Exception as exc:
+            message = format_runtime_provider_error(exc)
+            raise RuntimeError(message) from exc
+
         agent = AIAgent(
             model=model,
-            api_key=api_key,
-            base_url=base_url,
+            api_key=runtime.get("api_key"),
+            base_url=runtime.get("base_url"),
+            provider=runtime.get("provider"),
+            api_mode=runtime.get("api_mode"),
             quiet_mode=True,
             session_id=f"cron_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )

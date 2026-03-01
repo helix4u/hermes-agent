@@ -1,6 +1,8 @@
 """Local execution environment with interrupt support and non-blocking I/O."""
 
 import os
+import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -11,6 +13,23 @@ from tools.environments.shell_utils import (
     terminate_process_tree,
 )
 
+# Noise lines emitted by interactive shells when stdin is not a terminal.
+# Filtered from output to keep tool results clean.
+_SHELL_NOISE = frozenset({
+    "bash: no job control in this shell",
+    "bash: no job control in this shell\n",
+    "no job control in this shell",
+    "no job control in this shell\n",
+})
+
+
+def _clean_shell_noise(output: str) -> str:
+    """Strip shell startup warnings that leak when using -i without a TTY."""
+    lines = output.split("\n", 2)  # only check first two lines
+    if lines and lines[0].strip() in _SHELL_NOISE:
+        return "\n".join(lines[1:])
+    return output
+
 
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host machine.
@@ -20,6 +39,7 @@ class LocalEnvironment(BaseEnvironment):
     - Background stdout drain thread to prevent pipe buffer deadlocks
     - stdin_data support for piping content (bypasses ARG_MAX limits)
     - sudo -S transform via SUDO_PASSWORD env var
+    - Uses interactive login shell so full user env is available
     """
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
@@ -100,7 +120,8 @@ class LocalEnvironment(BaseEnvironment):
                 time.sleep(0.2)
 
             reader.join(timeout=5)
-            return {"output": "".join(_output_chunks), "returncode": proc.returncode}
+            output = _clean_shell_noise("".join(_output_chunks))
+            return {"output": output, "returncode": proc.returncode}
 
         except Exception as e:
             return {"output": f"Execution error: {str(e)}", "returncode": 1}

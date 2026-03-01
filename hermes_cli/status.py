@@ -12,6 +12,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 from hermes_cli.colors import Colors, color
+from hermes_cli.config import get_env_path, get_env_value
 from hermes_constants import OPENROUTER_MODELS_URL
 
 def check_mark(ok: bool) -> str:
@@ -65,7 +66,7 @@ def show_status(args):
     print(f"  Project:      {PROJECT_ROOT}")
     print(f"  Python:       {sys.version.split()[0]}")
     
-    env_path = PROJECT_ROOT / '.env'
+    env_path = get_env_path()
     print(f"  .env file:    {check_mark(env_path.exists())} {'exists' if env_path.exists() else 'not found'}")
     
     # =========================================================================
@@ -88,7 +89,7 @@ def show_status(args):
     }
     
     for name, env_var in keys.items():
-        value = os.getenv(env_var, "")
+        value = get_env_value(env_var) or ""
         has_key = bool(value)
         display = redact_key(value) if not show_all else value
         print(f"  {name:<12}  {check_mark(has_key)} {display}")
@@ -100,10 +101,12 @@ def show_status(args):
     print(color("◆ Auth Providers", Colors.CYAN, Colors.BOLD))
 
     try:
-        from hermes_cli.auth import get_nous_auth_status
+        from hermes_cli.auth import get_nous_auth_status, get_codex_auth_status
         nous_status = get_nous_auth_status()
+        codex_status = get_codex_auth_status()
     except Exception:
         nous_status = {}
+        codex_status = {}
 
     nous_logged_in = bool(nous_status.get("logged_in"))
     print(
@@ -119,6 +122,20 @@ def show_status(args):
         print(f"    Access exp: {access_exp}")
         print(f"    Key exp:    {key_exp}")
         print(f"    Refresh:    {refresh_label}")
+
+    codex_logged_in = bool(codex_status.get("logged_in"))
+    print(
+        f"  {'OpenAI Codex':<12}  {check_mark(codex_logged_in)} "
+        f"{'logged in' if codex_logged_in else 'not logged in (run: hermes login --provider openai-codex)'}"
+    )
+    codex_auth_file = codex_status.get("auth_file")
+    if codex_auth_file:
+        print(f"    Auth file:  {codex_auth_file}")
+    codex_last_refresh = _format_iso_timestamp(codex_status.get("last_refresh"))
+    if codex_status.get("last_refresh"):
+        print(f"    Refreshed:  {codex_last_refresh}")
+    if codex_status.get("error") and not codex_logged_in:
+        print(f"    Error:      {codex_status.get('error')}")
 
     # =========================================================================
     # Terminal Configuration

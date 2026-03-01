@@ -49,16 +49,26 @@ import threading
 import queue
 
 
-# Load environment variables first
+# Load .env from ~/.hermes/.env first, then project root as dev fallback
 from dotenv import load_dotenv
 from hermes_constants import OPENROUTER_BASE_URL
 
-env_path = Path(__file__).parent / '.env'
-if env_path.exists():
+_hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+_user_env = _hermes_home / ".env"
+_project_env = Path(__file__).parent / '.env'
+if _user_env.exists():
     try:
-        load_dotenv(dotenv_path=env_path, encoding="utf-8")
+        load_dotenv(dotenv_path=_user_env, encoding="utf-8")
     except UnicodeDecodeError:
-        load_dotenv(dotenv_path=env_path, encoding="latin-1")
+        load_dotenv(dotenv_path=_user_env, encoding="latin-1")
+elif _project_env.exists():
+    try:
+        load_dotenv(dotenv_path=_project_env, encoding="utf-8")
+    except UnicodeDecodeError:
+        load_dotenv(dotenv_path=_project_env, encoding="latin-1")
+
+# Point mini-swe-agent at ~/.hermes/ so it shares our config
+os.environ.setdefault("MSWEA_GLOBAL_CONFIG_DIR", str(_hermes_home))
 
 # =============================================================================
 # Configuration Loading
@@ -132,15 +142,6 @@ def load_cli_config() -> Dict[str, Any]:
     else:
         config_path = project_config_path
     
-    # Also load .env from ~/.hermes/.env if it exists
-    user_env_path = Path.home() / '.hermes' / '.env'
-    if user_env_path.exists():
-        from dotenv import load_dotenv
-        try:
-            load_dotenv(dotenv_path=user_env_path, override=True, encoding="utf-8")
-        except UnicodeDecodeError:
-            load_dotenv(dotenv_path=user_env_path, override=True, encoding="latin-1")
-    
     # Default configuration
     defaults = {
         "model": {
@@ -201,7 +202,7 @@ def load_cli_config() -> Dict[str, Any]:
             "max_tool_calls": 50,  # Max RPC tool calls per execution
         },
         "delegation": {
-            "max_iterations": 25,  # Max tool-calling turns per child agent
+            "max_iterations": 45,  # Max tool-calling turns per child agent
             "default_toolsets": ["terminal", "file", "web"],  # Default toolsets for subagents
         },
     }
@@ -286,6 +287,7 @@ def load_cli_config() -> Dict[str, Any]:
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
         "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+        "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
         # Sudo support (works with all backends)
         "sudo_password": "SUDO_PASSWORD",
     }
@@ -298,7 +300,12 @@ def load_cli_config() -> Dict[str, Any]:
     for config_key, env_var in env_mappings.items():
         if config_key in terminal_config:
             if _file_has_terminal_config or env_var not in os.environ:
-                os.environ[env_var] = str(terminal_config[config_key])
+                val = terminal_config[config_key]
+                if isinstance(val, list):
+                    import json
+                    os.environ[env_var] = json.dumps(val)
+                else:
+                    os.environ[env_var] = str(val)
     
     # Apply browser config to environment variables
     browser_config = defaults.get("browser", {})
@@ -399,6 +406,29 @@ def _cprint(text: str):
     prompt_toolkit parse the escapes and render real colors.
     """
     _pt_print(_PT_ANSI(text))
+
+
+class ChatConsole:
+    """Rich Console adapter for prompt_toolkit's patch_stdout context.
+
+    Captures Rich's rendered ANSI output and routes it through _cprint
+    so colors and markup render correctly inside the interactive chat loop.
+    Drop-in replacement for Rich Console — just pass this to any function
+    that expects a console.print() interface.
+    """
+
+    def __init__(self):
+        from io import StringIO
+        self._buffer = StringIO()
+        self._inner = Console(file=self._buffer, force_terminal=True, highlight=False)
+
+    def print(self, *args, **kwargs):
+        self._buffer.seek(0)
+        self._buffer.truncate()
+        self._inner.print(*args, **kwargs)
+        output = self._buffer.getvalue()
+        for line in output.rstrip("\n").split("\n"):
+            _cprint(line)
 
 # ASCII Art - HERMES-AGENT logo (full width, single line - requires ~95 char terminal)
 HERMES_AGENT_LOGO = """[bold #FFD700]██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗       █████╗  ██████╗ ███████╗███╗   ██╗████████╗[/]
@@ -653,23 +683,44 @@ COMMANDS = {
 }
 
 
+# ============================================================================
+# Skill Slash Commands — dynamic commands generated from installed skills
+# ============================================================================
+
+from agent.skill_commands import scan_skill_commands, get_skill_commands, build_skill_invocation_message
+
+_skill_commands = scan_skill_commands()
+
+
 class SlashCommandCompleter(Completer):
-    """Autocomplete for /commands in the input area."""
+    """Autocomplete for /commands and /skill-name in the input area."""
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
-        # Only complete at the start of input, after /
         if not text.startswith("/"):
             return
         word = text[1:]  # strip the leading /
+
+        # Built-in commands
         for cmd, desc in COMMANDS.items():
-            cmd_name = cmd[1:]  # strip leading / from key
+            cmd_name = cmd[1:]
             if cmd_name.startswith(word):
                 yield Completion(
                     cmd_name,
                     start_position=-len(word),
                     display=cmd,
                     display_meta=desc,
+                )
+
+        # Skill commands
+        for cmd, info in _skill_commands.items():
+            cmd_name = cmd[1:]
+            if cmd_name.startswith(word):
+                yield Completion(
+                    cmd_name,
+                    start_position=-len(word),
+                    display=cmd,
+                    display_meta=f"⚡ {info['description'][:50]}",
                 )
 
 
@@ -754,32 +805,36 @@ class HermesCLI:
         provider: str = None,
         api_key: str = None,
         base_url: str = None,
-        max_turns: int = 60,
+        max_turns: int = None,
         verbose: bool = False,
         compact: bool = False,
+        resume: str = None,
     ):
         """
         Initialize the Hermes CLI.
-        
+
         Args:
             model: Model to use (default: from env or claude-sonnet)
             toolsets: List of toolsets to enable (default: all)
-            provider: Inference provider ("auto", "openrouter", "nous")
+            provider: Inference provider ("auto", "openrouter", "nous", "openai-codex")
             api_key: API key (default: from environment)
             base_url: API base URL (default: OpenRouter)
             max_turns: Maximum tool-calling iterations (default: 60)
             verbose: Enable verbose logging
             compact: Use compact display mode
+            resume: Session ID to resume (restores conversation history from SQLite)
         """
         # Initialize Rich console
         self.console = Console()
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
-        self.verbose = verbose if verbose is not None else CLI_CONFIG["agent"].get("verbose", False)
+        # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
+        self.tool_progress_mode = CLI_CONFIG["display"].get("tool_progress", "all")
+        self.verbose = verbose if verbose is not None else (self.tool_progress_mode == "verbose")
         
         # Configuration - priority: CLI args > env vars > config file
         # Model can come from: CLI arg, LLM_MODEL env, OPENAI_MODEL env (custom endpoint), or config
         self.model = model or os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or CLI_CONFIG["model"]["default"]
-        
+
         # Base URL: custom endpoint (OPENAI_BASE_URL) takes precedence over OpenRouter
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", CLI_CONFIG["model"]["base_url"])
 
@@ -804,30 +859,38 @@ class HermesCLI:
             else:
                 self.api_key = openai_key or openrouter_key
 
-        # Provider resolution: determines whether to use OAuth credentials or env var keys
-        from hermes_cli.auth import resolve_provider
+        self._explicit_api_key = api_key
+        self._explicit_base_url = base_url
+
+        # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
             provider
             or os.getenv("HERMES_INFERENCE_PROVIDER")
             or CLI_CONFIG["model"].get("provider")
             or "auto"
         )
-        self.provider = resolve_provider(
-            self.requested_provider,
-            explicit_api_key=api_key,
-            explicit_base_url=base_url,
+        self._provider_source: Optional[str] = None
+        self.provider = self.requested_provider
+        self.api_mode = "chat_completions"
+        self.base_url = (
+            base_url
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("OPENROUTER_BASE_URL", CLI_CONFIG["model"]["base_url"])
         )
-        self._nous_key_expires_at: Optional[str] = None
-        self._nous_key_source: Optional[str] = None
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
         # Max turns priority: CLI arg > env var > config file (agent.max_turns or root max_turns) > default
         if max_turns != 60:  # CLI arg was explicitly set
+        self._nous_key_expires_at: Optional[str] = None
+        self._nous_key_source: Optional[str] = None
+        # Max turns priority: CLI arg > config file > env var > default
+        if max_turns is not None:
             self.max_turns = max_turns
-        elif os.getenv("HERMES_MAX_ITERATIONS"):
-            self.max_turns = int(os.getenv("HERMES_MAX_ITERATIONS"))
         elif CLI_CONFIG["agent"].get("max_turns"):
             self.max_turns = CLI_CONFIG["agent"]["max_turns"]
         elif CLI_CONFIG.get("max_turns"):  # Backwards compat: root-level max_turns
             self.max_turns = CLI_CONFIG["max_turns"]
+        elif os.getenv("HERMES_MAX_ITERATIONS"):
+            self.max_turns = int(os.getenv("HERMES_MAX_ITERATIONS"))
         else:
             self.max_turns = 60
         
@@ -863,57 +926,67 @@ class HermesCLI:
         # Conversation state
         self.conversation_history: List[Dict[str, Any]] = []
         self.session_start = datetime.now()
+        self._resumed = False
         
-        # Generate session ID with timestamp for display and logging
-        # Format: YYYYMMDD_HHMMSS_shortUUID (e.g., 20260201_143052_a1b2c3)
-        timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
-        short_uuid = uuid.uuid4().hex[:6]
-        self.session_id = f"{timestamp_str}_{short_uuid}"
+        # Session ID: reuse existing one when resuming, otherwise generate fresh
+        if resume:
+            self.session_id = resume
+            self._resumed = True
+        else:
+            timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
+            short_uuid = uuid.uuid4().hex[:6]
+            self.session_id = f"{timestamp_str}_{short_uuid}"
         
         # History file for persistent input recall across sessions
         self._history_file = Path.home() / ".hermes_history"
 
     def _ensure_runtime_credentials(self) -> bool:
         """
-        Ensure OAuth provider credentials are fresh before agent use.
-        For Nous Portal: checks agent key TTL, refreshes/re-mints as needed.
-        If the key changed, tears down the agent so it rebuilds with new creds.
+        Ensure runtime credentials are resolved before agent use.
+        Re-resolves provider credentials so key rotation and token refresh
+        are picked up without restarting the CLI.
         Returns True if credentials are ready, False on auth failure.
         """
-        if self.provider != "nous":
-            return True
-
-        from hermes_cli.auth import format_auth_error, resolve_nous_runtime_credentials
+        from hermes_cli.runtime_provider import (
+            resolve_runtime_provider,
+            format_runtime_provider_error,
+        )
 
         try:
-            credentials = resolve_nous_runtime_credentials(
-                min_key_ttl_seconds=max(
-                    60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))
-                ),
-                timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
+            runtime = resolve_runtime_provider(
+                requested=self.requested_provider,
+                explicit_api_key=self._explicit_api_key,
+                explicit_base_url=self._explicit_base_url,
             )
         except Exception as exc:
-            message = format_auth_error(exc)
+            message = format_runtime_provider_error(exc)
             self.console.print(f"[bold red]{message}[/]")
             return False
 
-        api_key = credentials.get("api_key")
-        base_url = credentials.get("base_url")
+        api_key = runtime.get("api_key")
+        base_url = runtime.get("base_url")
+        resolved_provider = runtime.get("provider", "openrouter")
+        resolved_api_mode = runtime.get("api_mode", self.api_mode)
         if not isinstance(api_key, str) or not api_key:
-            self.console.print("[bold red]Nous credential resolver returned an empty API key.[/]")
+            self.console.print("[bold red]Provider resolver returned an empty API key.[/]")
             return False
         if not isinstance(base_url, str) or not base_url:
-            self.console.print("[bold red]Nous credential resolver returned an empty base URL.[/]")
+            self.console.print("[bold red]Provider resolver returned an empty base URL.[/]")
             return False
 
         credentials_changed = api_key != self.api_key or base_url != self.base_url
+        routing_changed = (
+            resolved_provider != self.provider
+            or resolved_api_mode != self.api_mode
+        )
+        self.provider = resolved_provider
+        self.api_mode = resolved_api_mode
+        self._provider_source = runtime.get("source")
         self.api_key = api_key
         self.base_url = base_url
-        self._nous_key_expires_at = credentials.get("expires_at")
-        self._nous_key_source = credentials.get("source")
 
         # AIAgent/OpenAI client holds auth at init time, so rebuild if key rotated
-        if credentials_changed and self.agent is not None:
+        if (credentials_changed or routing_changed) and self.agent is not None:
             self.agent = None
 
         return True
@@ -921,6 +994,7 @@ class HermesCLI:
     def _init_agent(self) -> bool:
         """
         Initialize the agent on first use.
+        When resuming a session, restores conversation history from SQLite.
         
         Returns:
             bool: True if successful, False otherwise
@@ -928,7 +1002,7 @@ class HermesCLI:
         if self.agent is not None:
             return True
 
-        if self.provider == "nous" and not self._ensure_runtime_credentials():
+        if not self._ensure_runtime_credentials():
             return False
 
         # Initialize SQLite session store for CLI sessions
@@ -939,11 +1013,41 @@ class HermesCLI:
         except Exception as e:
             logger.debug("SQLite session store not available: %s", e)
         
+        # If resuming, validate the session exists and load its history
+        if self._resumed and self._session_db:
+            session_meta = self._session_db.get_session(self.session_id)
+            if not session_meta:
+                _cprint(f"\033[1;31mSession not found: {self.session_id}{_RST}")
+                _cprint(f"{_DIM}Use a session ID from a previous CLI run (hermes sessions list).{_RST}")
+                return False
+            restored = self._session_db.get_messages_as_conversation(self.session_id)
+            if restored:
+                self.conversation_history = restored
+                msg_count = len([m for m in restored if m.get("role") == "user"])
+                _cprint(
+                    f"{_GOLD}↻ Resumed session {_BOLD}{self.session_id}{_RST}{_GOLD} "
+                    f"({msg_count} user message{'s' if msg_count != 1 else ''}, "
+                    f"{len(restored)} total messages){_RST}"
+                )
+            else:
+                _cprint(f"{_GOLD}Session {self.session_id} found but has no messages. Starting fresh.{_RST}")
+            # Re-open the session (clear ended_at so it's active again)
+            try:
+                self._session_db._conn.execute(
+                    "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                    (self.session_id,),
+                )
+                self._session_db._conn.commit()
+            except Exception:
+                pass
+        
         try:
             self.agent = AIAgent(
                 model=self.model,
                 api_key=self.api_key,
                 base_url=self.base_url,
+                provider=self.provider,
+                api_mode=self.api_mode,
                 max_iterations=self.max_turns,
                 enabled_toolsets=self.enabled_toolsets,
                 verbose_logging=self.verbose,
@@ -955,6 +1059,7 @@ class HermesCLI:
                 platform="cli",
                 session_db=self._session_db,
                 clarify_callback=self._clarify_callback,
+                honcho_session_key=self.session_id,
             )
             return True
         except Exception as e:
@@ -1035,8 +1140,8 @@ class HermesCLI:
             toolsets_info = f" [dim #B8860B]·[/] [#CD7F32]toolsets: {', '.join(self.enabled_toolsets)}[/]"
 
         provider_info = f" [dim #B8860B]·[/] [dim]provider: {self.provider}[/]"
-        if self.provider == "nous" and self._nous_key_source:
-            provider_info += f" [dim #B8860B]·[/] [dim]key: {self._nous_key_source}[/]"
+        if self._provider_source:
+            provider_info += f" [dim #B8860B]·[/] [dim]auth: {self._provider_source}[/]"
 
         self.console.print(
             f"  {api_indicator} [#FFBF00]{model_short}[/] "
@@ -1045,20 +1150,21 @@ class HermesCLI:
         )
     
     def show_help(self):
-        """Display help information with kawaii ASCII art."""
-        print()
-        print("+" + "-" * 50 + "+")
-        print("|" + " " * 14 + "(^_^)? Available Commands" + " " * 10 + "|")
-        print("+" + "-" * 50 + "+")
-        print()
+        """Display help information."""
+        _cprint(f"\n{_BOLD}+{'-' * 50}+{_RST}")
+        _cprint(f"{_BOLD}|{' ' * 14}(^_^)? Available Commands{' ' * 10}|{_RST}")
+        _cprint(f"{_BOLD}+{'-' * 50}+{_RST}\n")
         
         for cmd, desc in COMMANDS.items():
-            print(f"  {cmd:<15} - {desc}")
+            _cprint(f"  {_GOLD}{cmd:<15}{_RST} {_DIM}-{_RST} {desc}")
         
-        print()
-        print("  Tip: Just type your message to chat with Hermes!")
-        print("  Multi-line: Alt+Enter for a new line")
-        print()
+        if _skill_commands:
+            _cprint(f"\n  ⚡ {_BOLD}Skill Commands{_RST} ({len(_skill_commands)} installed):")
+            for cmd, info in sorted(_skill_commands.items()):
+                _cprint(f"  {_GOLD}{cmd:<22}{_RST} {_DIM}-{_RST} {info['description']}")
+
+        _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")
+        _cprint(f"  {_DIM}Multi-line: Alt+Enter for a new line{_RST}\n")
     
     def show_tools(self):
         """Display available tools with kawaii ASCII art."""
@@ -1083,8 +1189,10 @@ class HermesCLI:
             if toolset not in toolsets:
                 toolsets[toolset] = []
             desc = tool["function"].get("description", "")
-            # Get first sentence or first 60 chars
-            desc = desc.split(".")[0][:60]
+            # First sentence: split on ". " (period+space) to avoid breaking on "e.g." or "v2.0"
+            desc = desc.split("\n")[0]
+            if ". " in desc:
+                desc = desc[:desc.index(". ") + 1]
             toolsets[toolset].append((name, desc))
         
         # Display by toolset
@@ -1132,7 +1240,12 @@ class HermesCLI:
         terminal_cwd = os.getenv("TERMINAL_CWD", os.getcwd())
         terminal_timeout = os.getenv("TERMINAL_TIMEOUT", "60")
         
-        config_path = Path(__file__).parent / 'cli-config.yaml'
+        user_config_path = Path.home() / '.hermes' / 'config.yaml'
+        project_config_path = Path(__file__).parent / 'cli-config.yaml'
+        if user_config_path.exists():
+            config_path = user_config_path
+        else:
+            config_path = project_config_path
         config_status = "(loaded)" if config_path.exists() else "(not found)"
         
         api_key_display = '********' + self.api_key[-4:] if self.api_key and len(self.api_key) > 4 else 'Not set!'
@@ -1170,7 +1283,7 @@ class HermesCLI:
         print()
         print("  -- Session --")
         print(f"  Started:     {self.session_start.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"  Config File: cli-config.yaml {config_status}")
+        print(f"  Config File: {config_path} {config_status}")
         print()
     
     def show_history(self):
@@ -1515,7 +1628,7 @@ class HermesCLI:
     def _handle_skills_command(self, cmd: str):
         """Handle /skills slash command — delegates to hermes_cli.skills_hub."""
         from hermes_cli.skills_hub import handle_skills_slash
-        handle_skills_slash(cmd, self.console)
+        handle_skills_slash(cmd, ChatConsole())
 
     def _show_gateway_status(self):
         """Show status of the gateway and connected messaging platforms."""
@@ -1652,12 +1765,58 @@ class HermesCLI:
             self._handle_skills_command(cmd_original)
         elif cmd_lower == "/platforms" or cmd_lower == "/gateway":
             self._show_gateway_status()
+        elif cmd_lower == "/verbose":
+            self._toggle_verbose()
         else:
-            self.console.print(f"[bold red]Unknown command: {cmd_lower}[/]")
-            self.console.print("[dim #B8860B]Type /help for available commands[/]")
+            # Check for skill slash commands (/gif-search, /axolotl, etc.)
+            base_cmd = cmd_lower.split()[0]
+            if base_cmd in _skill_commands:
+                user_instruction = cmd_original[len(base_cmd):].strip()
+                msg = build_skill_invocation_message(base_cmd, user_instruction)
+                if msg:
+                    skill_name = _skill_commands[base_cmd]["name"]
+                    print(f"\n⚡ Loading skill: {skill_name}")
+                    if hasattr(self, '_pending_input'):
+                        self._pending_input.put(msg)
+                else:
+                    self.console.print(f"[bold red]Failed to load skill for {base_cmd}[/]")
+            else:
+                self.console.print(f"[bold red]Unknown command: {cmd_lower}[/]")
+                self.console.print("[dim #B8860B]Type /help for available commands[/]")
         
         return True
     
+    def _toggle_verbose(self):
+        """Cycle tool progress mode: off → new → all → verbose → off."""
+        cycle = ["off", "new", "all", "verbose"]
+        try:
+            idx = cycle.index(self.tool_progress_mode)
+        except ValueError:
+            idx = 2  # default to "all"
+        self.tool_progress_mode = cycle[(idx + 1) % len(cycle)]
+        self.verbose = self.tool_progress_mode == "verbose"
+
+        if self.agent:
+            self.agent.verbose_logging = self.verbose
+            self.agent.quiet_mode = not self.verbose
+
+        labels = {
+            "off": "[dim]Tool progress: OFF[/] — silent mode, just the final response.",
+            "new": "[yellow]Tool progress: NEW[/] — show each new tool (skip repeats).",
+            "all": "[green]Tool progress: ALL[/] — show every tool call.",
+            "verbose": "[bold green]Tool progress: VERBOSE[/] — full args, results, and debug logs.",
+        }
+        self.console.print(labels.get(self.tool_progress_mode, ""))
+
+        if self.verbose:
+            logging.getLogger().setLevel(logging.DEBUG)
+            for noisy in ('openai', 'openai._base_client', 'httpx', 'httpcore', 'asyncio', 'hpack', 'grpc', 'modal'):
+                logging.getLogger(noisy).setLevel(logging.WARNING)
+        else:
+            logging.getLogger().setLevel(logging.INFO)
+            for quiet_logger in ('tools', 'minisweagent', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
+                logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+
     def _clarify_callback(self, question, choices):
         """
         Platform callback for the clarify tool. Called from the agent thread.
@@ -1823,8 +1982,8 @@ class HermesCLI:
         Returns:
             The agent's response, or None on error
         """
-        # Refresh OAuth credentials if needed (handles key rotation transparently)
-        if self.provider == "nous" and not self._ensure_runtime_credentials():
+        # Refresh provider credentials if needed (handles key rotation transparently)
+        if not self._ensure_runtime_credentials():
             return None
 
         # Initialize agent if needed
@@ -1940,6 +2099,32 @@ class HermesCLI:
             print(f"Error: {e}")
             return None
     
+    def _print_exit_summary(self):
+        """Print session resume info on exit, similar to Claude Code."""
+        print()
+        msg_count = len(self.conversation_history)
+        if msg_count > 0:
+            user_msgs = len([m for m in self.conversation_history if m.get("role") == "user"])
+            tool_calls = len([m for m in self.conversation_history if m.get("role") == "tool" or m.get("tool_calls")])
+            elapsed = datetime.now() - self.session_start
+            hours, remainder = divmod(int(elapsed.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            if hours > 0:
+                duration_str = f"{hours}h {minutes}m {seconds}s"
+            elif minutes > 0:
+                duration_str = f"{minutes}m {seconds}s"
+            else:
+                duration_str = f"{seconds}s"
+            
+            print(f"Resume this session with:")
+            print(f"  hermes --resume {self.session_id}")
+            print()
+            print(f"Session:        {self.session_id}")
+            print(f"Duration:       {duration_str}")
+            print(f"Messages:       {msg_count} ({user_msgs} user, {tool_calls} tool calls)")
+        else:
+            print("Goodbye! ⚕")
+
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
         self.show_banner()
@@ -2198,13 +2383,17 @@ class HermesCLI:
 
         # Paste collapsing: detect large pastes and save to temp file
         _paste_counter = [0]
+        _prev_text_len = [0]
 
         def _on_text_changed(buf):
             """Detect large pastes and collapse them to a file reference."""
             text = buf.text
             line_count = text.count('\n')
-            # Heuristic: if text jumps to 5+ lines in one change, it's a paste
-            if line_count >= 5 and not text.startswith('/'):
+            chars_added = len(text) - _prev_text_len[0]
+            _prev_text_len[0] = len(text)
+            # Heuristic: a real paste adds many characters at once (not just a
+            # single newline from Alt+Enter) AND the result has 5+ lines.
+            if line_count >= 5 and chars_added > 1 and not text.startswith('/'):
                 _paste_counter[0] += 1
                 # Save to temp file
                 paste_dir = Path(os.path.expanduser("~/.hermes/pastes"))
@@ -2600,7 +2789,7 @@ class HermesCLI:
                 except Exception as e:
                     logger.debug("Could not close session in DB: %s", e)
             _run_cleanup()
-            print("\nGoodbye! ⚕")
+            self._print_exit_summary()
 
 
 # ============================================================================
@@ -2615,12 +2804,13 @@ def main(
     provider: str = None,
     api_key: str = None,
     base_url: str = None,
-    max_turns: int = 60,
+    max_turns: int = None,
     verbose: bool = False,
     compact: bool = False,
     list_tools: bool = False,
     list_toolsets: bool = False,
     gateway: bool = False,
+    resume: str = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -2638,12 +2828,14 @@ def main(
         compact: Use compact display mode
         list_tools: List available tools and exit
         list_toolsets: List available toolsets and exit
+        resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
     
     Examples:
         python cli.py                            # Start interactive mode
         python cli.py --toolsets web,terminal    # Use specific toolsets
         python cli.py -q "What is Python?"       # Single query mode
         python cli.py --list-tools               # List tools and exit
+        python cli.py --resume 20260225_143052_a1b2c3  # Resume session
     """
     # Signal to terminal_tool that we're in interactive mode
     # This enables interactive sudo password prompts with timeout
@@ -2692,6 +2884,7 @@ def main(
         max_turns=max_turns,
         verbose=verbose,
         compact=compact,
+        resume=resume,
     )
     
     # Handle list commands (don't init agent for these)
@@ -2713,6 +2906,7 @@ def main(
         cli.show_banner()
         cli.console.print(f"[bold blue]Query:[/] {query}")
         cli.chat(query)
+        cli._print_exit_summary()
         return
     
     # Run interactive mode

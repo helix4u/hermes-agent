@@ -29,6 +29,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
@@ -47,15 +48,20 @@ def _ensure_utf8_stdio():
 
 _ensure_utf8_stdio()
 
-# Load .env file
-from agent.env_loader import load_dotenv_with_fallback, read_env_text_with_fallback
-env_path = PROJECT_ROOT / '.env'
-if env_path.exists():
+# Load .env from ~/.hermes/.env first, then project root as dev fallback
+from dotenv import load_dotenv
+from hermes_cli.config import get_env_path, get_hermes_home
+_user_env = get_env_path()
+if _user_env.exists():
     try:
-        load_dotenv_with_fallback(env_path, logger=logging.getLogger(__name__))
-    except ValueError as exc:
-        print(f"Failed to load {env_path}: {exc}", file=sys.stderr)
-        sys.exit(2)
+        load_dotenv(dotenv_path=_user_env, encoding="utf-8")
+    except UnicodeDecodeError:
+        load_dotenv(dotenv_path=_user_env, encoding="latin-1")
+load_dotenv(dotenv_path=PROJECT_ROOT / '.env', override=False)
+
+# Point mini-swe-agent at ~/.hermes/ so it shares our config
+os.environ.setdefault("MSWEA_GLOBAL_CONFIG_DIR", str(get_hermes_home()))
+os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 
 from hermes_cli import __version__
 from hermes_constants import OPENROUTER_BASE_URL
@@ -66,9 +72,13 @@ logger = logging.getLogger(__name__)
 def _has_any_provider_configured() -> bool:
     """Check if at least one inference provider is usable."""
     from hermes_cli.config import get_env_path, get_hermes_home
+    from hermes_cli.auth import get_auth_status
 
-    # Check env vars (may be set by .env or shell)
-    if os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY"):
+    # Check env vars (may be set by .env or shell).
+    # OPENAI_BASE_URL alone counts — local models (vLLM, llama.cpp, etc.)
+    # often don't require an API key.
+    provider_env_vars = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL")
+    if any(os.getenv(v) for v in provider_env_vars):
         return True
 
     # Check .env file for keys
@@ -82,7 +92,7 @@ def _has_any_provider_configured() -> bool:
                     continue
                 key, _, val = line.partition("=")
                 val = val.strip().strip("'\"")
-                if key.strip() in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY") and val:
+                if key.strip() in provider_env_vars and val:
                     return True
         except Exception:
             pass
@@ -95,8 +105,8 @@ def _has_any_provider_configured() -> bool:
             auth = json.loads(auth_file.read_text())
             active = auth.get("active_provider")
             if active:
-                state = auth.get("providers", {}).get(active, {})
-                if state.get("access_token") or state.get("refresh_token"):
+                status = get_auth_status(active)
+                if status.get("logged_in"):
                     return True
         except Exception:
             pass
@@ -104,8 +114,31 @@ def _has_any_provider_configured() -> bool:
     return False
 
 
+def _resolve_last_cli_session() -> Optional[str]:
+    """Look up the most recent CLI session ID from SQLite. Returns None if unavailable."""
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        sessions = db.search_sessions(source="cli", limit=1)
+        db.close()
+        if sessions:
+            return sessions[0]["id"]
+    except Exception:
+        pass
+    return None
+
+
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    # Resolve --continue into --resume with the latest CLI session
+    if getattr(args, "continue_last", False) and not getattr(args, "resume", None):
+        last_id = _resolve_last_cli_session()
+        if last_id:
+            args.resume = last_id
+        else:
+            print("No previous CLI session found to continue.")
+            sys.exit(1)
+
     # First-run guard: check if any provider is configured before launching
     if not _has_any_provider_configured():
         print()
@@ -134,6 +167,7 @@ def cmd_chat(args):
         "toolsets": args.toolsets,
         "verbose": args.verbose,
         "query": args.query,
+        "resume": getattr(args, "resume", None),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -145,6 +179,116 @@ def cmd_gateway(args):
     """Gateway management commands."""
     from hermes_cli.gateway import gateway_command
     gateway_command(args)
+
+
+def cmd_whatsapp(args):
+    """Set up WhatsApp: enable, configure allowed users, install bridge, pair via QR."""
+    import os
+    import subprocess
+    from pathlib import Path
+    from hermes_cli.config import get_env_value, save_env_value
+
+    print()
+    print("⚕ WhatsApp Setup")
+    print("=" * 50)
+    print()
+    print("This will link your WhatsApp account to Hermes Agent.")
+    print("The agent will respond to messages sent to your WhatsApp number.")
+    print()
+
+    # Step 1: Enable WhatsApp
+    current = get_env_value("WHATSAPP_ENABLED")
+    if current and current.lower() == "true":
+        print("✓ WhatsApp is already enabled")
+    else:
+        save_env_value("WHATSAPP_ENABLED", "true")
+        print("✓ WhatsApp enabled")
+
+    # Step 2: Allowed users
+    current_users = get_env_value("WHATSAPP_ALLOWED_USERS") or ""
+    if current_users:
+        print(f"✓ Allowed users: {current_users}")
+        response = input("\n  Update allowed users? [y/N] ").strip()
+        if response.lower() in ("y", "yes"):
+            phone = input("  Phone number(s) (e.g. 15551234567, comma-separated): ").strip()
+            if phone:
+                save_env_value("WHATSAPP_ALLOWED_USERS", phone.replace(" ", ""))
+                print(f"  ✓ Updated to: {phone}")
+    else:
+        print()
+        phone = input("  Your phone number (e.g. 15551234567): ").strip()
+        if phone:
+            save_env_value("WHATSAPP_ALLOWED_USERS", phone.replace(" ", ""))
+            print(f"  ✓ Allowed users set: {phone}")
+        else:
+            print("  ⚠ No allowlist — the agent will respond to ALL incoming messages")
+
+    # Step 3: Install bridge deps
+    project_root = Path(__file__).resolve().parents[1]
+    bridge_dir = project_root / "scripts" / "whatsapp-bridge"
+    bridge_script = bridge_dir / "bridge.js"
+
+    if not bridge_script.exists():
+        print(f"\n✗ Bridge script not found at {bridge_script}")
+        return
+
+    if not (bridge_dir / "node_modules").exists():
+        print("\n→ Installing WhatsApp bridge dependencies...")
+        result = subprocess.run(
+            ["npm", "install"],
+            cwd=str(bridge_dir),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            print(f"  ✗ npm install failed: {result.stderr}")
+            return
+        print("  ✓ Dependencies installed")
+    else:
+        print("✓ Bridge dependencies already installed")
+
+    # Step 4: Check for existing session
+    session_dir = Path.home() / ".hermes" / "whatsapp" / "session"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    if (session_dir / "creds.json").exists():
+        print("✓ Existing WhatsApp session found")
+        response = input("\n  Re-pair? This will clear the existing session. [y/N] ").strip()
+        if response.lower() in ("y", "yes"):
+            import shutil
+            shutil.rmtree(session_dir, ignore_errors=True)
+            session_dir.mkdir(parents=True, exist_ok=True)
+            print("  ✓ Session cleared")
+        else:
+            print("\n✓ WhatsApp is configured and paired!")
+            print("  Start the gateway with: hermes gateway")
+            return
+
+    # Step 5: Run bridge in pair-only mode (no HTTP server, exits after QR scan)
+    print()
+    print("─" * 50)
+    print("📱 Scan the QR code with your phone:")
+    print("   WhatsApp → Settings → Linked Devices → Link a Device")
+    print("─" * 50)
+    print()
+
+    try:
+        subprocess.run(
+            ["node", str(bridge_script), "--pair-only", "--session", str(session_dir)],
+            cwd=str(bridge_dir),
+        )
+    except KeyboardInterrupt:
+        pass
+
+    print()
+    if (session_dir / "creds.json").exists():
+        print("✓ WhatsApp paired successfully!")
+        print()
+        print("Start the gateway with: hermes gateway")
+        print("Or install as a service: hermes gateway install")
+    else:
+        print("⚠ Pairing may not have completed. Run 'hermes whatsapp' to try again.")
 
 
 def cmd_setup(args):
@@ -159,7 +303,7 @@ def cmd_model(args):
         resolve_provider, get_provider_auth_state, PROVIDER_REGISTRY,
         _prompt_model_selection, _save_model_choice, _update_config_for_provider,
         resolve_nous_runtime_credentials, fetch_nous_models, AuthError, format_auth_error,
-        _login_nous, ProviderConfig,
+        _login_nous,
     )
     from hermes_cli.config import load_config, save_config, get_env_value, save_env_value
 
@@ -182,7 +326,12 @@ def cmd_model(args):
         or config_provider
         or "auto"
     )
-    active = resolve_provider(effective_provider)
+    try:
+        active = resolve_provider(effective_provider)
+    except AuthError as exc:
+        warning = format_auth_error(exc)
+        print(f"Warning: {warning} Falling back to auto provider detection.")
+        active = resolve_provider("auto")
 
     # Detect custom endpoint
     if active == "openrouter" and get_env_value("OPENAI_BASE_URL"):
@@ -191,6 +340,7 @@ def cmd_model(args):
     provider_labels = {
         "openrouter": "OpenRouter",
         "nous": "Nous Portal",
+        "openai-codex": "OpenAI Codex",
         "custom": "Custom endpoint",
     }
     active_label = provider_labels.get(active, active)
@@ -204,11 +354,12 @@ def cmd_model(args):
     providers = [
         ("openrouter", "OpenRouter (100+ models, pay-per-use)"),
         ("nous", "Nous Portal (Nous Research subscription)"),
+        ("openai-codex", "OpenAI Codex"),
         ("custom", "Custom endpoint (self-hosted / VLLM / etc.)"),
     ]
 
     # Reorder so the active provider is at the top
-    active_key = active if active in ("openrouter", "nous") else "custom"
+    active_key = active if active in ("openrouter", "nous", "openai-codex") else "custom"
     ordered = []
     for key, label in providers:
         if key == active_key:
@@ -229,6 +380,8 @@ def cmd_model(args):
         _model_flow_openrouter(config, current_model)
     elif selected_provider == "nous":
         _model_flow_nous(config, current_model)
+    elif selected_provider == "openai-codex":
+        _model_flow_openai_codex(config, current_model)
     elif selected_provider == "custom":
         _model_flow_custom(config)
 
@@ -378,6 +531,46 @@ def _model_flow_nous(config, current_model=""):
             save_env_value("OPENAI_BASE_URL", "")
             save_env_value("OPENAI_API_KEY", "")
         print(f"Default model set to: {selected} (via Nous Portal)")
+    else:
+        print("No change.")
+
+
+def _model_flow_openai_codex(config, current_model=""):
+    """OpenAI Codex provider: ensure logged in, then pick model."""
+    from hermes_cli.auth import (
+        get_codex_auth_status, _prompt_model_selection, _save_model_choice,
+        _update_config_for_provider, _login_openai_codex,
+        PROVIDER_REGISTRY, DEFAULT_CODEX_BASE_URL,
+    )
+    from hermes_cli.codex_models import get_codex_model_ids
+    from hermes_cli.config import get_env_value, save_env_value
+    import argparse
+
+    status = get_codex_auth_status()
+    if not status.get("logged_in"):
+        print("Not logged into OpenAI Codex. Starting login...")
+        print()
+        try:
+            mock_args = argparse.Namespace()
+            _login_openai_codex(mock_args, PROVIDER_REGISTRY["openai-codex"])
+        except SystemExit:
+            print("Login cancelled or failed.")
+            return
+        except Exception as exc:
+            print(f"Login failed: {exc}")
+            return
+
+    codex_models = get_codex_model_ids()
+
+    selected = _prompt_model_selection(codex_models, current_model=current_model)
+    if selected:
+        _save_model_choice(selected)
+        _update_config_for_provider("openai-codex", DEFAULT_CODEX_BASE_URL)
+        # Clear custom endpoint env vars that would otherwise override Codex.
+        if get_env_value("OPENAI_BASE_URL"):
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        print(f"Default model set to: {selected} (via OpenAI Codex)")
     else:
         print("No change.")
 
@@ -624,12 +817,31 @@ def cmd_update(args):
         
         print()
         print("✓ Update complete!")
+        
+        # Auto-restart gateway if it's running as a systemd service
+        try:
+            check = subprocess.run(
+                ["systemctl", "--user", "is-active", "hermes-gateway"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if check.stdout.strip() == "active":
+                print()
+                print("→ Gateway service is running — restarting to pick up changes...")
+                restart = subprocess.run(
+                    ["systemctl", "--user", "restart", "hermes-gateway"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                if restart.returncode == 0:
+                    print("✓ Gateway restarted.")
+                else:
+                    print(f"⚠ Gateway restart failed: {restart.stderr.strip()}")
+                    print("  Try manually: hermes gateway restart")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # No systemd (macOS, WSL1, etc.) — skip silently
+        
         print()
         print("Tip: You can now log in with Nous Portal for inference:")
         print("  hermes login              # Authenticate with Nous Portal")
-        print()
-        print("Note: If you have the gateway service running, restart it:")
-        print("  hermes gateway restart")
         
     except subprocess.CalledProcessError as e:
         print(f"✗ Update failed: {e}")
@@ -646,6 +858,8 @@ def main():
 Examples:
     hermes                        Start interactive chat
     hermes chat -q "Hello"        Single query mode
+    hermes --continue             Resume the most recent session
+    hermes --resume <session_id>  Resume a specific session
     hermes setup                  Run setup wizard
     hermes login                  Authenticate with an inference provider
     hermes logout                 Clear stored authentication
@@ -655,6 +869,7 @@ Examples:
     hermes config set model gpt-4 Set a config value
     hermes gateway                Run messaging gateway
     hermes gateway install        Install as system service
+    hermes sessions list          List past sessions
     hermes update                 Update to latest version
 
 For more help on a command:
@@ -666,6 +881,19 @@ For more help on a command:
         "--version", "-V",
         action="store_true",
         help="Show version and exit"
+    )
+    parser.add_argument(
+        "--resume", "-r",
+        metavar="SESSION_ID",
+        default=None,
+        help="Resume a previous session by ID (shortcut for: hermes chat --resume ID)"
+    )
+    parser.add_argument(
+        "--continue", "-c",
+        dest="continue_last",
+        action="store_true",
+        default=False,
+        help="Resume the most recent CLI session"
     )
     
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -692,7 +920,7 @@ For more help on a command:
     )
     chat_parser.add_argument(
         "--provider",
-        choices=["auto", "openrouter", "nous"],
+        choices=["auto", "openrouter", "nous", "openai-codex"],
         default=None,
         help="Inference provider (default: auto)"
     )
@@ -700,6 +928,18 @@ For more help on a command:
         "-v", "--verbose",
         action="store_true",
         help="Verbose output"
+    )
+    chat_parser.add_argument(
+        "--resume", "-r",
+        metavar="SESSION_ID",
+        help="Resume a previous session by ID (shown on exit)"
+    )
+    chat_parser.add_argument(
+        "--continue", "-c",
+        dest="continue_last",
+        action="store_true",
+        default=False,
+        help="Resume the most recent CLI session"
     )
     chat_parser.set_defaults(func=cmd_chat)
 
@@ -770,6 +1010,16 @@ For more help on a command:
     setup_parser.set_defaults(func=cmd_setup)
 
     # =========================================================================
+    # whatsapp command
+    # =========================================================================
+    whatsapp_parser = subparsers.add_parser(
+        "whatsapp",
+        help="Set up WhatsApp integration",
+        description="Configure WhatsApp and pair via QR code"
+    )
+    whatsapp_parser.set_defaults(func=cmd_whatsapp)
+
+    # =========================================================================
     # login command
     # =========================================================================
     login_parser = subparsers.add_parser(
@@ -779,9 +1029,9 @@ For more help on a command:
     )
     login_parser.add_argument(
         "--provider",
-        choices=["nous"],
+        choices=["nous", "openai-codex"],
         default=None,
-        help="Provider to authenticate with (default: interactive selection)"
+        help="Provider to authenticate with (default: nous)"
     )
     login_parser.add_argument(
         "--portal-url",
@@ -833,7 +1083,7 @@ For more help on a command:
     )
     logout_parser.add_argument(
         "--provider",
-        choices=["nous"],
+        choices=["nous", "openai-codex"],
         default=None,
         help="Provider to log out from (default: active provider)"
     )
@@ -1197,6 +1447,17 @@ For more help on a command:
         cmd_version(args)
         return
     
+    # Handle top-level --resume / --continue as shortcut to chat
+    if (args.resume or args.continue_last) and args.command is None:
+        args.command = "chat"
+        args.query = None
+        args.model = None
+        args.provider = None
+        args.toolsets = None
+        args.verbose = False
+        cmd_chat(args)
+        return
+    
     # Default to chat if no command specified
     if args.command is None:
         args.query = None
@@ -1204,6 +1465,8 @@ For more help on a command:
         args.provider = None
         args.toolsets = None
         args.verbose = False
+        args.resume = None
+        args.continue_last = False
         cmd_chat(args)
         return
     
