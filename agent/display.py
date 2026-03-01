@@ -199,6 +199,24 @@ class KawaiiSpinner:
     def update_text(self, new_message: str):
         self.message = new_message
 
+    def print_above(self, text: str):
+        """Print a line above the spinner without disrupting animation.
+
+        Clears the current spinner line, prints the text, and lets the
+        next animation tick redraw the spinner on the line below.
+        Thread-safe: uses the captured stdout reference (self._out).
+        Works inside redirect_stdout(devnull) because _write bypasses
+        sys.stdout and writes to the stdout captured at spinner creation.
+        """
+        if not self.running:
+            self._write(f"  {text}", flush=True)
+            return
+        # Clear spinner line with spaces (not \033[K) to avoid garbled escape
+        # codes when prompt_toolkit's patch_stdout is active — same approach
+        # as stop(). Then print text; spinner redraws on next tick.
+        blanks = ' ' * max(self.last_line_len + 5, 40)
+        self._write(f"\r{blanks}\r  {text}", flush=True)
+
     def stop(self, final_message: str = None):
         self.running = False
         if self.thread:
