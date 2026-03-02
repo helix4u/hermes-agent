@@ -1808,7 +1808,8 @@ class AIAgent:
 
         allowed_keys = {
             "model", "instructions", "input", "tools", "store",
-            "reasoning", "include", "max_output_tokens", "temperature",
+            "reasoning", "include", "max_output_tokens", "max_tokens", "temperature",
+            "extra_body",
         }
         normalized: Dict[str, Any] = {
             "model": model,
@@ -1826,10 +1827,16 @@ class AIAgent:
         if isinstance(include, list):
             normalized["include"] = include
 
-        # Pass through max_output_tokens and temperature
-        max_output_tokens = api_kwargs.get("max_output_tokens")
-        if isinstance(max_output_tokens, (int, float)) and max_output_tokens > 0:
-            normalized["max_output_tokens"] = int(max_output_tokens)
+        extra_body = api_kwargs.get("extra_body")
+        normalized_extra_body: Dict[str, Any] = {}
+        if isinstance(extra_body, dict):
+            normalized_extra_body = dict(extra_body)
+
+        # Codex Responses currently rejects token-cap parameters in this runtime.
+        # Accept legacy fields for compatibility but strip them from requests.
+        normalized_extra_body.pop("max_tokens", None)
+        if normalized_extra_body:
+            normalized["extra_body"] = normalized_extra_body
         temperature = api_kwargs.get("temperature")
         if isinstance(temperature, (int, float)):
             normalized["temperature"] = float(temperature)
@@ -2201,9 +2208,6 @@ class AIAgent:
             else:
                 kwargs["include"] = []
 
-            if self.max_tokens is not None:
-                kwargs["max_output_tokens"] = self.max_tokens
-
             return kwargs
 
         provider_preferences = {}
@@ -2410,7 +2414,6 @@ class AIAgent:
                     "messages": api_messages,
                     "tools": [memory_tool_def],
                     "temperature": 0.3,
-                    "max_tokens": 5120,
                 }
                 response = aux_client.chat.completions.create(**api_kwargs, timeout=30.0)
             elif self.api_mode == "codex_responses":
@@ -2418,8 +2421,6 @@ class AIAgent:
                 codex_kwargs = self._build_api_kwargs(api_messages)
                 codex_kwargs["tools"] = self._responses_tools([memory_tool_def])
                 codex_kwargs["temperature"] = 0.3
-                if "max_output_tokens" in codex_kwargs:
-                    codex_kwargs["max_output_tokens"] = 5120
                 response = self._run_codex_stream(codex_kwargs)
             else:
                 api_kwargs = {

@@ -945,21 +945,31 @@ class ShellFileOperations(FileOperations):
         Returns:
             PatchResult with diff and lint results
         """
-        # Expand ~ and other shell paths
-        path = self._expand_path(path)
+        # Expand path according to platform/backend.
+        if os.name == "nt":
+            path = self._resolve_windows_path(path)
+        else:
+            path = self._expand_path(path)
 
         # Block writes to sensitive paths
         if _is_write_denied(path):
             return PatchResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
         # Read current content
-        read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-        read_result = self._exec(read_cmd)
-        
-        if read_result.exit_code != 0:
-            return PatchResult(error=f"Failed to read file: {path}")
-        
-        content = read_result.stdout
+        if os.name == "nt":
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception:
+                return PatchResult(error=f"Failed to read file: {path}")
+        else:
+            read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+            read_result = self._exec(read_cmd)
+            
+            if read_result.exit_code != 0:
+                return PatchResult(error=f"Failed to read file: {path}")
+            
+            content = read_result.stdout
         
         # Import and use fuzzy matching
         from tools.fuzzy_match import fuzzy_find_and_replace

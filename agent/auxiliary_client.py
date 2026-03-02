@@ -95,9 +95,6 @@ class _CodexCompletionsAdapter:
             "store": False,
         }
 
-        max_tokens = kwargs.get("max_output_tokens") or kwargs.get("max_completion_tokens") or kwargs.get("max_tokens")
-        if max_tokens is not None:
-            resp_kwargs["max_output_tokens"] = int(max_tokens)
         if temperature is not None:
             resp_kwargs["temperature"] = temperature
 
