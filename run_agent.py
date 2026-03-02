@@ -2738,6 +2738,43 @@ class AIAgent:
             if self.tool_delay > 0 and i < len(assistant_message.tool_calls):
                 time.sleep(self.tool_delay)
 
+    def _fill_missing_tool_outputs(self, messages: list, error_msg: str) -> bool:
+        """Add synthetic tool outputs for assistant tool calls that were never answered.
+
+        Returns True if any synthetic tool output was appended.
+        """
+        pending_handled = False
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if not isinstance(msg, dict):
+                break
+            if msg.get("role") == "tool":
+                continue
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                answered_ids = {
+                    m["tool_call_id"]
+                    for m in messages[idx + 1:]
+                    if isinstance(m, dict) and m.get("role") == "tool"
+                }
+                for tc in msg["tool_calls"]:
+                    if isinstance(tc, dict):
+                        tc_id = tc.get("id")
+                    else:
+                        tc_id = getattr(tc, "id", None)
+                    if tc_id in answered_ids:
+                        continue
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": f"Error executing tool: {error_msg}",
+                    })
+                    self._log_msg_to_db(messages[-1])
+                    pending_handled = True
+                return pending_handled
+            break
+        return False
+
     def _tool_call_signature(self, tool_calls: list) -> str:
         """Build a deterministic signature for a sequence of tool calls."""
         if not tool_calls:
@@ -2821,6 +2858,7 @@ class AIAgent:
             "Please provide a final response summarizing what you've found and accomplished so far, "
             "without calling any more tools."
         )
+        self._fill_missing_tool_outputs(messages, "Tool execution was skipped while handling iteration limit.")
         messages.append({"role": "user", "content": summary_request})
 
         try:
@@ -3974,30 +4012,7 @@ class AIAgent:
                 # If an assistant message with tool_calls was already appended,
                 # the API expects a role="tool" result for every tool_call_id.
                 # Fill in error results for any that weren't answered yet.
-                pending_handled = False
-                for idx in range(len(messages) - 1, -1, -1):
-                    msg = messages[idx]
-                    if not isinstance(msg, dict):
-                        break
-                    if msg.get("role") == "tool":
-                        continue
-                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                        answered_ids = {
-                            m["tool_call_id"]
-                            for m in messages[idx + 1:]
-                            if isinstance(m, dict) and m.get("role") == "tool"
-                        }
-                        for tc in msg["tool_calls"]:
-                            if tc["id"] not in answered_ids:
-                                err_msg = {
-                                    "role": "tool",
-                                    "tool_call_id": tc["id"],
-                                    "content": f"Error executing tool: {error_msg}",
-                                }
-                                messages.append(err_msg)
-                                self._log_msg_to_db(err_msg)
-                        pending_handled = True
-                    break
+                pending_handled = self._fill_missing_tool_outputs(messages, error_msg)
                 
                 if not pending_handled:
                     # Error happened before tool processing (e.g. response parsing).
