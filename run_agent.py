@@ -169,6 +169,8 @@ class AIAgent:
         providers_ignored: List[str] = None,
         providers_order: List[str] = None,
         provider_sort: str = None,
+        provider_require_parameters: bool = False,
+        provider_data_collection: str = None,
         session_id: str = None,
         tool_progress_callback: callable = None,
         clarify_callback: callable = None,
@@ -273,6 +275,8 @@ class AIAgent:
         self.providers_ignored = providers_ignored
         self.providers_order = providers_order
         self.provider_sort = provider_sort
+        self.provider_require_parameters = provider_require_parameters
+        self.provider_data_collection = provider_data_collection
 
         # Store toolset filtering options
         self.enabled_toolsets = enabled_toolsets
@@ -1699,6 +1703,21 @@ class AIAgent:
                 )
                 continue
 
+            if item_type == "reasoning":
+                encrypted = item.get("encrypted_content")
+                if isinstance(encrypted, str) and encrypted:
+                    reasoning_item = {"type": "reasoning", "encrypted_content": encrypted}
+                    item_id = item.get("id")
+                    if isinstance(item_id, str) and item_id:
+                        reasoning_item["id"] = item_id
+                    summary = item.get("summary")
+                    if isinstance(summary, list):
+                        reasoning_item["summary"] = summary
+                    else:
+                        reasoning_item["summary"] = []
+                    normalized.append(reasoning_item)
+                continue
+
             role = item.get("role")
             if role in {"user", "assistant"}:
                 content = item.get("content", "")
@@ -1928,6 +1947,15 @@ class AIAgent:
                     item_id = getattr(item, "id", None)
                     if isinstance(item_id, str) and item_id:
                         raw_item["id"] = item_id
+                    # Capture summary — required by the API when replaying reasoning items
+                    summary = getattr(item, "summary", None)
+                    if isinstance(summary, list):
+                        raw_summary = []
+                        for part in summary:
+                            text = getattr(part, "text", None)
+                            if isinstance(text, str):
+                                raw_summary.append({"type": "summary_text", "text": text})
+                        raw_item["summary"] = raw_summary
                     reasoning_items_raw.append(raw_item)
             elif item_type == "function_call":
                 if item_status in {"queued", "in_progress", "incomplete"}:
@@ -2150,23 +2178,28 @@ class AIAgent:
             if not instructions:
                 instructions = DEFAULT_AGENT_IDENTITY
 
+            # Resolve reasoning effort: config > default (xhigh)
+            reasoning_effort = "xhigh"
+            reasoning_enabled = True
+            if self.reasoning_config and isinstance(self.reasoning_config, dict):
+                if self.reasoning_config.get("enabled") is False:
+                    reasoning_enabled = False
+                elif self.reasoning_config.get("effort"):
+                    reasoning_effort = self.reasoning_config["effort"]
+
             kwargs = {
                 "model": self.model,
                 "instructions": instructions,
                 "input": self._chat_messages_to_responses_input(payload_messages),
                 "tools": self._responses_tools(),
                 "store": False,
-                "reasoning": {"effort": "medium", "summary": "auto"},
-                "include": ["reasoning.encrypted_content"],
             }
 
-            # Apply reasoning effort from config if set
-            if self.reasoning_config and isinstance(self.reasoning_config, dict):
-                if self.reasoning_config.get("enabled") is False:
-                    kwargs.pop("reasoning", None)
-                    kwargs["include"] = []
-                elif self.reasoning_config.get("effort"):
-                    kwargs["reasoning"]["effort"] = self.reasoning_config["effort"]
+            if reasoning_enabled:
+                kwargs["reasoning"] = {"effort": reasoning_effort, "summary": "auto"}
+                kwargs["include"] = ["reasoning.encrypted_content"]
+            else:
+                kwargs["include"] = []
 
             if self.max_tokens is not None:
                 kwargs["max_output_tokens"] = self.max_tokens
@@ -2182,6 +2215,10 @@ class AIAgent:
             provider_preferences["order"] = self.providers_order
         if self.provider_sort:
             provider_preferences["sort"] = self.provider_sort
+        if self.provider_require_parameters:
+            provider_preferences["require_parameters"] = True
+        if self.provider_data_collection:
+            provider_preferences["data_collection"] = self.provider_data_collection
 
         api_kwargs = {
             "model": self.model,
@@ -2758,6 +2795,20 @@ class AIAgent:
                 }
                 if self.max_tokens is not None:
                     summary_kwargs.update(self._max_tokens_param(self.max_tokens))
+
+                # Include provider routing preferences
+                provider_preferences = {}
+                if self.providers_allowed:
+                    provider_preferences["only"] = self.providers_allowed
+                if self.providers_ignored:
+                    provider_preferences["ignore"] = self.providers_ignored
+                if self.providers_order:
+                    provider_preferences["order"] = self.providers_order
+                if self.provider_sort:
+                    provider_preferences["sort"] = self.provider_sort
+                if provider_preferences:
+                    summary_extra_body["provider"] = provider_preferences
+
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
@@ -3287,7 +3338,7 @@ class AIAgent:
                         if self._try_refresh_codex_client_credentials(force=True):
                             print(f"{self.log_prefix}🔐 Codex auth refreshed after 401. Retrying request...")
                             continue
-                    
+
                     retry_count += 1
                     elapsed_time = time.time() - api_start_time
                     
