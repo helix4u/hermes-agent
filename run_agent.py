@@ -2738,6 +2738,80 @@ class AIAgent:
             if self.tool_delay > 0 and i < len(assistant_message.tool_calls):
                 time.sleep(self.tool_delay)
 
+    def _tool_call_signature(self, tool_calls: list) -> str:
+        """Build a deterministic signature for a sequence of tool calls."""
+        if not tool_calls:
+            return ""
+
+        parts = []
+        for tc in tool_calls:
+            if tc is None:
+                parts.append("null")
+                continue
+
+            if isinstance(tc, dict):
+                fn = tc.get("function", {})
+                name = fn.get("name", "unknown")
+                raw_args = fn.get("arguments", "{}")
+            else:
+                fn = getattr(tc, "function", None)
+                name = getattr(fn, "name", "unknown") if fn is not None else "unknown"
+                raw_args = getattr(fn, "arguments", "{}") if fn is not None else "{}"
+
+            try:
+                normalized = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except Exception:
+                normalized = raw_args
+
+            try:
+                args_text = json.dumps(
+                    normalized,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+            except Exception:
+                args_text = str(raw_args)
+
+            if len(args_text) > 220:
+                args_text = args_text[:220] + "..."
+
+            parts.append(f"{name}:{args_text}")
+
+        return "|".join(parts)
+
+    def _build_summary_fallback(self, messages: list) -> str | None:
+        """Generate a minimal human-readable fallback summary from available messages."""
+        if not messages:
+            return None
+
+        snippets = []
+        for msg in messages[-30:]:
+            if not isinstance(msg, dict):
+                continue
+
+            role = msg.get("role")
+            content = msg.get("content")
+            if not content:
+                continue
+
+            text = self._strip_think_blocks(content) if isinstance(content, str) else str(content)
+            text = text.strip()
+            if not text:
+                continue
+
+            text = text[:220] + "..." if len(text) > 220 else text
+            snippets.append(f"{role}: {text}")
+
+        if not snippets:
+            return None
+
+        lines = ["I reached the iteration limit and could not generate a clean final response."]
+        lines.append("Recent context:")
+        for snippet in snippets[-10:]:
+            lines.append(f"- {snippet}")
+        return "\n".join(lines)
+
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
         print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
@@ -2786,6 +2860,7 @@ class AIAgent:
             if self.api_mode == "codex_responses":
                 codex_kwargs = self._build_api_kwargs(api_messages)
                 codex_kwargs["tools"] = None
+                codex_kwargs["tool_choice"] = "none"
                 summary_response = self._run_codex_stream(codex_kwargs)
                 assistant_message, _ = self._normalize_codex_response(summary_response)
                 final_response = (assistant_message.content or "").strip() if assistant_message else ""
@@ -2793,6 +2868,7 @@ class AIAgent:
                 summary_kwargs = {
                     "model": self.model,
                     "messages": api_messages,
+                    "tools": [],
                 }
                 if self.max_tokens is not None:
                     summary_kwargs.update(self._max_tokens_param(self.max_tokens))
@@ -2815,7 +2891,12 @@ class AIAgent:
 
                 summary_response = self.client.chat.completions.create(**summary_kwargs)
 
-                if summary_response.choices and summary_response.choices[0].message.content:
+                if (
+                    summary_response is not None
+                    and summary_response.choices
+                    and summary_response.choices[0].message
+                    and summary_response.choices[0].message.content
+                ):
                     final_response = summary_response.choices[0].message.content
                 else:
                     final_response = ""
@@ -2826,12 +2907,15 @@ class AIAgent:
                 if final_response:
                     messages.append({"role": "assistant", "content": final_response})
                 else:
-                    final_response = "I reached the iteration limit and couldn't generate a summary."
+                    final_response = self._build_summary_fallback(messages) or (
+                        "I reached the iteration limit and couldn't generate a summary."
+                    )
             else:
                 # Retry summary generation
                 if self.api_mode == "codex_responses":
                     codex_kwargs = self._build_api_kwargs(api_messages)
                     codex_kwargs["tools"] = None
+                    codex_kwargs["tool_choice"] = "none"
                     retry_response = self._run_codex_stream(codex_kwargs)
                     retry_msg, _ = self._normalize_codex_response(retry_response)
                     final_response = (retry_msg.content or "").strip() if retry_msg else ""
@@ -2839,6 +2923,7 @@ class AIAgent:
                     summary_kwargs = {
                         "model": self.model,
                         "messages": api_messages,
+                        "tools": [],
                     }
                     if self.max_tokens is not None:
                         summary_kwargs["max_tokens"] = self.max_tokens
@@ -2847,7 +2932,12 @@ class AIAgent:
 
                     summary_response = self.client.chat.completions.create(**summary_kwargs)
 
-                    if summary_response.choices and summary_response.choices[0].message.content:
+                    if (
+                        summary_response is not None
+                        and summary_response.choices
+                        and summary_response.choices[0].message
+                        and summary_response.choices[0].message.content
+                    ):
                         final_response = summary_response.choices[0].message.content
                     else:
                         final_response = ""
@@ -2857,11 +2947,20 @@ class AIAgent:
                         final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
                     messages.append({"role": "assistant", "content": final_response})
                 else:
-                    final_response = "I reached the iteration limit and couldn't generate a summary."
+                    final_response = self._build_summary_fallback(messages) or (
+                        "I reached the iteration limit and couldn't generate a summary."
+                    )
 
         except Exception as e:
             logging.warning(f"Failed to get summary response: {e}")
+            fallback = self._build_summary_fallback(messages)
             final_response = f"I reached the maximum iterations ({self.max_iterations}) but couldn't summarize. Error: {str(e)}"
+            if fallback:
+                final_response = f"{fallback}\n{final_response}"
+
+        if final_response is None:
+            fallback = self._build_summary_fallback(messages)
+            final_response = fallback or "I reached the maximum iterations but couldn't generate any response."
 
         return final_response
 
@@ -2894,6 +2993,9 @@ class AIAgent:
         self._last_content_with_tools = None
         self._turns_since_memory = 0
         self._iters_since_skill = 0
+        last_tool_signature = None
+        repeated_tool_signature_count = 0
+        tool_signature_repeat_limit = 3
         
         # Initialize conversation
         messages = conversation_history or []
@@ -3711,10 +3813,26 @@ class AIAgent:
                             if clean:
                                 preview = clean[:120] + "..." if len(clean) > 120 else clean
                                 print(f"  ┊ 💬 {preview}")
-                    
+
+                    assistant_signature = self._tool_call_signature(assistant_message.tool_calls)
+                    if assistant_signature == last_tool_signature:
+                        repeated_tool_signature_count += 1
+                    else:
+                        last_tool_signature = assistant_signature
+                        repeated_tool_signature_count = 1
+
                     messages.append(assistant_msg)
                     self._log_msg_to_db(assistant_msg)
-                    
+
+                    if repeated_tool_signature_count >= tool_signature_repeat_limit:
+                        if not self.quiet_mode:
+                            print(
+                                f"{self.log_prefix}⚠️ Repeated tool-call pattern detected. "
+                                "Summarizing now to avoid a loop."
+                            )
+                        final_response = self._handle_max_iterations(messages, api_call_count)
+                        break
+
                     self._execute_tool_calls(assistant_message, messages, effective_task_id)
                     
                     if self.compression_enabled and self.context_compressor.should_compress():
