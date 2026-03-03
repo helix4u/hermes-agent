@@ -32,6 +32,7 @@ Usage:
 import json
 import logging
 import os
+import platform
 import shlex
 import shutil
 import signal
@@ -39,6 +40,8 @@ import subprocess
 import threading
 import time
 import uuid
+
+_IS_WINDOWS = platform.system() == "Windows"
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional

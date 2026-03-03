@@ -2,6 +2,9 @@
 
 Instructions for AI coding assistants (GitHub Copilot, Cursor, etc.) and human developers.
 
+NEVER PUSH TO REMOTE WITHOUT THE USER ASKING!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Force encoding of things that could use another characterset to utf-8 encoding for safely running it on windows.
+
 Hermes Agent is an AI agent harness with tool-calling capabilities, interactive CLI, messaging integrations, and scheduled tasks.
 
 ## Development Environment

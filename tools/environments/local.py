@@ -1,11 +1,14 @@
 """Local execution environment with interrupt support and non-blocking I/O."""
 
 import os
+import platform
 import shutil
 import signal
 import subprocess
 import threading
 import time
+
+_IS_WINDOWS = platform.system() == "Windows"
 
 from tools.environments.base import BaseEnvironment
 from tools.environments.shell_utils import (
