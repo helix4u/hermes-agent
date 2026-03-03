@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import traceback
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -139,7 +140,7 @@ def _deliver_result(job: dict, content: str) -> None:
             pass
 
 
-def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+def run_job(job: dict, tool_progress_callback=None) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
     
@@ -207,6 +208,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             provider=runtime.get("provider"),
             api_mode=runtime.get("api_mode"),
             quiet_mode=True,
+            tool_progress_callback=tool_progress_callback,
             session_id=f"cron_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
         
@@ -303,7 +305,21 @@ def tick(verbose: bool = True) -> int:
         executed = 0
         for job in due_jobs:
             try:
+                job_name = job.get("name", job["id"])
+                started_at_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _deliver_result(
+                    job,
+                    (
+                        f"⏳ Cron job starting\n"
+                        f"Name: {job_name}\n"
+                        f"ID: {job['id']}\n"
+                        f"Started: {started_at_human}"
+                    ),
+                )
+
+                started_at = time.monotonic()
                 success, output, final_response, error = run_job(job)
+                elapsed_s = int(max(0, time.monotonic() - started_at))
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:
@@ -316,6 +332,25 @@ def tick(verbose: bool = True) -> int:
                         _deliver_result(job, deliver_content)
                     except Exception as de:
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+                status_msg = (
+                    f"✅ Cron job completed\n"
+                    f"Name: {job_name}\n"
+                    f"ID: {job['id']}\n"
+                    f"Duration: {elapsed_s}s\n"
+                    f"Output: {output_file}"
+                ) if success else (
+                    f"❌ Cron job failed\n"
+                    f"Name: {job_name}\n"
+                    f"ID: {job['id']}\n"
+                    f"Duration: {elapsed_s}s\n"
+                    f"Error: {error}\n"
+                    f"Output: {output_file}"
+                )
+                try:
+                    _deliver_result(job, status_msg)
+                except Exception as de:
+                    logger.error("Status delivery failed for job %s: %s", job["id"], de)
 
                 mark_job_run(job["id"], success, error)
                 executed += 1

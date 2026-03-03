@@ -585,13 +585,21 @@ class AIAgent:
         compression_threshold = float(os.getenv("CONTEXT_COMPRESSION_THRESHOLD", "0.85"))
         compression_enabled = os.getenv("CONTEXT_COMPRESSION_ENABLED", "true").lower() in ("true", "1", "yes")
         compression_summary_model = os.getenv("CONTEXT_COMPRESSION_MODEL") or None
+        compression_protect_last_n = int(os.getenv("CONTEXT_COMPRESSION_PROTECT_LAST_N", "3"))
+        compression_summary_target_tokens = int(
+            os.getenv("CONTEXT_COMPRESSION_SUMMARY_TARGET_TOKENS", "2048")
+        )
+        if compression_protect_last_n < 1:
+            compression_protect_last_n = 1
+        if compression_summary_target_tokens < 256:
+            compression_summary_target_tokens = 256
         
         self.context_compressor = ContextCompressor(
             model=self.model,
             threshold_percent=compression_threshold,
             protect_first_n=3,
-            protect_last_n=8,
-            summary_target_tokens=500,
+            protect_last_n=compression_protect_last_n,
+            summary_target_tokens=compression_summary_target_tokens,
             summary_model_override=compression_summary_model,
             quiet_mode=self.quiet_mode,
         )
@@ -2616,6 +2624,62 @@ class AIAgent:
                        None = use config value (flush_min_turns).
                        0 = always flush (used for compression).
         """
+        def _as_text(content) -> str:
+            """Best-effort text extraction from OpenAI-style content variants."""
+            if isinstance(content, str):
+                return content.strip()
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, str):
+                        parts.append(item)
+                        continue
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") in ("text", "input_text", "output_text"):
+                        text = item.get("text")
+                        if isinstance(text, str) and text.strip():
+                            parts.append(text.strip())
+                return "\n".join(parts).strip()
+            return ""
+
+        def _build_distill_messages(source_messages: list) -> list:
+            """Keep only conversational turns (user/assistant text), excluding tool chatter."""
+            cleaned = []
+            if not source_messages:
+                return cleaned
+
+            max_chars = int(os.getenv("HERMES_MEMORY_DISTILL_MAX_CHARS", "24000"))
+            total_chars = 0
+
+            kept_reversed = []
+            for msg in reversed(source_messages):
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+
+                # Skip assistant tool-call skeletons that carry no natural-language content.
+                if role == "assistant" and msg.get("tool_calls") and not msg.get("content"):
+                    continue
+
+                text = _as_text(msg.get("content"))
+                if not text:
+                    continue
+
+                # Keep the most recent conversational context if we must trim.
+                remaining = max_chars - total_chars
+                if remaining <= 0:
+                    break
+                if len(text) > remaining:
+                    text = text[:remaining]
+                kept_reversed.append({"role": role, "content": text})
+                total_chars += len(text)
+
+            cleaned.extend(reversed(kept_reversed))
+            return cleaned
+
         if self._memory_flush_min_turns == 0 and min_turns is None:
             return
         if "memory" not in self.valid_tool_names or not self._memory_store:
@@ -2629,18 +2693,29 @@ class AIAgent:
         if not messages or len(messages) < 3:
             return
 
+        distilled = _build_distill_messages(messages)
+        if len(distilled) < 2:
+            return
+
         flush_content = (
-            "[System: The session is being compressed. "
-            "Please save anything worth remembering to your memories.]"
+            "[System: The session is being compressed.\n"
+            "You are seeing a distilled chat transcript (user/assistant text only; tool calls/results removed).\n"
+            "Save notable, durable observations from shared experience and discussion.\n"
+            "Prioritize:\n"
+            "- concrete facts about the world/project environment that are likely to matter later,\n"
+            "- stable decisions and operating conventions,\n"
+            "- user preferences and constraints.\n"
+            "Avoid ephemeral logs, one-off command noise, and low-signal details.\n"
+            "If something is wiki-worthy but you can only use memory, store it in target='memory' "
+            "with a `WIKI_CANDIDATE:` prefix so it can be promoted later.\n"
+            "Use the memory tool only. Prefer target='memory' for world/project facts and target='user' for user profile details.]"
         )
-        _sentinel = f"__flush_{id(self)}_{time.monotonic()}"
-        flush_msg = {"role": "user", "content": flush_content, "_flush_sentinel": _sentinel}
-        messages.append(flush_msg)
+        flush_msg = {"role": "user", "content": flush_content}
 
         try:
-            # Build API messages for the flush call
+            # Build API messages for the flush call from cleaned conversation turns.
             api_messages = []
-            for msg in messages:
+            for msg in distilled + [flush_msg]:
                 api_msg = msg.copy()
                 if msg.get("role") == "assistant":
                     reasoning = msg.get("reasoning")
@@ -2648,7 +2723,6 @@ class AIAgent:
                         api_msg["reasoning_content"] = reasoning
                 api_msg.pop("reasoning", None)
                 api_msg.pop("finish_reason", None)
-                api_msg.pop("_flush_sentinel", None)
                 api_messages.append(api_msg)
 
             if self._cached_system_prompt:
@@ -2662,7 +2736,6 @@ class AIAgent:
                     break
 
             if not memory_tool_def:
-                messages.pop()  # remove flush msg
                 return
 
             # Use auxiliary client for the flush call when available --
@@ -2726,15 +2799,67 @@ class AIAgent:
                         logger.debug("Memory flush tool call failed: %s", e)
         except Exception as e:
             logger.debug("Memory flush API call failed: %s", e)
-        finally:
-            # Strip flush artifacts: remove everything from the flush message onward.
-            # Use sentinel marker instead of identity check for robustness.
-            while messages and messages[-1].get("_flush_sentinel") != _sentinel:
-                messages.pop()
-                if not messages:
-                    break
-            if messages and messages[-1].get("_flush_sentinel") == _sentinel:
-                messages.pop()
+
+    def _handoff_wiki_candidates_to_workspace_memory(self) -> None:
+        """Promote `WIKI_CANDIDATE:` memory entries into today's workspace memory note.
+
+        This runs before compression so notable candidates survive as file-backed notes
+        even if conversational context is compacted.
+        """
+        if not self._memory_store:
+            return
+
+        try:
+            raw_entries = getattr(self._memory_store, "memory_entries", []) or []
+            if not raw_entries:
+                return
+
+            candidates = []
+            for entry in raw_entries:
+                if not isinstance(entry, str):
+                    continue
+                text = entry.strip()
+                if not text:
+                    continue
+                idx = text.find("WIKI_CANDIDATE:")
+                if idx == -1:
+                    continue
+                candidate = text[idx + len("WIKI_CANDIDATE:"):].strip()
+                if candidate:
+                    candidates.append(candidate)
+
+            if not candidates:
+                return
+
+            ws_root = Path(os.getenv("HERMES_WORKSPACE", Path.home() / ".hermes" / "workspace"))
+            memory_dir = ws_root / "memory"
+            memory_dir.mkdir(parents=True, exist_ok=True)
+            today_file = memory_dir / f"{datetime.now().strftime('%Y-%m-%d')}.md"
+
+            existing = ""
+            if today_file.exists():
+                with open(today_file, "r", encoding="utf-8", errors="replace") as f:
+                    existing = f.read()
+
+            new_candidates = []
+            for candidate in candidates:
+                marker = f"- WIKI_CANDIDATE: {candidate}"
+                if marker not in existing:
+                    new_candidates.append(candidate)
+
+            if not new_candidates:
+                return
+
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(today_file, "a", encoding="utf-8", errors="replace", newline="") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write("\n## Post-compression wiki candidate handoff\n")
+                f.write(f"- Captured at: {timestamp}\n")
+                for candidate in new_candidates:
+                    f.write(f"- WIKI_CANDIDATE: {candidate}\n")
+        except Exception as e:
+            logger.debug("WIKI_CANDIDATE handoff failed: %s", e)
 
     def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None) -> tuple:
         """Compress conversation context and split the session in SQLite.
@@ -2750,6 +2875,7 @@ class AIAgent:
 
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
+        self._handoff_wiki_candidates_to_workspace_memory()
 
         compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
 
@@ -2799,6 +2925,7 @@ class AIAgent:
                 break
 
             function_name = tool_call.function.name
+            self._tool_calls_executed_total = int(getattr(self, "_tool_calls_executed_total", 0)) + 1
 
             # Reset nudge counters when the relevant tool is actually used
             if function_name == "memory":
@@ -3111,6 +3238,44 @@ class AIAgent:
 
         return "|".join(parts)
 
+    def _append_tool_budget_guidance(self, api_messages: list, api_call_count: int) -> list:
+        """Attach a transient budget note so the model can pace tool usage.
+
+        The note is request-only and is never written to conversation history.
+        """
+        if not api_messages:
+            return api_messages
+
+        enabled = os.getenv("HERMES_TOOL_BUDGET_GUIDANCE", "true").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            return api_messages
+
+        max_tool_calls = int(
+            (
+                os.getenv("HERMES_MAX_TOOL_CALLS_PER_RUN")
+                or os.getenv("HERMES_MAX_TOOL_CALLS_PER_RESPONSE")
+                or "0"
+            ).strip() or "0"
+        )
+        if max_tool_calls <= 0:
+            max_tool_calls = max(self.max_iterations * 4, 8)
+
+        used_tool_calls = int(getattr(self, "_tool_calls_executed_total", 0))
+        remaining_tool_calls = max(max_tool_calls - used_tool_calls, 0)
+        remaining_iterations = max(self.max_iterations - api_call_count, 0)
+
+        guidance = (
+            "[System: Tool budget status for this turn:\n"
+            f"- API iterations remaining after this response: {remaining_iterations}\n"
+            f"- Tool calls used so far this run: {used_tool_calls}\n"
+            f"- Tool calls remaining in soft budget: {remaining_tool_calls} (max {max_tool_calls})\n"
+            "Use tools deliberately, batch where possible, and avoid redundant calls.]"
+        )
+
+        augmented = list(api_messages)
+        augmented.append({"role": "user", "content": guidance})
+        return augmented
+
     def _build_summary_fallback(self, messages: list) -> str | None:
         """Generate a minimal human-readable fallback summary from available messages."""
         if not messages:
@@ -3325,6 +3490,7 @@ class AIAgent:
         self._last_content_with_tools = None
         self._turns_since_memory = 0
         self._iters_since_skill = 0
+        self._tool_calls_executed_total = 0
         last_tool_signature = None
         repeated_tool_signature_count = 0
         tool_signature_repeat_limit = 3
@@ -3460,6 +3626,7 @@ class AIAgent:
                 messages,
                 active_system_prompt,
             )
+            api_messages = self._append_tool_budget_guidance(api_messages, api_call_count)
             
             # Thinking spinner for quiet mode (animated during API call)
             thinking_spinner = None
@@ -3792,6 +3959,7 @@ class AIAgent:
                                 messages,
                                 active_system_prompt,
                             )
+                            api_messages = self._append_tool_budget_guidance(api_messages, api_call_count)
                             continue
 
                     if is_payload_too_large:
@@ -3808,6 +3976,7 @@ class AIAgent:
                                 messages,
                                 active_system_prompt,
                             )
+                            api_messages = self._append_tool_budget_guidance(api_messages, api_call_count)
                             continue  # Retry with compressed messages
                         else:
                             trimmed = self._hard_trim_context(messages)
@@ -3820,6 +3989,7 @@ class AIAgent:
                                     messages,
                                     active_system_prompt,
                                 )
+                                api_messages = self._append_tool_budget_guidance(api_messages, api_call_count)
                                 continue
                             print(f"{self.log_prefix}❌ Payload too large and cannot compress further.")
                             logging.error(f"{self.log_prefix}413 payload too large. Cannot compress further.")
@@ -3876,6 +4046,7 @@ class AIAgent:
                                 messages,
                                 active_system_prompt,
                             )
+                            api_messages = self._append_tool_budget_guidance(api_messages, api_call_count)
                             continue  # Retry with compressed messages
                         else:
                             trimmed = self._hard_trim_context(messages)
@@ -3888,6 +4059,7 @@ class AIAgent:
                                     messages,
                                     active_system_prompt,
                                 )
+                                api_messages = self._append_tool_budget_guidance(api_messages, api_call_count)
                                 continue
 
                             # Can't compress or trim further

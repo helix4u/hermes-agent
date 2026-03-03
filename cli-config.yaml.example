@@ -181,7 +181,17 @@ compression:
   
   # Model to use for generating summaries (fast/cheap recommended)
   # This model compresses the middle turns into a concise summary
+  # Provider options: auto, openrouter, nous, custom, openai-codex
+  summary_provider: "auto"
   summary_model: "google/gemini-3-flash-preview"
+
+  # Keep only the most recent N messages verbatim at the end of context.
+  # Older middle turns are summarized into a structured context record.
+  protect_last_n: 3
+
+  # Approximate target size for the compression summary.
+  # Increase this to retain more detail from older turns.
+  summary_target_tokens: 2048
 
 # =============================================================================
 # Persistent Memory

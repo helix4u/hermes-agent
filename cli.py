@@ -329,7 +329,10 @@ def load_cli_config() -> Dict[str, Any]:
     compression_env_mappings = {
         "enabled": "CONTEXT_COMPRESSION_ENABLED",
         "threshold": "CONTEXT_COMPRESSION_THRESHOLD",
+        "summary_provider": "CONTEXT_COMPRESSION_PROVIDER",
         "summary_model": "CONTEXT_COMPRESSION_MODEL",
+        "protect_last_n": "CONTEXT_COMPRESSION_PROTECT_LAST_N",
+        "summary_target_tokens": "CONTEXT_COMPRESSION_SUMMARY_TARGET_TOKENS",
     }
     
     for config_key, env_var in compression_env_mappings.items():

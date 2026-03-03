@@ -24,7 +24,7 @@ import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Callable
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -96,7 +96,10 @@ if _config_path.exists():
             _compression_env_map = {
                 "enabled": "CONTEXT_COMPRESSION_ENABLED",
                 "threshold": "CONTEXT_COMPRESSION_THRESHOLD",
+                "summary_provider": "CONTEXT_COMPRESSION_PROVIDER",
                 "summary_model": "CONTEXT_COMPRESSION_MODEL",
+                "protect_last_n": "CONTEXT_COMPRESSION_PROTECT_LAST_N",
+                "summary_target_tokens": "CONTEXT_COMPRESSION_SUMMARY_TARGET_TOKENS",
             }
             for _cfg_key, _env_var in _compression_env_map.items():
                 if _cfg_key in _compression_cfg:
@@ -711,7 +714,8 @@ class GatewayRunner:
         _known_commands = {
             "new", "reset", "help", "status", "stop", "model",
             "personality", "retry", "undo", "sethome", "set-home",
-            "terminal", "shell", "compress", "usage", "reload-mcp"
+            "terminal", "shell", "compress", "usage", "reload-mcp",
+            "cron"
         }
         if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
@@ -759,6 +763,9 @@ class GatewayRunner:
 
         if command == "reload-mcp":
             return await self._handle_reload_mcp_command(event)
+
+        if command == "cron":
+            return await self._handle_cron_command(event)
         
         # Skill slash commands: /skill-name loads the skill and sends to agent
         if command:
@@ -1202,6 +1209,7 @@ class GatewayRunner:
             "`/compress` — Compress conversation context",
             "`/usage` — Show token usage for this session",
             "`/reload-mcp` — Reload MCP servers from config",
+            "`/cron` — Manage scheduled jobs (`list`, `add`, `remove`, `run`)",
             "`/help` — Show this message",
         ]
         try:
@@ -1214,6 +1222,416 @@ class GatewayRunner:
         except Exception:
             pass
         return "\n".join(lines)
+
+    async def _handle_cron_command(self, event: MessageEvent) -> str:
+        """Handle /cron command for scheduled jobs."""
+        args = event.get_command_args().strip()
+
+        if not args:
+            # Show quick help + current jobs
+            return await self._handle_cron_list_command()
+
+        parts = args.split(maxsplit=1)
+        subcommand = parts[0].lower()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        if subcommand in ("list", "ls"):
+            return await self._handle_cron_list_command()
+
+        if subcommand == "add":
+            if not rest:
+                return (
+                    "(._.) Usage: `/cron add <schedule> <prompt>`\n"
+                    "Accepted schedules:\n"
+                    "• `30m`, `2h`, `1d` (one-shot delay)\n"
+                    "• `every 30m`, `every 2h` (recurring)\n"
+                    "• `0 9 * * *` (cron expression)\n"
+                    "• `2026-03-03T14:00:00` (one-shot timestamp)\n"
+                    'Example: `/cron add 30m Remind me to take a break`\n'
+                    'Example: `/cron add "every 2h" Check server health`\n'
+                    'Example: `/cron add "0 9 * * *" Morning briefing`'
+                )
+            try:
+                schedule, prompt = self._parse_cron_add_args(rest)
+            except ValueError as e:
+                return str(e)
+            return await self._handle_cron_add_command(event, schedule=schedule, prompt=prompt)
+
+        if subcommand in ("remove", "rm", "delete"):
+            if not rest:
+                return "(._.) Usage: `/cron remove <job_id>`"
+            job_id = rest.split()[0]
+            return await self._handle_cron_remove_command(job_id)
+
+        if subcommand in ("run", "run_now", "run-now", "now"):
+            if not rest:
+                return "(._.) Usage: `/cron run <job_id>`"
+            if subcommand == "run" and rest.lower().startswith("now "):
+                rest = rest[4:].strip()
+            job_id = rest.split()[0]
+            return await self._handle_cron_run_command(event, job_id)
+
+        if subcommand in ("help", "?"):
+            return (
+                "📖 **Cron Commands**\n"
+                "`/cron list` — List jobs\n"
+                "`/cron add <schedule> <prompt>` — Add job\n"
+                "`/cron remove <job_id>` — Remove job\n"
+                "`/cron run <job_id>` — Run one job immediately\n\n"
+                "**Accepted schedules for `/cron add`:**\n"
+                "• `30m`, `2h`, `1d` (one-shot delay)\n"
+                "• `every 30m`, `every 2h` (recurring)\n"
+                "• `0 9 * * *` (cron expression)\n"
+                "• `2026-03-03T14:00:00` (one-shot timestamp)"
+            )
+
+        return (
+            f"(._.) Unknown cron command: `{subcommand}`\n"
+            "Available: list, add, remove, run"
+        )
+
+    def _parse_cron_add_args(self, args: str) -> tuple[str, str]:
+        """Parse `/cron add` args into (schedule, prompt)."""
+        rest = args.strip()
+        if not rest:
+            raise ValueError(
+                "(._.) Usage: `/cron add <schedule> <prompt>`\n"
+                "Accepted schedule examples: `30m`, `every 2h`, `0 9 * * *`, `2026-03-03T14:00:00`"
+            )
+
+        # Support quoted schedule like "every 2h" for spaces.
+        if rest.startswith('"'):
+            close_quote = rest.find('"', 1)
+            if close_quote == -1:
+                raise ValueError(
+                    '(._.) Unmatched quote in schedule. Use `"every 2h"` or `30m`.\n'
+                    "Accepted schedule examples: `30m`, `every 2h`, `0 9 * * *`, `2026-03-03T14:00:00`"
+                )
+            schedule = rest[1:close_quote].strip()
+            prompt = rest[close_quote + 1 :].strip()
+            if not prompt:
+                raise ValueError("(._.) Please provide a prompt for the job.")
+            return schedule, prompt
+
+        # Support "every 2h" / "every 1d" without requiring quotes.
+        lower_rest = rest.lower()
+        if lower_rest.startswith("every "):
+            parts = rest.split(maxsplit=2)
+            if len(parts) < 3:
+                raise ValueError(
+                    "(._.) Usage: `/cron add <schedule> <prompt>`\n"
+                    "For recurring jobs, use: `every 30m` or `every 2h`"
+                )
+            schedule = f"{parts[0]} {parts[1]}"
+            prompt = parts[2].strip()
+            if not prompt:
+                raise ValueError("(._.) Please provide a prompt for the job.")
+            return schedule, prompt
+
+        # Support cron expressions without quoting when enough fields are present.
+        parts = rest.split()
+        if len(parts) >= 6 and all(
+            re.match(r'^[\d\*\-,/]+$', p) for p in parts[:5]
+        ):
+            schedule = " ".join(parts[:5])
+            prompt = " ".join(parts[5:]).strip()
+            if not prompt:
+                raise ValueError("(._.) Please provide a prompt for the job.")
+            return schedule, prompt
+
+        parts = rest.split(maxsplit=1)
+        schedule = parts[0].strip()
+        prompt = parts[1].strip() if len(parts) > 1 else ""
+        if not schedule:
+            raise ValueError(
+                "(._.) Usage: `/cron add <schedule> <prompt>`\n"
+                "Accepted schedule examples: `30m`, `every 2h`, `0 9 * * *`, `2026-03-03T14:00:00`"
+            )
+        if not prompt:
+            raise ValueError("(._.) Please provide a prompt for the job.")
+        return schedule, prompt
+
+    async def _handle_cron_list_command(self) -> str:
+        """List all active cron jobs for `/cron list`."""
+        from cron.jobs import list_jobs
+
+        jobs = list_jobs()
+        if not jobs:
+            return "No scheduled jobs. Use `/cron add <schedule> <prompt>` to create one."
+
+        lines = ["Scheduled Jobs:\n"]
+        for job in jobs:
+            times = job["repeat"].get("times")
+            completed = job["repeat"].get("completed", 0)
+            repeat_str = "forever" if times is None else f"{completed}/{times}"
+            prompt_preview = job["prompt"][:90] + ("..." if len(job["prompt"]) > 90 else "")
+            lines.extend([
+                f"ID: `{job['id']}`",
+                f"Name: {job['name']}",
+                f"Schedule: {job['schedule_display']} ({repeat_str})",
+                f"Next run: {job.get('next_run_at', 'N/A')}",
+                f"Prompt: {prompt_preview}",
+                "",
+            ])
+
+        return "\n".join(lines)
+
+    async def _handle_cron_add_command(
+        self,
+        event: MessageEvent,
+        schedule: str,
+        prompt: str,
+    ) -> str:
+        """Handle `/cron add` by creating a job from current chat context."""
+        from cron.jobs import create_job
+
+        origin = {
+            "platform": event.source.platform.value if event.source.platform else "unknown",
+            "chat_id": event.source.chat_id,
+            "chat_name": event.source.chat_name,
+        }
+
+        try:
+            job = create_job(prompt=prompt, schedule=schedule, origin=origin)
+        except Exception as e:
+            return f"⚠️ Failed to create cron job: {e}"
+
+        return (
+            f"Created cron job `{job['id']}`.\n"
+            f"Name: {job['name']}\n"
+            f"Schedule: {job['schedule_display']}\n"
+            f"Next run: {job['next_run_at']}"
+        )
+
+    async def _handle_cron_remove_command(self, job_id: str) -> str:
+        """Handle `/cron remove <job_id>`."""
+        from cron.jobs import get_job, remove_job
+
+        job = get_job(job_id)
+        if not job:
+            return f"(._.) Job not found: `{job_id}`"
+        removed_name = job["name"]
+        if remove_job(job_id):
+            return f"Removed job `{removed_name}` (`{job_id}`)."
+        return f"⚠️ Failed to remove job `{job_id}`"
+
+    async def _handle_cron_run_command(self, event: MessageEvent, job_id: str) -> str:
+        """Handle `/cron run <job_id>` for one-off immediate execution."""
+        from cron.jobs import get_job
+        import queue as _queue
+        import time as _time
+
+        job = get_job(job_id)
+        if not job:
+            return f"(._.) Job not found: `{job_id}`"
+
+        source = event.source
+        adapter = self.adapters.get(source.platform) if source else None
+        job_name = job.get("name", job["id"])
+        progress_queue: "_queue.Queue[str]" = _queue.Queue()
+        progress_state = {
+            "started_at": _time.monotonic(),
+            "last_detail": "Calling model...",
+            "tool_calls": 0,
+            "updates": 0,
+            "done": False,
+        }
+        heartbeat_faces = {
+            "thinking": [
+                "(·_·)",
+                "(•‿•)",
+                "(^‿^)",
+                "(•ᴗ•)",
+                "(ᵔ◡ᵔ)",
+                "(^-^*)",
+            ],
+            "tool": [
+                "(⌐■_■)",
+                "(^_^)b",
+                "(•̀ᴗ•́)و",
+                "(｡•̀ᴗ-)✧",
+                "(ง •_•)ง",
+                "(๑•̀ㅂ•́)و",
+            ],
+            "steady": [
+                "(o^▽^o)",
+                "(≧◡≦)",
+                "(¬‿¬)",
+                "(づ｡◕‿‿◕｡)づ",
+                "(づ￣ ³￣)づ",
+                "(ﾉ◕ヮ◕)ﾉ",
+                "(^o^)/",
+            ],
+        }
+        progress_message_id: str | None = None
+
+        def _set_progress_detail(detail: str, tool_call: bool = False) -> None:
+            progress_state["last_detail"] = (detail or "Working...").strip()
+            if tool_call:
+                progress_state["tool_calls"] += 1
+            progress_state["updates"] += 1
+            progress_queue.put("__tick__")
+
+        def _build_progress_message() -> str:
+            elapsed = int(max(0, _time.monotonic() - progress_state["started_at"]))
+            detail = (progress_state.get("last_detail") or "Working...").strip()
+            if len(detail) > 180:
+                detail = detail[:177] + "..."
+            if str(detail).lower().startswith("💡"):
+                pool = heartbeat_faces["thinking"]
+            elif progress_state.get("tool_calls", 0) > 0:
+                pool = heartbeat_faces["tool"]
+            else:
+                pool = heartbeat_faces["steady"]
+            face = pool[elapsed % len(pool)]
+            return (
+                f"🛠️ {face} Cron job is running... ({elapsed}s)\n"
+                f"Name: {job_name}\n"
+                f"ID: {job['id']}\n"
+                f"{detail}\n"
+                f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
+            )
+
+        def progress_callback(tool_name: str, preview: str = None, args: dict = None):
+            if tool_name == "_thinking":
+                _set_progress_detail(f"💡 thinking: {preview or 'working...'}", tool_call=False)
+                return
+            if preview:
+                if len(preview) > 80:
+                    preview = preview[:77] + "..."
+                _set_progress_detail(f"⚙️ {tool_name}: \"{preview}\"", tool_call=True)
+                return
+            _set_progress_detail(f"⚙️ {tool_name}...", tool_call=True)
+
+        async def _manual_cron_progress_loop():
+            nonlocal progress_message_id
+            if not adapter or not source:
+                return
+            while True:
+                try:
+                    while True:
+                        try:
+                            progress_queue.get_nowait()
+                        except _queue.Empty:
+                            break
+                    msg = _build_progress_message()
+                    if progress_message_id is None:
+                        result = await adapter.send(chat_id=source.chat_id, content=msg)
+                        if result and result.success and result.message_id:
+                            progress_message_id = result.message_id
+                    else:
+                        await adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=progress_message_id,
+                            content=msg,
+                        )
+                    if progress_state.get("done"):
+                        return
+                    await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    await asyncio.sleep(1.0)
+
+        if adapter and source:
+            try:
+                initial = await adapter.send(
+                    chat_id=source.chat_id,
+                    content=(
+                        f"⏳ Cron job starting\n"
+                        f"Name: {job_name}\n"
+                        f"ID: {job['id']}\n"
+                        f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    ),
+                )
+                if initial and initial.success and initial.message_id:
+                    progress_message_id = initial.message_id
+            except Exception:
+                pass
+
+        progress_task = asyncio.create_task(_manual_cron_progress_loop())
+        result = await asyncio.to_thread(self._run_cron_job_once, job, event, progress_callback)
+        progress_state["done"] = True
+        try:
+            await progress_task
+        except Exception:
+            pass
+
+        if adapter and source:
+            try:
+                status_msg = (
+                    f"✅ Cron job completed\n"
+                    f"Name: {result['job_name']}\n"
+                    f"ID: {result['job_id']}\n"
+                    f"Output: {result['output_file']}"
+                ) if result.get("success") else (
+                    f"❌ Cron job failed\n"
+                    f"Name: {result['job_name']}\n"
+                    f"ID: {result['job_id']}\n"
+                    f"Error: {result.get('error')}\n"
+                    f"Output: {result['output_file']}"
+                )
+                await adapter.send(chat_id=source.chat_id, content=status_msg)
+            except Exception:
+                pass
+
+        if not result.get("success"):
+            return (
+                f"⚠️ Cron job `{result['job_id']}` failed while running now.\n"
+                f"Error: `{result.get('error')}`\n"
+                f"Output saved to: `{result['output_file']}`"
+            )
+
+        preview = (result.get("final_response") or "(No response)").strip()
+        if len(preview) > 2800:
+            preview = preview[:2775] + "..."
+        return (
+            f"Ran `{result['job_id']}` now.\n"
+            f"Output saved to: `{result['output_file']}`\n\n"
+            f"**Response:**\n{preview}"
+        )
+
+    def _run_cron_job_once(
+        self,
+        job: dict,
+        event: MessageEvent,
+        tool_progress_callback: Optional[Callable[..., None]] = None,
+    ) -> Dict[str, Any]:
+        """Execute one job in a blocking thread context."""
+        from cron.jobs import mark_job_run
+        from cron.scheduler import run_job, save_job_output
+
+        job_ctx = dict(job)
+        # If the job has no origin stored, pin run output to this chat.
+        if not job_ctx.get("origin") and event.source:
+            job_ctx["origin"] = {
+                "platform": event.source.platform.value if event.source.platform else "unknown",
+                "chat_id": event.source.chat_id,
+                "chat_name": event.source.chat_name,
+            }
+
+        success, output, final_response, error = run_job(
+            job_ctx,
+            tool_progress_callback=tool_progress_callback,
+        )
+
+        output_file = "unknown"
+        try:
+            saved = save_job_output(job_ctx["id"], output)
+            output_file = str(saved)
+        except Exception:
+            pass
+
+        mark_job_run(job_ctx["id"], success, error)
+
+        return {
+            "success": success,
+            "job_id": job_ctx["id"],
+            "job_name": job_ctx.get("name", job_ctx["id"]),
+            "output_file": output_file,
+            "error": error,
+            "final_response": final_response,
+        }
     
     async def _handle_model_command(self, event: MessageEvent) -> str:
         """Handle /model command - show or change the current model."""
@@ -1959,7 +2377,13 @@ class GatewayRunner:
             "tool_calls": 0,
             "updates": 0,
         }
-        heartbeat_faces = ["(·_·)", "(•‿•)", "(⌐■_■)", "(^_^)/"]
+        heartbeat_faces_by_phase = {
+            "starting": ["(^_^)/", "(^o^)/", "(o^▽^o)"],
+            "thinking": ["(·_·)", "(•‿•)", "(^‿^)", "(ᵔ◡ᵔ)", "(^-^*)"],
+            "tool": ["(⌐■_■)", "(^_^)b", "(•̀ᴗ•́)و", "(｡•̀ᴗ-)✧", "(ง •_•)ง"],
+            "finalizing": ["(•ᴗ•)", "(≧◡≦)", "(¬‿¬)", "(づ｡◕‿‿◕｡)づ"],
+            "default": ["(•‿•)", "(^_^)/", "(^‿^)"],
+        }
         phase_labels = {
             "starting": "starting",
             "thinking": "thinking",
@@ -1988,8 +2412,9 @@ class GatewayRunner:
 
         def _build_progress_message() -> str:
             elapsed = int(max(0, time.monotonic() - progress_state["started_at"]))
-            face = heartbeat_faces[elapsed % len(heartbeat_faces)]
             phase = progress_state.get("phase", "thinking")
+            pool = heartbeat_faces_by_phase.get(phase, heartbeat_faces_by_phase["default"])
+            face = pool[elapsed % len(pool)]
             phase_text = phase_labels.get(phase, "working")
             phase_emoji = phase_emojis.get(phase, "⚙️")
             detail = (progress_state.get("last_detail") or "Working...").strip()

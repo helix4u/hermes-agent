@@ -77,6 +77,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._seen_message_ids: Dict[int, float] = {}
+        self._listen_view_registered = False
     
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -133,8 +134,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 try:
                     synced = await adapter_self._client.tree.sync()
                     print(f"[{adapter_self.name}] Synced {len(synced)} slash command(s)")
+                    try:
+                        synced_names = [cmd.name for cmd in synced]
+                        print(f"[{adapter_self.name}] Synced command names: {', '.join(synced_names)}")
+                    except Exception:
+                        pass
                 except Exception as e:
                     print(f"[{adapter_self.name}] Slash command sync failed: {e}")
+                if not adapter_self._listen_view_registered:
+                    adapter_self._client.add_view(PersistentListenButtonView(adapter_self))
+                    adapter_self._listen_view_registered = True
                 adapter_self._ready_event.set()
 
             @self._client.event
@@ -428,8 +437,9 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception:
             return
         embed = discord.Embed(description=self.format_message(content))
+        view = ListenButtonView(self)
         try:
-            await msg.edit(embed=embed)
+            await msg.edit(embed=embed, view=view)
         except Exception:
             return
     
@@ -721,6 +731,62 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
 
+        cron = discord.app_commands.Group(name="cron", description="Manage Hermes cron jobs")
+
+        @cron.command(name="list", description="List all scheduled cron jobs")
+        async def slash_cron_list(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            event = self._build_slash_event(interaction, "/cron list")
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug("Discord delete_original_response failed: %s", e)
+
+        @cron.command(name="add", description="Add a new cron job")
+        @discord.app_commands.describe(
+            schedule="Accepted: 30m | 2h | 1d | every 30m | 0 9 * * * | 2026-03-03T14:00:00",
+            prompt="What the job should do",
+        )
+        async def slash_cron_add(
+            interaction: discord.Interaction,
+            schedule: str,
+            prompt: str,
+        ):
+            await interaction.response.defer(ephemeral=True)
+            # Cron schedule parsing in the runner expects quoted schedules when
+            # spaces are present (e.g., cron expressions).
+            schedule_arg = f'"{schedule}"' if " " in schedule else schedule
+            event = self._build_slash_event(interaction, f"/cron add {schedule_arg} {prompt}")
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug("Discord delete_original_response failed: %s", e)
+
+        @cron.command(name="remove", description="Remove a cron job")
+        @discord.app_commands.describe(job_id="Job ID from /cron list")
+        async def slash_cron_remove(interaction: discord.Interaction, job_id: str):
+            await interaction.response.defer(ephemeral=True)
+            event = self._build_slash_event(interaction, f"/cron remove {job_id}")
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug("Discord delete_original_response failed: %s", e)
+
+        @cron.command(name="run", description="Run one cron job immediately")
+        @discord.app_commands.describe(job_id="Job ID from /cron list")
+        async def slash_cron_run(interaction: discord.Interaction, job_id: str):
+            await interaction.response.defer(ephemeral=True)
+            event = self._build_slash_event(interaction, f"/cron run {job_id}")
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug("Discord delete_original_response failed: %s", e)
+        tree.add_command(cron)
+
         @tree.command(name="retry", description="Retry your last message")
         async def slash_retry(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True)
@@ -995,67 +1061,93 @@ if DISCORD_AVAILABLE:
         async def listen(
             self, interaction: discord.Interaction, button: discord.ui.Button
         ):
-            try:
-                if not interaction.message:
-                    await interaction.response.send_message(
-                        "No message context available for TTS.", ephemeral=True
-                    )
-                    return
+            await _handle_discord_listen(self.adapter, interaction)
 
-                # Use embed description first (gateway uses embeds for normal replies).
-                text = ""
-                if interaction.message.embeds:
-                    text = (interaction.message.embeds[0].description or "").strip()
-                if not text:
-                    text = (interaction.message.content or "").strip()
-                if not text:
-                    await interaction.response.send_message(
-                        "Nothing to read from this message.", ephemeral=True
-                    )
-                    return
+    class PersistentListenButtonView(discord.ui.View):
+        """Persistent listen button for messages sent through REST payloads."""
 
-                await interaction.response.defer(ephemeral=True, thinking=False)
+        CUSTOM_ID = "hermes:listen"
 
-                from tools.tts_tool import text_to_speech_tool
-                tts_json = await asyncio.to_thread(text_to_speech_tool, text)
-                data = json.loads(tts_json)
-                if not data.get("success"):
-                    await interaction.followup.send(
-                        f"TTS failed: {data.get('error', 'unknown error')}",
-                        ephemeral=True,
-                    )
-                    return
+        def __init__(self, adapter: "DiscordAdapter"):
+            super().__init__(timeout=None)  # Persistent while process is running
+            self.adapter = adapter
 
-                audio_path = str(data.get("file_path", "")).strip()
-                if not audio_path:
-                    await interaction.followup.send(
-                        "TTS returned no output file path.",
-                        ephemeral=True,
-                    )
-                    return
+        @discord.ui.button(
+            label="Listen",
+            style=discord.ButtonStyle.secondary,
+            emoji="🔊",
+            custom_id=CUSTOM_ID,
+        )
+        async def listen(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await _handle_discord_listen(self.adapter, interaction)
 
-                result = await self.adapter.send_voice(
-                    chat_id=str(interaction.channel_id),
-                    audio_path=audio_path,
-                    reply_to=str(interaction.message.id),
-                )
-                if not result.success:
-                    await interaction.followup.send(
-                        f"Failed to send audio: {result.error}",
-                        ephemeral=True,
-                    )
-                    return
 
-                # Success is silent: audio delivery in channel is the confirmation.
-            except Exception:
-                logger.exception("[discord] listen button handler failed")
-                try:
-                    if interaction.response.is_done():
-                        await interaction.followup.send("TTS failed unexpectedly.", ephemeral=True)
-                    else:
-                        await interaction.response.send_message("TTS failed unexpectedly.", ephemeral=True)
-                except Exception:
-                    pass
+async def _handle_discord_listen(
+    adapter: "DiscordAdapter", interaction: discord.Interaction
+) -> None:
+    try:
+        if not interaction.message:
+            await interaction.response.send_message(
+                "No message context available for TTS.", ephemeral=True
+            )
+            return
+
+        # Use embed description first (gateway uses embeds for normal replies).
+        text = ""
+        if interaction.message.embeds:
+            text = (interaction.message.embeds[0].description or "").strip()
+        if not text:
+            text = (interaction.message.content or "").strip()
+        if not text:
+            await interaction.response.send_message(
+                "Nothing to read from this message.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=False)
+
+        from tools.tts_tool import text_to_speech_tool
+        tts_json = await asyncio.to_thread(text_to_speech_tool, text)
+        data = json.loads(tts_json)
+        if not data.get("success"):
+            await interaction.followup.send(
+                f"TTS failed: {data.get('error', 'unknown error')}",
+                ephemeral=True,
+            )
+            return
+
+        audio_path = str(data.get("file_path", "")).strip()
+        if not audio_path:
+            await interaction.followup.send(
+                "TTS returned no output file path.",
+                ephemeral=True,
+            )
+            return
+
+        result = await adapter.send_voice(
+            chat_id=str(interaction.channel_id),
+            audio_path=audio_path,
+            reply_to=str(interaction.message.id),
+        )
+        if not result.success:
+            await interaction.followup.send(
+                f"Failed to send audio: {result.error}",
+                ephemeral=True,
+            )
+            return
+
+        # Success is silent: audio delivery in channel is the confirmation.
+    except Exception:
+        logger.exception("[discord] listen button handler failed")
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("TTS failed unexpectedly.", ephemeral=True)
+            else:
+                await interaction.response.send_message("TTS failed unexpectedly.", ephemeral=True)
+        except Exception:
+            pass
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -1140,3 +1232,4 @@ if DISCORD_AVAILABLE:
             self.resolved = True
             for child in self.children:
                 child.disabled = True
+
