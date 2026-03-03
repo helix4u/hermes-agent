@@ -590,7 +590,7 @@ class AIAgent:
             model=self.model,
             threshold_percent=compression_threshold,
             protect_first_n=3,
-            protect_last_n=4,
+            protect_last_n=8,
             summary_target_tokens=500,
             summary_model_override=compression_summary_model,
             quiet_mode=self.quiet_mode,
@@ -2426,6 +2426,86 @@ class AIAgent:
 
         return trimmed if trimmed else list(messages[-24:])
 
+    @staticmethod
+    def _normalize_tool_call_id(raw_id: Any) -> str:
+        if not isinstance(raw_id, str):
+            return ""
+        value = raw_id.strip()
+        if not value:
+            return ""
+        if value.startswith("fc_") and len(value) > len("fc_"):
+            return f"call_{value[len('fc_'):]}"
+        return value
+
+    def _has_in_flight_tool_calls(self, messages: list) -> bool:
+        """True when any assistant tool_call is still missing its tool output."""
+        if not isinstance(messages, list) or not messages:
+            return False
+
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+                continue
+
+            pending: set[str] = set()
+            for tc in msg.get("tool_calls", []):
+                tc_id = ""
+                if isinstance(tc, dict):
+                    tc_id = self._normalize_tool_call_id(tc.get("id") or tc.get("call_id"))
+                else:
+                    tc_id = self._normalize_tool_call_id(getattr(tc, "id", None) or getattr(tc, "call_id", None))
+                if tc_id:
+                    pending.add(tc_id)
+
+            if not pending:
+                continue
+
+            for follow in messages[idx + 1:]:
+                if not isinstance(follow, dict):
+                    continue
+                if follow.get("role") == "assistant":
+                    break
+                if follow.get("role") != "tool":
+                    continue
+                out_id = self._normalize_tool_call_id(follow.get("tool_call_id"))
+                if out_id in pending:
+                    pending.remove(out_id)
+
+            if pending:
+                return True
+
+        return False
+
+    def _answers_latest_user_message(self, response_text: str, latest_user_message: str) -> bool:
+        """Heuristic guard to reduce off-topic final replies."""
+        if not isinstance(response_text, str) or not response_text.strip():
+            return False
+        if not isinstance(latest_user_message, str) or not latest_user_message.strip():
+            return True
+
+        response_l = response_text.lower()
+        user_l = latest_user_message.lower()
+
+        stop = {
+            "the", "and", "that", "with", "this", "from", "your", "you", "for",
+            "are", "was", "were", "have", "has", "had", "not", "but", "about",
+            "into", "onto", "then", "than", "just", "please", "what", "when",
+            "where", "which", "would", "could", "should", "can", "will", "them",
+            "they", "their", "there", "here", "been", "being", "also", "only",
+        }
+
+        user_terms = [t for t in re.findall(r"[a-z0-9_]{4,}", user_l) if t not in stop]
+        if not user_terms:
+            return True
+
+        # Require at least one salient overlap for topical anchoring.
+        for term in user_terms[:12]:
+            if term in response_l:
+                return True
+
+        return False
+
     def _build_assistant_message(self, assistant_message, finish_reason: str) -> dict:
         """Build a normalized assistant message dict from an API response message.
 
@@ -2648,6 +2728,12 @@ class AIAgent:
         Returns:
             (compressed_messages, new_system_prompt) tuple
         """
+        if self._has_in_flight_tool_calls(messages):
+            if not self.quiet_mode:
+                print(f"{self.log_prefix}⏸️  Skipping compression: tool call outputs still in flight.")
+            current_prompt = self._cached_system_prompt or self._build_system_prompt(system_message)
+            return messages, current_prompt
+
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
 
@@ -3310,6 +3396,7 @@ class AIAgent:
         final_response = None
         interrupted = False
         codex_ack_continuations = 0
+        final_answer_guard_retries = 0
         
         # Clear any stale interrupt state at start
         self.clear_interrupt()
@@ -4193,6 +4280,24 @@ class AIAgent:
                     
                     # Strip <think> blocks from user-facing response (keep raw in messages for trajectory)
                     final_response = self._strip_think_blocks(final_response).strip()
+
+                    if (
+                        final_answer_guard_retries < 1
+                        and not self._answers_latest_user_message(final_response, original_user_message)
+                    ):
+                        final_answer_guard_retries += 1
+                        guard_msg = {
+                            "role": "user",
+                            "content": (
+                                "[System check: Your previous draft did not directly answer the most recent user "
+                                "message. Re-read the latest user request and respond directly, without changing topics.]"
+                            ),
+                        }
+                        messages.append(guard_msg)
+                        self._log_msg_to_db(guard_msg)
+                        continue
+
+                    final_answer_guard_retries = 0
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
                     
