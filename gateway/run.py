@@ -95,6 +95,7 @@ if _config_path.exists():
                 "threshold": "CONTEXT_COMPRESSION_THRESHOLD",
                 "summary_provider": "CONTEXT_COMPRESSION_PROVIDER",
                 "summary_model": "CONTEXT_COMPRESSION_MODEL",
+                "protect_first_n": "CONTEXT_COMPRESSION_PROTECT_FIRST_N",
                 "protect_last_n": "CONTEXT_COMPRESSION_PROTECT_LAST_N",
                 "summary_target_tokens": "CONTEXT_COMPRESSION_SUMMARY_TARGET_TOKENS",
             }
@@ -921,7 +922,27 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
                 session_key=session_key
             )
-            
+
+            returned_session_id = str(agent_result.get("session_id") or "").strip()
+            session_switched = False
+            if returned_session_id and returned_session_id != session_entry.session_id:
+                if self.session_store.update_session_id(session_entry.session_key, returned_session_id):
+                    logger.info(
+                        "Session ID updated after compression split: %s -> %s (%s)",
+                        session_entry.session_id,
+                        returned_session_id,
+                        session_entry.session_key,
+                    )
+                    session_entry.session_id = returned_session_id
+                    session_switched = True
+                    hook_ctx["session_id"] = returned_session_id
+                else:
+                    logger.warning(
+                        "Agent returned new session_id=%s but session mapping update failed for key=%s",
+                        returned_session_id,
+                        session_entry.session_key,
+                    )
+
             response = agent_result.get("final_response", "")
             agent_messages = agent_result.get("messages", [])
             
@@ -954,6 +975,38 @@ class GatewayRunner:
             # intermediate reasoning) so sessions can be resumed with full context
             # and transcripts are useful for debugging and training data.
             ts = datetime.now().isoformat()
+
+            if session_switched:
+                rewritten: List[Dict[str, Any]] = []
+                existing_meta = next(
+                    (m for m in (history or []) if isinstance(m, dict) and m.get("role") == "session_meta"),
+                    None,
+                )
+                if existing_meta:
+                    meta_entry = dict(existing_meta)
+                    meta_entry.setdefault("timestamp", ts)
+                    rewritten.append(meta_entry)
+                else:
+                    rewritten.append(
+                        {
+                            "role": "session_meta",
+                            "tools": agent_result.get("tools", []) or [],
+                            "model": os.getenv("HERMES_MODEL", ""),
+                            "platform": source.platform.value if source.platform else "",
+                            "timestamp": ts,
+                        }
+                    )
+
+                for msg in agent_messages:
+                    if not isinstance(msg, dict) or msg.get("role") == "system":
+                        continue
+                    entry = dict(msg)
+                    entry.setdefault("timestamp", ts)
+                    rewritten.append(entry)
+
+                self.session_store.rewrite_transcript(session_entry.session_id, rewritten)
+                self.session_store.update_session(session_entry.session_key)
+                return response
             
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
@@ -2397,6 +2450,7 @@ class GatewayRunner:
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
+                    "session_id": session_id,
                 }
 
             pr = self._provider_routing
@@ -2492,6 +2546,8 @@ class GatewayRunner:
                 )
             
             result = agent.run_conversation(message, conversation_history=agent_history)
+            if isinstance(result, dict):
+                result.setdefault("session_id", getattr(agent, "session_id", session_id))
             result_holder[0] = result
 
             if tool_progress_enabled:
@@ -2516,6 +2572,7 @@ class GatewayRunner:
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
                     "tools": tools_holder[0] or [],
+                    "session_id": result.get("session_id") or getattr(agent, "session_id", session_id),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -2565,6 +2622,11 @@ class GatewayRunner:
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "tools": tools_holder[0] or [],
+                "session_id": (
+                    result_holder[0].get("session_id")
+                    if isinstance(result_holder[0], dict)
+                    else getattr(agent, "session_id", session_id)
+                ),
             }
         
         # Start progress message sender if enabled
@@ -2637,12 +2699,13 @@ class GatewayRunner:
                 
                 # Now process the pending message with updated history
                 updated_history = result.get("messages", history)
+                next_session_id = str(result.get("session_id") or session_id)
                 return await self._run_agent(
                     message=pending,
                     context_prompt=context_prompt,
                     history=updated_history,
                     source=source,
-                    session_id=session_id,
+                    session_id=next_session_id,
                     session_key=session_key
                 )
         finally:

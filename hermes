@@ -2,11 +2,49 @@
 """
 Hermes Agent CLI Launcher
 
-This is a convenience wrapper to launch the Hermes CLI.
-Usage: ./hermes [options]
+This wrapper re-execs into the project virtualenv when available so local
+invocations like ./hermes always use the correct interpreter and dependencies.
 """
 
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+def _ensure_project_venv() -> None:
+    root = Path(__file__).resolve().parent
+    candidates = [
+        root / ".venv" / "bin" / "python3",
+        root / "venv" / "bin" / "python3",
+    ]
+
+    current_prefix = Path(sys.prefix).resolve()
+    current_venv_env = Path(os.environ.get("VIRTUAL_ENV", "")).resolve() if os.environ.get("VIRTUAL_ENV") else None
+    for venv_python in candidates:
+        if not venv_python.exists():
+            continue
+        venv_root = venv_python.parent.parent.resolve()
+
+        # Robust "already in this venv" check:
+        # - sys.prefix is the venv root even when sys.executable is a symlink
+        # - VIRTUAL_ENV may already be set by the parent shell
+        if current_prefix == venv_root:
+            return
+        if current_venv_env is not None and current_venv_env == venv_root:
+            return
+
+        os.environ["VIRTUAL_ENV"] = str(venv_root)
+        os.environ["PATH"] = f"{venv_python.parent}:{os.environ.get('PATH', '')}"
+        os.execv(
+            str(venv_python),
+            [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
+        return
+
+
 if __name__ == "__main__":
-    from cli import main
-    import fire
-    fire.Fire(main)
+    _ensure_project_venv()
+    from hermes_cli.main import main
+    raise SystemExit(main())

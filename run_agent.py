@@ -565,19 +565,22 @@ class AIAgent:
         compression_threshold = float(os.getenv("CONTEXT_COMPRESSION_THRESHOLD", "0.85"))
         compression_enabled = os.getenv("CONTEXT_COMPRESSION_ENABLED", "true").lower() in ("true", "1", "yes")
         compression_summary_model = os.getenv("CONTEXT_COMPRESSION_MODEL") or None
+        compression_protect_first_n = int(os.getenv("CONTEXT_COMPRESSION_PROTECT_FIRST_N", "0"))
         compression_protect_last_n = int(os.getenv("CONTEXT_COMPRESSION_PROTECT_LAST_N", "4"))
         compression_summary_target_tokens = int(
             os.getenv("CONTEXT_COMPRESSION_SUMMARY_TARGET_TOKENS", "500")
         )
+        if compression_protect_first_n < 0:
+            compression_protect_first_n = 0
         if compression_protect_last_n < 1:
             compression_protect_last_n = 1
         if compression_summary_target_tokens < 256:
             compression_summary_target_tokens = 256
-        
+
         self.context_compressor = ContextCompressor(
             model=self.model,
             threshold_percent=compression_threshold,
-            protect_first_n=3,
+            protect_first_n=compression_protect_first_n,
             protect_last_n=compression_protect_last_n,
             summary_target_tokens=compression_summary_target_tokens,
             summary_model_override=compression_summary_model,
@@ -1498,6 +1501,8 @@ class AIAgent:
     def _chat_messages_to_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Convert internal chat-style messages to Responses input items."""
         items: List[Dict[str, Any]] = []
+        known_function_call_ids: set[str] = set()
+        deferred_tool_outputs: List[Dict[str, str]] = []
 
         for msg in messages:
             if not isinstance(msg, dict):
@@ -1562,6 +1567,7 @@ class AIAgent:
                                 "name": fn_name,
                                 "arguments": arguments,
                             })
+                            known_function_call_ids.add(call_id)
                     continue
 
                 items.append({"role": role, "content": content_text})
@@ -1575,11 +1581,49 @@ class AIAgent:
                         call_id = raw_tool_call_id.strip()
                 if not isinstance(call_id, str) or not call_id.strip():
                     continue
-                items.append({
+                output_text = str(msg.get("content", "") or "")
+
+                # Defer tool outputs until we know which function_call IDs are
+                # actually present in this payload. This avoids sending orphan
+                # function_call_output items that the Responses API rejects.
+                deferred_tool_outputs.append(
+                    {
+                        "call_id": call_id,
+                        "output": output_text,
+                    }
+                )
+
+        def _call_id_variants(raw_call_id: str) -> List[str]:
+            variants: List[str] = []
+            candidate = (raw_call_id or "").strip()
+            if not candidate:
+                return variants
+            variants.append(candidate)
+            if candidate.startswith("fc_") and len(candidate) > len("fc_"):
+                variants.append(f"call_{candidate[len('fc_'):]}")
+            elif candidate.startswith("call_") and len(candidate) > len("call_"):
+                variants.append(f"fc_{candidate[len('call_'):]}")
+            return variants
+
+        for entry in deferred_tool_outputs:
+            raw_call_id = entry.get("call_id", "")
+            output = entry.get("output", "")
+            variants = _call_id_variants(raw_call_id)
+            matched_call_id = next((cid for cid in variants if cid in known_function_call_ids), None)
+            if not matched_call_id:
+                logger.debug(
+                    "Skipping orphan function_call_output for unmatched call_id=%s",
+                    raw_call_id,
+                )
+                continue
+
+            items.append(
+                {
                     "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": str(msg.get("content", "") or ""),
-                })
+                    "call_id": matched_call_id,
+                    "output": output,
+                }
+            )
 
         return items
 
@@ -1665,6 +1709,77 @@ class AIAgent:
 
             raise ValueError(
                 f"Codex Responses input[{idx}] has unsupported item shape (type={item_type!r}, role={role!r})."
+            )
+
+        def _normalize_call_id(raw_call_id: Any) -> str:
+            if not isinstance(raw_call_id, str):
+                return ""
+            cid = raw_call_id.strip()
+            if not cid:
+                return ""
+            if cid.startswith("fc_") and len(cid) > len("fc_"):
+                return f"call_{cid[len('fc_'):]}"
+            return cid
+
+        declared_calls: List[str] = []
+        declared_norm: set[str] = set()
+        for item in normalized:
+            if item.get("type") != "function_call":
+                continue
+            cid = item.get("call_id")
+            if not isinstance(cid, str) or not cid.strip():
+                continue
+            cid = cid.strip()
+            declared_calls.append(cid)
+            declared_norm.add(_normalize_call_id(cid))
+
+        # Drop orphan/duplicate function_call_output entries before API submission.
+        filtered: List[Dict[str, Any]] = []
+        answered_calls: set[str] = set()
+        for item in normalized:
+            if item.get("type") != "function_call_output":
+                filtered.append(item)
+                continue
+
+            output_cid = _normalize_call_id(item.get("call_id"))
+            if not output_cid:
+                continue
+            if output_cid not in declared_norm:
+                logger.warning(
+                    "Dropping orphan function_call_output during preflight for call_id=%s",
+                    item.get("call_id"),
+                )
+                continue
+            if output_cid in answered_calls:
+                logger.debug(
+                    "Dropping duplicate function_call_output during preflight for call_id=%s",
+                    item.get("call_id"),
+                )
+                continue
+            answered_calls.add(output_cid)
+            filtered.append(item)
+
+        normalized = filtered
+
+        # Final guard: every declared function_call must have an output.
+        for call_id in declared_calls:
+            normalized_call_id = _normalize_call_id(call_id)
+            if normalized_call_id in answered_calls:
+                continue
+            normalized.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": (
+                        "Error executing tool: Missing tool output recovered automatically "
+                        "during request preflight."
+                    ),
+                }
+            )
+            answered_calls.add(normalized_call_id)
+            logger.warning(
+                "Synthesized missing function_call_output during preflight for call_id=%s",
+                call_id,
             )
 
         return normalized
@@ -2424,6 +2539,12 @@ class AIAgent:
         Returns:
             (compressed_messages, new_system_prompt) tuple
         """
+        if self._has_in_flight_tool_calls(messages):
+            if not self.quiet_mode:
+                print(f"{self.log_prefix}⏸️  Skipping compression: tool call outputs still in flight.")
+            current_prompt = self._cached_system_prompt or self._build_system_prompt(system_message)
+            return messages, current_prompt
+
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
 
@@ -2453,6 +2574,60 @@ class AIAgent:
                 logger.debug("Session DB compression split failed: %s", e)
 
         return compressed, new_system_prompt
+
+    def _has_in_flight_tool_calls(self, messages: List[Dict[str, Any]]) -> bool:
+        """Return True when the latest assistant tool_call block lacks tool outputs."""
+        if not messages:
+            return False
+
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if not isinstance(msg, dict):
+                continue
+
+            role = msg.get("role")
+            if role == "tool":
+                continue
+            if role != "assistant":
+                return False
+
+            tool_calls = msg.get("tool_calls")
+            if not isinstance(tool_calls, list) or not tool_calls:
+                return False
+
+            expected_ids: set[str] = set()
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = tc.get("id")
+                if isinstance(tc_id, str) and tc_id.strip():
+                    expected_ids.add(tc_id.strip())
+
+            if not expected_ids:
+                return False
+
+            answered_ids: set[str] = set()
+            j = i + 1
+            while j < len(messages):
+                nxt = messages[j]
+                if not isinstance(nxt, dict) or nxt.get("role") != "tool":
+                    break
+                raw_tool_id = nxt.get("tool_call_id")
+                call_id, _ = self._split_responses_tool_id(raw_tool_id)
+                if not isinstance(call_id, str) or not call_id.strip():
+                    if isinstance(raw_tool_id, str) and raw_tool_id.strip():
+                        call_id = raw_tool_id.strip()
+                if isinstance(call_id, str) and call_id:
+                    answered_ids.add(call_id)
+                    if call_id.startswith("call_") and len(call_id) > len("call_"):
+                        answered_ids.add(f"fc_{call_id[len('call_'):]}")
+                    elif call_id.startswith("fc_") and len(call_id) > len("fc_"):
+                        answered_ids.add(f"call_{call_id[len('fc_'):]}")
+                j += 1
+
+            return any(call_id not in answered_ids for call_id in expected_ids)
+
+        return False
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str) -> None:
         """Execute tool calls from the assistant message and append results to messages."""

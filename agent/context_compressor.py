@@ -29,7 +29,7 @@ class ContextCompressor:
         self,
         model: str,
         threshold_percent: float = 0.85,
-        protect_first_n: int = 3,
+        protect_first_n: int = 0,
         protect_last_n: int = 4,
         summary_target_tokens: int = 2500,
         quiet_mode: bool = False,
@@ -113,7 +113,7 @@ TURNS TO SUMMARIZE:
 ---
 
 Also include:
-5. The active user intent/goal at the end of these turns, and what remains to do next
+5. What remains to do next
 
 Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
 
@@ -164,18 +164,6 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
 
         turns_to_summarize = messages[compress_start:compress_end]
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
-        active_user_intent = ""
-        for msg in reversed(messages):
-            if msg.get("role") != "user":
-                continue
-            content = (msg.get("content") or "").strip()
-            if not content:
-                continue
-            if content.startswith("[CONTEXT SUMMARY]:"):
-                continue
-            active_user_intent = content
-            break
-
         if not self.quiet_mode:
             print(f"\n📦 Context compression triggered ({display_tokens:,} tokens ≥ {self.threshold_tokens:,} threshold)")
             print(f"   📊 Model context limit: {self.context_length:,} tokens ({self.threshold_percent*100:.0f}% = {self.threshold_tokens:,})")
@@ -202,12 +190,6 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
             print(f"   🗜️  Summarizing turns {compress_start+1}-{compress_end} ({len(turns_to_summarize)} turns)")
 
         summary = self._generate_summary(turns_to_summarize)
-        if active_user_intent and "[ACTIVE USER INTENT]:" not in summary:
-            clipped_intent = active_user_intent
-            if len(clipped_intent) > 1200:
-                clipped_intent = clipped_intent[:1200] + "..."
-            summary = f"{summary}\n\n[ACTIVE USER INTENT]: {clipped_intent}"
-
         compressed = []
         for i in range(compress_start):
             msg = messages[i].copy()
