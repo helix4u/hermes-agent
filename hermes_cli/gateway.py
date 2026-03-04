@@ -27,12 +27,23 @@ from hermes_cli.colors import Colors, color
 
 def find_gateway_pids() -> list:
     """Find PIDs of running gateway processes."""
+    def _is_gateway_command(cmdline: str) -> bool:
+        line = (cmdline or "").strip()
+        if not line:
+            return False
+        if " -lc " in line or line.startswith("bash -lc ") or line.startswith("zsh -lc "):
+            return False
+        if "gateway/run.py" in line:
+            return True
+        if "-m hermes_cli.main gateway run" in line:
+            return True
+        if "/hermes gateway run" in line and "python" in line:
+            return True
+        if line.endswith("/hermes gateway run"):
+            return True
+        return False
+
     pids = []
-    patterns = [
-        "hermes_cli.main gateway",
-        "hermes gateway",
-        "gateway/run.py",
-    ]
 
     try:
         if is_windows():
@@ -49,7 +60,7 @@ def find_gateway_pids() -> list:
                     current_cmd = line[len("CommandLine="):]
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId="):]
-                    if any(p in current_cmd for p in patterns):
+                    if _is_gateway_command(current_cmd):
                         try:
                             pid = int(pid_str)
                             if pid != os.getpid() and pid not in pids:
@@ -67,17 +78,16 @@ def find_gateway_pids() -> list:
                 # Skip grep and current process
                 if 'grep' in line or str(os.getpid()) in line:
                     continue
-                for pattern in patterns:
-                    if pattern in line:
-                        parts = line.split()
-                        if len(parts) > 1:
-                            try:
-                                pid = int(parts[1])
-                                if pid not in pids:
-                                    pids.append(pid)
-                            except ValueError:
-                                continue
-                        break
+                if not _is_gateway_command(line):
+                    continue
+                parts = line.split()
+                if len(parts) > 1:
+                    try:
+                        pid = int(parts[1])
+                        if pid not in pids:
+                            pids.append(pid)
+                    except ValueError:
+                        continue
     except Exception:
         pass
 
@@ -380,9 +390,29 @@ def launchd_status(deep: bool = False):
 def run_gateway(verbose: bool = False):
     """Run the gateway in foreground."""
     sys.path.insert(0, str(PROJECT_ROOT))
-    
+    import atexit
+    from gateway.status import acquire_gateway_lock, release_gateway_lock
+
+    # Cross-check running gateway processes (service-managed or manual),
+    # even if lock/pid files were cleaned up by another process exit.
+    existing_pids = [pid for pid in find_gateway_pids() if pid != os.getpid()]
+    if existing_pids:
+        print_error(f"Gateway is already running (PID: {', '.join(map(str, existing_pids))}).")
+        print("Use `hermes gateway status` to inspect current process.")
+        print("Use `hermes gateway stop` to stop it before starting a new one.")
+        sys.exit(1)
+
+    acquired, owner_pid = acquire_gateway_lock()
+    if not acquired:
+        owner = f" (PID {owner_pid})" if owner_pid else ""
+        print_error(f"Gateway is already running{owner}.")
+        print("Use `hermes gateway status` to inspect current process.")
+        print("Use `hermes gateway stop` to stop it before starting a new one.")
+        sys.exit(1)
+
+    atexit.register(release_gateway_lock)
     from gateway.run import start_gateway
-    
+
     print("┌─────────────────────────────────────────────────────────┐")
     print("│           ⚕ Hermes Gateway Starting...                 │")
     print("├─────────────────────────────────────────────────────────┤")
@@ -393,9 +423,12 @@ def run_gateway(verbose: bool = False):
     
     # Exit with code 1 if gateway fails to connect any platform,
     # so systemd Restart=on-failure will retry on transient errors
-    success = asyncio.run(start_gateway())
-    if not success:
-        sys.exit(1)
+    try:
+        success = asyncio.run(start_gateway())
+        if not success:
+            sys.exit(1)
+    finally:
+        release_gateway_lock()
 
 
 # =============================================================================

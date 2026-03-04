@@ -97,6 +97,44 @@ from agent.trajectory import (
 )
 
 
+def _repair_terminal_tool_args(tool_name: str, raw_args: str) -> Optional[str]:
+    """Salvage invalid terminal tool JSON by extracting a command string."""
+    if tool_name != "terminal" or not raw_args or not raw_args.strip():
+        return None
+    raw = raw_args.strip()
+
+    def _to_json(cmd: str) -> Optional[str]:
+        if not cmd:
+            return None
+        try:
+            return json.dumps({"command": cmd})
+        except (TypeError, ValueError):
+            return None
+
+    # Strict quoted JSON value.
+    m = re.search(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+    if m:
+        return _to_json(m.group(1))
+
+    # Unescaped quotes inside value.
+    m = re.search(r'"command"\s*:\s*"(.*)"\s*[,}]', raw)
+    if m:
+        return _to_json(m.group(1))
+
+    # Truncated at end.
+    m2 = re.search(r'"command"\s*:\s*"(.*)', raw, re.DOTALL)
+    if m2:
+        cmd = m2.group(1).rstrip()
+        if cmd.endswith('"}'):
+            cmd = cmd[:-2]
+        elif cmd.endswith('"'):
+            cmd = cmd[:-1]
+        cmd = re.sub(r'["}\],\s]+$', '', cmd)
+        if cmd:
+            return _to_json(cmd)
+    return None
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -527,13 +565,21 @@ class AIAgent:
         compression_threshold = float(os.getenv("CONTEXT_COMPRESSION_THRESHOLD", "0.85"))
         compression_enabled = os.getenv("CONTEXT_COMPRESSION_ENABLED", "true").lower() in ("true", "1", "yes")
         compression_summary_model = os.getenv("CONTEXT_COMPRESSION_MODEL") or None
+        compression_protect_last_n = int(os.getenv("CONTEXT_COMPRESSION_PROTECT_LAST_N", "4"))
+        compression_summary_target_tokens = int(
+            os.getenv("CONTEXT_COMPRESSION_SUMMARY_TARGET_TOKENS", "500")
+        )
+        if compression_protect_last_n < 1:
+            compression_protect_last_n = 1
+        if compression_summary_target_tokens < 256:
+            compression_summary_target_tokens = 256
         
         self.context_compressor = ContextCompressor(
             model=self.model,
             threshold_percent=compression_threshold,
             protect_first_n=3,
-            protect_last_n=4,
-            summary_target_tokens=500,
+            protect_last_n=compression_protect_last_n,
+            summary_target_tokens=compression_summary_target_tokens,
             summary_model_override=compression_summary_model,
             quiet_mode=self.quiet_mode,
         )
@@ -2608,6 +2654,22 @@ class AIAgent:
                     f"exceeding the {MAX_TOOL_RESULT_CHARS:,} char limit]"
                 )
 
+            # Emit completion event so gateway progress can show call + result pairs.
+            if self.tool_progress_callback:
+                try:
+                    self.tool_progress_callback(
+                        "_tool_result",
+                        function_name,
+                        {
+                            "tool": function_name,
+                            "duration_seconds": round(tool_duration, 3),
+                            "is_error": bool(_is_error_result),
+                            "result": function_result,
+                        },
+                    )
+                except Exception as cb_err:
+                    logging.debug(f"Tool progress callback error (result): {cb_err}")
+
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
@@ -2635,6 +2697,76 @@ class AIAgent:
 
             if self.tool_delay > 0 and i < len(assistant_message.tool_calls):
                 time.sleep(self.tool_delay)
+
+    def _repair_unanswered_tool_calls(self, messages: List[Dict[str, Any]]) -> int:
+        """Insert synthetic tool outputs for dangling assistant tool calls.
+
+        Interrupted sessions can occasionally persist an assistant message with
+        tool_calls but without the required role="tool" responses. This breaks
+        the next API call with:
+        "No tool output found for function call ...".
+        """
+        if not messages:
+            return 0
+
+        repaired = 0
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                i += 1
+                continue
+
+            tool_calls = msg.get("tool_calls")
+            if not isinstance(tool_calls, list) or not tool_calls:
+                i += 1
+                continue
+
+            expected_ids: List[str] = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = tc.get("id")
+                if isinstance(tc_id, str) and tc_id.strip():
+                    expected_ids.append(tc_id.strip())
+            if not expected_ids:
+                i += 1
+                continue
+
+            # Only tool messages immediately following this assistant turn can
+            # satisfy these tool calls for API sequencing purposes.
+            j = i + 1
+            answered: set[str] = set()
+            while j < len(messages):
+                nxt = messages[j]
+                if not isinstance(nxt, dict):
+                    break
+                if nxt.get("role") != "tool":
+                    break
+                tid = nxt.get("tool_call_id")
+                if isinstance(tid, str) and tid.strip():
+                    answered.add(tid.strip())
+                j += 1
+
+            missing = [tcid for tcid in expected_ids if tcid not in answered]
+            if missing:
+                synthetic = [
+                    {
+                        "role": "tool",
+                        "tool_call_id": tcid,
+                        "content": "[Recovered missing tool output from interrupted turn]",
+                    }
+                    for tcid in missing
+                ]
+                messages[j:j] = synthetic
+                repaired += len(synthetic)
+                # Skip past inserted synthetic outputs.
+                i = j + len(synthetic)
+                continue
+
+            i = j
+
+        return repaired
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
@@ -2787,7 +2919,13 @@ class AIAgent:
         
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
-        
+        repaired_calls = self._repair_unanswered_tool_calls(messages)
+        if repaired_calls:
+            logger.warning(
+                "Recovered %s dangling tool call output(s) from conversation history before new turn.",
+                repaired_calls,
+            )
+
         # Hydrate todo store from conversation history (gateway creates a fresh
         # AIAgent per message, so the in-memory store is empty -- we need to
         # recover the todo state from the most recent todo tool response in history)
@@ -2871,6 +3009,15 @@ class AIAgent:
         self.clear_interrupt()
         
         while api_call_count < self.max_iterations:
+            # Defensive repair for interrupted histories that may contain
+            # dangling assistant tool_calls without matching tool outputs.
+            repaired_before_call = self._repair_unanswered_tool_calls(messages)
+            if repaired_before_call:
+                logger.warning(
+                    "Recovered %s dangling tool call output(s) before API request.",
+                    repaired_before_call,
+                )
+
             # Check for interrupt request (e.g., user sent new message)
             if self._interrupt_requested:
                 interrupted = True
@@ -2958,6 +3105,21 @@ class AIAgent:
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)
             approx_tokens = total_chars // 4  # Rough estimate: 4 chars per token
+
+            # Preflight compression: if the outgoing payload already appears too
+            # large, compress before making a guaranteed-fail API request.
+            if self.compression_enabled and self.context_compressor.should_compress_preflight(api_messages):
+                if not self.quiet_mode:
+                    print(f"{self.log_prefix}⚠️  Preflight context too large (~{approx_tokens:,} tokens). Compressing before API call...")
+                original_len = len(messages)
+                messages, active_system_prompt = self._compress_context(
+                    messages, system_message, approx_tokens=approx_tokens
+                )
+                if len(messages) < original_len:
+                    if not self.quiet_mode:
+                        print(f"{self.log_prefix}   🗜️  Compressed {original_len} → {len(messages)} messages, retrying request build...")
+                    continue
+                # Could not reduce further; proceed and let normal error path handle.
             
             # Thinking spinner for quiet mode (animated during API call)
             thinking_spinner = None
@@ -3286,6 +3448,41 @@ class AIAgent:
                                 "partial": True
                             }
 
+                    # Context-window overflows are often surfaced as generic 400s.
+                    # Detect and compress BEFORE generic client-error abort logic.
+                    is_context_length_error = any(phrase in error_msg for phrase in [
+                        'context length', 'maximum context', 'token limit',
+                        'too many tokens', 'reduce the length', 'exceeds the limit',
+                        'exceeds the context window', 'context window of this model',
+                        'input exceeds the context window',
+                        'request entity too large',  # OpenRouter/Nous 413 safety net
+                    ])
+                    
+                    if is_context_length_error:
+                        print(f"{self.log_prefix}⚠️  Context length exceeded - attempting compression...")
+                        
+                        original_len = len(messages)
+                        messages, active_system_prompt = self._compress_context(
+                            messages, system_message, approx_tokens=approx_tokens
+                        )
+                        
+                        if len(messages) < original_len:
+                            print(f"{self.log_prefix}   🗜️  Compressed {original_len} → {len(messages)} messages, retrying...")
+                            continue  # Retry with compressed messages
+                        else:
+                            # Can't compress further
+                            print(f"{self.log_prefix}❌ Context length exceeded and cannot compress further.")
+                            print(f"{self.log_prefix}   💡 The conversation has accumulated too much content.")
+                            logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
+                            self._persist_session(messages, conversation_history)
+                            return {
+                                "messages": messages,
+                                "completed": False,
+                                "api_calls": api_call_count,
+                                "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
+                                "partial": True
+                            }
+
                     # Check for non-retryable client errors (4xx HTTP status codes).
                     # These indicate a problem with the request itself (bad model ID,
                     # invalid API key, forbidden, etc.) and will never succeed on retry.
@@ -3315,38 +3512,6 @@ class AIAgent:
                             "failed": True,
                             "error": str(api_error),
                         }
-                    
-                    # Check for non-retryable errors (context length exceeded)
-                    is_context_length_error = any(phrase in error_msg for phrase in [
-                        'context length', 'maximum context', 'token limit',
-                        'too many tokens', 'reduce the length', 'exceeds the limit',
-                        'request entity too large',  # OpenRouter/Nous 413 safety net
-                    ])
-                    
-                    if is_context_length_error:
-                        print(f"{self.log_prefix}⚠️  Context length exceeded - attempting compression...")
-                        
-                        original_len = len(messages)
-                        messages, active_system_prompt = self._compress_context(
-                            messages, system_message, approx_tokens=approx_tokens
-                        )
-                        
-                        if len(messages) < original_len:
-                            print(f"{self.log_prefix}   🗜️  Compressed {original_len} → {len(messages)} messages, retrying...")
-                            continue  # Retry with compressed messages
-                        else:
-                            # Can't compress further
-                            print(f"{self.log_prefix}❌ Context length exceeded and cannot compress further.")
-                            print(f"{self.log_prefix}   💡 The conversation has accumulated too much content.")
-                            logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
-                            self._persist_session(messages, conversation_history)
-                            return {
-                                "messages": messages,
-                                "completed": False,
-                                "api_calls": api_call_count,
-                                "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
-                                "partial": True
-                            }
                     
                     if retry_count >= max_retries:
                         print(f"{self.log_prefix}❌ Max retries ({max_retries}) exceeded. Giving up.")
@@ -3545,6 +3710,10 @@ class AIAgent:
                         try:
                             json.loads(args)
                         except json.JSONDecodeError as e:
+                            repaired = _repair_terminal_tool_args(tc.function.name, args)
+                            if repaired:
+                                tc.function.arguments = repaired
+                                continue
                             invalid_json_args.append((tc.function.name, str(e)))
                     
                     if invalid_json_args:

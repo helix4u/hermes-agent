@@ -865,3 +865,12 @@ class BasePlatformAdapter(ABC):
             ]
 
         return chunks
+
+    async def edit_message(self, chat_id: str, message_id: str, content: str) -> None:
+        """
+        Optional hook for platforms that support in-place message edits.
+
+        Default implementation is a no-op. Adapters like Discord can override
+        this to keep a single live status message updated.
+        """
+        return None

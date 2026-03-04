@@ -7,6 +7,9 @@ import signal
 import subprocess
 import threading
 import time
+import shlex
+from pathlib import Path
+from typing import Optional
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -73,6 +76,74 @@ def _clean_shell_noise(output: str) -> str:
     return "\n".join(lines)
 
 
+def _venv_bin_dir(venv_path: Path) -> Path:
+    """Return the executable directory for a virtual environment."""
+    return venv_path / ("Scripts" if _IS_WINDOWS else "bin")
+
+
+def _has_python_in_venv(venv_path: Path) -> bool:
+    """Check whether a candidate venv has a Python executable."""
+    bin_dir = _venv_bin_dir(venv_path)
+    exe_name = "python.exe" if _IS_WINDOWS else "python"
+    return (bin_dir / exe_name).is_file()
+
+
+def _find_nearest_venv(start_dir: str) -> Optional[Path]:
+    """Find the closest venv/.venv by walking upward from start_dir."""
+    start = Path(start_dir).expanduser().resolve()
+    for current in (start, *start.parents):
+        for name in ("venv", ".venv"):
+            candidate = current / name
+            if candidate.is_dir() and _has_python_in_venv(candidate):
+                return candidate
+    return None
+
+
+def _find_fallback_hermes_venv() -> Optional[Path]:
+    """Fallback to the Hermes repo venv when cwd doesn't contain one."""
+    repo_root = Path(__file__).resolve().parents[2]
+    candidate = repo_root / "venv"
+    if candidate.is_dir() and _has_python_in_venv(candidate):
+        return candidate
+    return None
+
+
+def _inject_venv_env(base_env: dict, venv_path: Path) -> dict:
+    """Return a copy of env with venv PATH/VIRTUAL_ENV activated."""
+    env = dict(base_env)
+    bin_dir = str(_venv_bin_dir(venv_path))
+    path_parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+    # Keep venv bin first even if startup scripts already added it elsewhere.
+    path_parts = [p for p in path_parts if p != bin_dir]
+    path_parts.insert(0, bin_dir)
+    env["PATH"] = os.pathsep.join(path_parts)
+    env["VIRTUAL_ENV"] = str(venv_path)
+    return env
+
+
+def _python3_shim_prefix(venv_path: Path) -> str:
+    """Return shell snippet that maps python3 -> venv python when missing."""
+    if _IS_WINDOWS:
+        return ""
+    bin_dir = _venv_bin_dir(venv_path)
+    py = bin_dir / "python"
+    py3 = bin_dir / "python3"
+    if not py.is_file() or py3.is_file():
+        return ""
+    py_str = str(py)
+    return f'python3() {{ "{py_str}" "$@"; }}'
+
+
+def _venv_command_prefix(venv_path: Path) -> str:
+    """Return shell snippet that force-activates venv for this command."""
+    bin_dir = str(_venv_bin_dir(venv_path))
+    venv_dir = str(venv_path)
+    return (
+        f'export VIRTUAL_ENV={shlex.quote(venv_dir)}; '
+        f'export PATH={shlex.quote(bin_dir)}:"$PATH"'
+    )
+
+
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host machine.
 
@@ -104,11 +175,20 @@ class LocalEnvironment(BaseEnvironment):
             # -l alone isn't enough: .profile sources .bashrc, but the guard
             # returns early because the shell isn't interactive.
             user_shell = _find_shell()
+            effective_env = os.environ | self.env
+            venv_path = _find_nearest_venv(work_dir) or _find_fallback_hermes_venv()
+            if venv_path:
+                effective_env = _inject_venv_env(effective_env, venv_path)
+                exec_command = f"{_venv_command_prefix(venv_path)}; {exec_command}"
+                shim = _python3_shim_prefix(venv_path)
+                if shim:
+                    exec_command = f"{shim}; {exec_command}"
+
             proc = subprocess.Popen(
                 [user_shell, "-lic", exec_command],
                 text=True,
                 cwd=work_dir,
-                env=os.environ | self.env,
+                env=effective_env,
                 encoding="utf-8",
                 errors="replace",
                 stdout=subprocess.PIPE,

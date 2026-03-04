@@ -100,7 +100,7 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
     _BATCH_SIZE = 5
     _batch: List[str] = []
 
-    def _callback(tool_name: str, preview: str = None):
+    def _callback(tool_name: str, preview: str = None, args: dict = None):
         # Special "_thinking" event: model produced text content (reasoning)
         if tool_name == "_thinking":
             if spinner:

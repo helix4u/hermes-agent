@@ -14,12 +14,14 @@ Usage:
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
 import sys
 import signal
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
@@ -33,14 +35,22 @@ _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
 # Load environment variables from ~/.hermes/.env first
 from dotenv import load_dotenv
+from agent.env_loader import load_dotenv_with_fallback
 _env_path = _hermes_home / '.env'
 if _env_path.exists():
     try:
-        load_dotenv(_env_path, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(_env_path, encoding="latin-1")
+        load_dotenv_with_fallback(_env_path, logger=logging.getLogger(__name__))
+    except ValueError as exc:
+        print(f"Failed to load {_env_path}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 # Also try project .env as fallback
-load_dotenv()
+_project_env = Path(__file__).parent.parent / '.env'
+if _project_env.exists():
+    try:
+        load_dotenv_with_fallback(_project_env, override=False, logger=logging.getLogger(__name__))
+    except ValueError as exc:
+        print(f"Failed to load {_project_env}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
@@ -48,7 +58,7 @@ _config_path = _hermes_home / 'config.yaml'
 if _config_path.exists():
     try:
         import yaml as _yaml
-        with open(_config_path) as _f:
+        with open(_config_path, encoding="utf-8") as _f:
             _cfg = _yaml.safe_load(_f) or {}
         # Top-level simple values (fallback only — don't override .env)
         for _key, _val in _cfg.items():
@@ -83,7 +93,10 @@ if _config_path.exists():
             _compression_env_map = {
                 "enabled": "CONTEXT_COMPRESSION_ENABLED",
                 "threshold": "CONTEXT_COMPRESSION_THRESHOLD",
+                "summary_provider": "CONTEXT_COMPRESSION_PROVIDER",
                 "summary_model": "CONTEXT_COMPRESSION_MODEL",
+                "protect_last_n": "CONTEXT_COMPRESSION_PROTECT_LAST_N",
+                "summary_target_tokens": "CONTEXT_COMPRESSION_SUMMARY_TARGET_TOKENS",
             }
             for _cfg_key, _env_var in _compression_env_map.items():
                 if _cfg_key in _compression_cfg:
@@ -101,10 +114,15 @@ os.environ["HERMES_QUIET"] = "1"
 # Enable interactive exec approval for dangerous commands on messaging platforms
 os.environ["HERMES_EXEC_ASK"] = "1"
 
-# Set terminal working directory for messaging platforms
-# Uses MESSAGING_CWD if set, otherwise defaults to home directory
-# This is separate from CLI which uses the directory where `hermes` is run
-messaging_cwd = os.getenv("MESSAGING_CWD") or str(Path.home())
+# Set terminal working directory for messaging platforms.
+# Uses MESSAGING_CWD if set. Otherwise prefer ~/.hermes/workspace, then
+# ~/.hermes, then home (more practical defaults for gateway tasks).
+_default_messaging_cwd = Path.home() / ".hermes" / "workspace"
+if not _default_messaging_cwd.exists():
+    _default_messaging_cwd = Path.home() / ".hermes"
+if not _default_messaging_cwd.exists():
+    _default_messaging_cwd = Path.home()
+messaging_cwd = os.getenv("MESSAGING_CWD") or str(_default_messaging_cwd)
 os.environ["TERMINAL_CWD"] = messaging_cwd
 
 from gateway.config import (
@@ -953,9 +971,94 @@ class GatewayRunner:
                     }
                 )
             
-            # Find only the NEW messages from this turn (skip history we loaded)
-            history_len = len(history)
-            new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else agent_messages
+            # Find only the NEW messages from this turn.
+            # Important: context compression can rewrite/prune earlier history,
+            # so raw len(history) slicing is not safe.
+            def _normalize_for_alignment(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                role = msg.get("role")
+                if not role or role in ("session_meta", "system"):
+                    return None
+
+                # Preserve rich tool topology for robust matching.
+                normalized: Dict[str, Any] = {"role": role}
+                if "content" in msg:
+                    normalized["content"] = msg.get("content")
+                if "tool_call_id" in msg:
+                    normalized["tool_call_id"] = msg.get("tool_call_id")
+                if "tool_name" in msg:
+                    normalized["tool_name"] = msg.get("tool_name")
+                if "tool_calls" in msg:
+                    normalized["tool_calls"] = msg.get("tool_calls")
+
+                # Mirror messages are transformed before being sent to the model.
+                if role == "user" and msg.get("mirror") and normalized.get("content"):
+                    mirror_src = msg.get("mirror_source", "another session")
+                    normalized["content"] = f"[Delivered from {mirror_src}] {normalized['content']}"
+
+                if role in ("user", "assistant") and not normalized.get("content") and "tool_calls" not in normalized:
+                    return None
+                return normalized
+
+            def _aligned_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+                return (
+                    a.get("role") == b.get("role")
+                    and (a.get("content") or "") == (b.get("content") or "")
+                    and (a.get("tool_call_id") or "") == (b.get("tool_call_id") or "")
+                    and (a.get("tool_name") or "") == (b.get("tool_name") or "")
+                    and json.dumps(a.get("tool_calls", []), sort_keys=True, ensure_ascii=False)
+                    == json.dumps(b.get("tool_calls", []), sort_keys=True, ensure_ascii=False)
+                )
+
+            # Primary anchor: the current inbound user message. This is stable
+            # even when older history is compressed/rewritten.
+            anchor_idx = None
+            for i in range(len(agent_messages) - 1, -1, -1):
+                _m = agent_messages[i]
+                if _m.get("role") == "user" and (_m.get("content") or "") == (message_text or ""):
+                    anchor_idx = i
+                    break
+
+            if anchor_idx is not None:
+                new_messages = agent_messages[anchor_idx:]
+            else:
+                history_aligned = []
+                for _m in history:
+                    _n = _normalize_for_alignment(_m)
+                    if _n is not None:
+                        history_aligned.append(_n)
+
+                agent_aligned = []
+                for _m in agent_messages:
+                    _n = _normalize_for_alignment(_m)
+                    if _n is not None:
+                        agent_aligned.append(_n)
+
+                common_prefix = 0
+                for h_msg, a_msg in zip(history_aligned, agent_aligned):
+                    if not _aligned_equal(h_msg, a_msg):
+                        break
+                    common_prefix += 1
+
+                if common_prefix < len(history_aligned):
+                    logger.debug(
+                        "Transcript history diverged from agent messages (likely compression); "
+                        "using best-effort aligned prefix=%s/%s",
+                        common_prefix,
+                        len(history_aligned),
+                    )
+
+                # Map aligned prefix index back to raw agent_messages index.
+                aligned_seen = 0
+                start_idx = len(agent_messages)
+                for idx, _m in enumerate(agent_messages):
+                    _n = _normalize_for_alignment(_m)
+                    if _n is None:
+                        continue
+                    if aligned_seen == common_prefix:
+                        start_idx = idx
+                        break
+                    aligned_seen += 1
+                new_messages = agent_messages[start_idx:]
             
             # If no new messages found (edge case), fall back to simple user/assistant
             if not new_messages:
@@ -1736,40 +1839,270 @@ class GatewayRunner:
             default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
             enabled_toolsets = [default_toolset]
         
-        # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
-        # Falls back to env vars for backward compatibility
+        # Tool progress and log configuration
         _progress_cfg = {}
         try:
             _tp_cfg_path = _hermes_home / "config.yaml"
             if _tp_cfg_path.exists():
                 import yaml as _tp_yaml
-                with open(_tp_cfg_path) as _tp_f:
+                with open(_tp_cfg_path, encoding="utf-8") as _tp_f:
                     _tp_data = _tp_yaml.safe_load(_tp_f) or {}
                 _progress_cfg = _tp_data.get("display", {})
         except Exception:
             pass
+
+        def _as_bool(val: Any, default: bool = False) -> bool:
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                v = val.strip().lower()
+                if v in {"1", "true", "yes", "on"}:
+                    return True
+                if v in {"0", "false", "no", "off"}:
+                    return False
+            return default
+
         progress_mode = (
             _progress_cfg.get("tool_progress")
             or os.getenv("HERMES_TOOL_PROGRESS_MODE")
             or "all"
         )
+        progress_style = (
+            _progress_cfg.get("tool_progress_style")
+            or os.getenv("HERMES_TOOL_PROGRESS_STYLE")
+            or "single"
+        ).strip().lower()
+        if progress_style not in {"feed", "single"}:
+            progress_style = "single"
         tool_progress_enabled = progress_mode != "off"
-        
-        # Queue for progress messages (thread-safe)
+        try:
+            progress_rolling_entries = int(
+                _progress_cfg.get("tool_progress_rolling_entries")
+                or os.getenv("HERMES_TOOL_PROGRESS_ROLLING_ENTRIES", "3")
+            )
+        except Exception:
+            progress_rolling_entries = 3
+        progress_rolling_entries = max(1, min(progress_rolling_entries, 8))
+        try:
+            progress_embed_max_chars = int(
+                os.getenv("HERMES_TOOL_PROGRESS_EMBED_MAX_CHARS", "3800")
+            )
+        except Exception:
+            progress_embed_max_chars = 3800
+        progress_embed_max_chars = max(1200, min(progress_embed_max_chars, 3900))
+
+        thread_logs_enabled = _as_bool(
+            _progress_cfg.get("tool_thread_logs", os.getenv("HERMES_TOOL_THREAD_LOGS", "true")),
+            default=True,
+        )
+        artifact_logs_enabled = _as_bool(
+            _progress_cfg.get("tool_log_artifacts", os.getenv("HERMES_TOOL_LOG_ARTIFACTS", "true")),
+            default=True,
+        )
+
+        # Discord only supports threads in server channels, not DMs.
+        thread_logs_enabled = bool(
+            thread_logs_enabled
+            and source.platform == Platform.DISCORD
+            and source.chat_type != "dm"
+        )
+
+        tool_log_path: Optional[Path] = None
+        if artifact_logs_enabled:
+            try:
+                tool_log_dir = _hermes_home / "logs" / "tool_runs"
+                tool_log_dir.mkdir(parents=True, exist_ok=True)
+                tool_log_path = tool_log_dir / f"{session_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+                tool_log_path.write_text(
+                    f"session_id={session_id}\n"
+                    f"session_key={session_key or ''}\n"
+                    f"platform={source.platform.value if source.platform else ''}\n"
+                    f"chat_id={source.chat_id}\n"
+                    f"started_at={datetime.now().isoformat()}\n"
+                    f"user_message={message}\n"
+                    "----\n",
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                logger.debug("Could not create tool log artifact file: %s", e)
+                tool_log_path = None
+
+        def _append_artifact(line: str) -> None:
+            if not tool_log_path:
+                return
+            try:
+                with tool_log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line.rstrip() + "\n")
+            except Exception as e:
+                logger.debug("Tool log artifact append failed: %s", e)
+
+        # Queue for progress/status ticks and detailed log entries (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
-        last_tool = [None]  # Mutable container for tracking in closure
-        
+        detail_queue = queue.Queue() if tool_progress_enabled else None
+        detail_backlog_max = max(
+            50,
+            int(os.getenv("HERMES_TOOL_DETAIL_BACKLOG_MAX", "400")),
+        )
+        thread_create_max_attempts = max(
+            1,
+            int(os.getenv("HERMES_TOOL_THREAD_CREATE_MAX_ATTEMPTS", "3")),
+        )
+        last_tool = [None]
+        progress_state = {
+            "started_at": time.monotonic(),
+            "phase": "thinking",
+            "last_detail": "Queued request...",
+            "tool_calls": 0,
+            "updates": 0,
+            "recent_events": [],
+        }
+
+        heartbeat_faces_by_phase = {
+            "starting": ["(^_^)/", "(^o^)/", "(o^▽^o)"],
+            "thinking": ["(·_·)", "(•‿•)", "(^‿^)", "(ᵔ◡ᵔ)", "(^-^*)"],
+            "tool": ["(⌐■_■)", "(^_^)b", "(•̀ᴗ•́)و", "(｡•̀ᴗ-)✧", "(ง •_•)ง"],
+            "finalizing": ["(•ᴗ•)", "(≧◡≦)", "(¬‿¬)", "(づ｡◕‿‿◕｡)づ"],
+            "default": ["(•‿•)", "(^_^)/", "(^‿^)"],
+        }
+        phase_labels = {
+            "starting": "starting",
+            "thinking": "thinking",
+            "tool": "using tools",
+            "finalizing": "finalizing",
+        }
+        phase_emojis = {
+            "starting": "🚀",
+            "thinking": "💡",
+            "tool": "🛠️",
+            "finalizing": "🧾",
+        }
+
+        def _push_recent_event(detail: str) -> None:
+            text = (detail or "").strip()
+            if not text:
+                return
+            ts = datetime.now().strftime("%H:%M:%S")
+            event_line = f"`{ts}` {text}"
+            recent_events = progress_state.setdefault("recent_events", [])
+            if recent_events and recent_events[-1] == event_line:
+                return
+            recent_events.append(event_line)
+            while len(recent_events) > progress_rolling_entries:
+                recent_events.pop(0)
+
+        def _set_progress_state(*, phase: str | None = None, detail: str | None = None, tool_call: bool = False):
+            if phase:
+                progress_state["phase"] = phase
+            if detail:
+                progress_state["last_detail"] = detail
+                _push_recent_event(detail)
+            if tool_call:
+                progress_state["tool_calls"] += 1
+            progress_state["updates"] += 1
+            if progress_queue:
+                progress_queue.put("__tick__")
+
+        def _build_progress_message() -> str:
+            elapsed = int(max(0, time.monotonic() - progress_state["started_at"]))
+            phase = progress_state.get("phase", "thinking")
+            pool = heartbeat_faces_by_phase.get(phase, heartbeat_faces_by_phase["default"])
+            face = pool[elapsed % len(pool)]
+            phase_text = phase_labels.get(phase, "working")
+            phase_emoji = phase_emojis.get(phase, "⚙️")
+            header = f"{phase_emoji} {face} Hermes is {phase_text}... ({elapsed}s)"
+            footer = f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
+
+            events = list(progress_state.get("recent_events") or [])
+            if not events:
+                fallback = (progress_state.get("last_detail") or "Working...").strip()
+                events = [f"`{datetime.now().strftime('%H:%M:%S')}` {fallback}"]
+
+            def _render(lines: list[str]) -> str:
+                body = "\n".join(f"• {line}" for line in lines)
+                return f"{header}\n{body}\n{footer}"
+
+            # First, try with current rolling window as-is.
+            msg = _render(events[-progress_rolling_entries:])
+            if len(msg) <= progress_embed_max_chars:
+                return msg
+
+            # If still too long, drop oldest events until it fits.
+            lines = events[-progress_rolling_entries:]
+            while len(lines) > 1:
+                lines = lines[1:]
+                msg = _render(lines)
+                if len(msg) <= progress_embed_max_chars:
+                    return msg
+
+            # Final fallback: trim the single remaining event to stay editable.
+            lone = lines[0] if lines else ""
+            overhead = len(f"{header}\n• \n{footer}")
+            available = max(80, progress_embed_max_chars - overhead)
+            if len(lone) > available:
+                lone = lone[: max(0, available - 24)] + "... [trimmed for embed]"
+            return _render([lone])
+
+        def _summarize_result_for_status(result_text: str, is_error: bool) -> str:
+            text = (result_text or "").strip()
+            if not text:
+                return ""
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return text if is_error else ""
+
+            if isinstance(parsed, dict):
+                parts: list[str] = []
+                if "exit_code" in parsed:
+                    parts.append(f"exit={parsed.get('exit_code')}")
+                err = parsed.get("error")
+                if err:
+                    parts.append(f"error={err}")
+                stderr = parsed.get("stderr")
+                if not err and is_error and isinstance(stderr, str) and stderr.strip():
+                    parts.append(f"stderr={stderr.strip()}")
+                if not parts and is_error:
+                    message_text = parsed.get("message")
+                    if isinstance(message_text, str) and message_text.strip():
+                        parts.append(message_text.strip())
+                return " | ".join(parts)
+            return text if is_error else ""
+
         def progress_callback(tool_name: str, preview: str = None, args: dict = None):
-            """Callback invoked by agent when a tool is called."""
             if not progress_queue:
                 return
-            
-            # "new" mode: only report when tool changes
+
+            # Tool completion event (emitted after each tool finishes).
+            if tool_name == "_tool_result":
+                payload = args or {}
+                completed_tool = str(payload.get("tool") or preview or "tool")
+                duration = payload.get("duration_seconds")
+                is_error = bool(payload.get("is_error"))
+                result_text = str(payload.get("result") or "").strip()
+                status_emoji = "❌" if is_error else "✅"
+                if isinstance(duration, (int, float)):
+                    duration_text = f" in {float(duration):.2f}s"
+                else:
+                    duration_text = ""
+                summary_suffix = _summarize_result_for_status(result_text, is_error)
+                done_msg = f"{status_emoji} {completed_tool} finished{duration_text}"
+                if summary_suffix:
+                    done_msg = f"{done_msg} | {summary_suffix}"
+                _set_progress_state(phase="tool", detail=done_msg, tool_call=False)
+
+                detail_payload = f"{status_emoji} RESULT {completed_tool}{duration_text}"
+                if result_text:
+                    detail_payload = f"{detail_payload}\n{result_text}"
+                ts = datetime.now().strftime("%H:%M:%S")
+                if detail_queue:
+                    detail_queue.put((ts, detail_payload))
+                _append_artifact(f"[{datetime.now().isoformat()}] {detail_payload}")
+                return
+
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-            
-            # Build progress message with primary argument preview
+
             tool_emojis = {
                 "terminal": "💻",
                 "process": "⚙️",
@@ -1809,56 +2142,173 @@ class GatewayRunner:
                 "delegate_task": "🔀",
                 "clarify": "❓",
                 "skill_manage": "📝",
+                "_thinking": "💡",
             }
             emoji = tool_emojis.get(tool_name, "⚙️")
-            
-            # Verbose mode: show detailed arguments
-            if progress_mode == "verbose" and args:
-                import json as _json
-                args_str = _json.dumps(args, ensure_ascii=False, default=str)
-                if len(args_str) > 200:
-                    args_str = args_str[:197] + "..."
-                msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
-                progress_queue.put(msg)
-                return
-            
+
+            args_text = ""
+            if args:
+                try:
+                    args_text = json.dumps(args, ensure_ascii=False, default=str)
+                except Exception:
+                    args_text = str(args)
+
             if preview:
-                # Truncate preview to keep messages clean
-                if len(preview) > 80:
-                    preview = preview[:77] + "..."
                 msg = f"{emoji} {tool_name}: \"{preview}\""
             else:
                 msg = f"{emoji} {tool_name}..."
-            
-            progress_queue.put(msg)
-        
-        # Background task to send progress messages
+
+            live_detail = msg
+            if args_text and tool_name != "_thinking":
+                live_detail = f"{emoji} CALL {tool_name}\n{args_text}"
+
+            if tool_name == "_thinking":
+                _set_progress_state(phase="thinking", detail=f"💡 thinking: {preview or 'working...'}")
+            else:
+                _set_progress_state(phase="tool", detail=live_detail, tool_call=True)
+
+            detail_payload = msg
+            if args_text:
+                detail_payload = f"{emoji} CALL {tool_name}\n{args_text}"
+
+            if detail_queue:
+                ts = datetime.now().strftime("%H:%M:%S")
+                detail_queue.put((ts, detail_payload))
+            _append_artifact(f"[{datetime.now().isoformat()}] {detail_payload}")
+
         async def send_progress_messages():
             if not progress_queue:
                 return
-            
+
             adapter = self.adapters.get(source.platform)
             if not adapter:
                 return
-            
+
+            progress_message_id: str | None = None
+            progress_thread_chat_id: str | None = None
+            thread_announced = False
+            thread_log_failed = False
+            thread_create_attempts = 0
+            detail_backlog: list[tuple[str, str]] = []
+            dropped_detail_entries = 0
+            last_heartbeat_at = 0.0
+            last_rendered = ""
+
             while True:
+                while True:
+                    try:
+                        progress_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                while detail_queue:
+                    try:
+                        entry = detail_queue.get_nowait()
+                        if isinstance(entry, tuple) and len(entry) == 2:
+                            ts, text = entry
+                        else:
+                            ts, text = datetime.now().strftime("%H:%M:%S"), str(entry)
+                        if len(detail_backlog) >= detail_backlog_max:
+                            dropped_detail_entries += 1
+                            continue
+                        detail_backlog.append((str(ts), str(text)))
+                    except queue.Empty:
+                        break
+                if dropped_detail_entries:
+                    note = (
+                        f"[{datetime.now().isoformat()}] "
+                        f"dropped_detail_entries={dropped_detail_entries} "
+                        f"(backlog_limit={detail_backlog_max})"
+                    )
+                    _append_artifact(note)
+                    dropped_detail_entries = 0
+
                 try:
-                    # Non-blocking check with small timeout
-                    msg = progress_queue.get_nowait()
-                    await adapter.send(chat_id=source.chat_id, content=msg)
-                    # Restore typing indicator after sending progress message
-                    await asyncio.sleep(0.3)
-                    await adapter.send_typing(source.chat_id)
-                except queue.Empty:
-                    await asyncio.sleep(0.3)  # Check again soon
+                    now = time.monotonic()
+                    heartbeat_due = (now - last_heartbeat_at) >= 1.0
+                    msg = _build_progress_message()
+
+                    if heartbeat_due or msg != last_rendered:
+                        if progress_style == "single" and progress_message_id and hasattr(adapter, "edit_message"):
+                            try:
+                                await adapter.edit_message(
+                                    chat_id=source.chat_id,
+                                    message_id=progress_message_id,
+                                    content=msg,
+                                )
+                            except Exception:
+                                result = await adapter.send(chat_id=source.chat_id, content=msg)
+                                if result and result.success and result.message_id:
+                                    progress_message_id = result.message_id
+                        else:
+                            result = await adapter.send(chat_id=source.chat_id, content=msg)
+                            if result and result.success and result.message_id and progress_style == "single":
+                                progress_message_id = result.message_id
+                        last_rendered = msg
+                        last_heartbeat_at = now
+                        await adapter.send_typing(source.chat_id)
+
+                    # Server-channel detailed logs: create thread from live status msg.
+                    if (
+                        thread_logs_enabled
+                        and not thread_log_failed
+                        and progress_thread_chat_id is None
+                        and progress_message_id
+                        and hasattr(adapter, "create_tool_log_thread")
+                    ):
+                        thread_create_attempts += 1
+                        title = f"Hermes Tool Log {datetime.now().strftime('%H:%M:%S')}"
+                        progress_thread_chat_id = await adapter.create_tool_log_thread(
+                            chat_id=source.chat_id,
+                            seed_message_id=progress_message_id,
+                            title=title,
+                        )
+                        if progress_thread_chat_id and not thread_announced:
+                            try:
+                                await adapter.send(
+                                    chat_id=source.chat_id,
+                                    content=f"🧵 Detailed tool log: <#{progress_thread_chat_id}>",
+                                )
+                            except Exception:
+                                pass
+                            thread_announced = True
+                            _append_artifact(
+                                f"[{datetime.now().isoformat()}] thread_created={progress_thread_chat_id}"
+                            )
+                        elif (
+                            not progress_thread_chat_id
+                            and thread_create_attempts >= thread_create_max_attempts
+                        ):
+                            thread_log_failed = True
+                            _append_artifact(
+                                f"[{datetime.now().isoformat()}] "
+                                f"thread_create_failed attempts={thread_create_attempts}"
+                            )
+                            detail_backlog.clear()
+                            try:
+                                await adapter.send(
+                                    chat_id=source.chat_id,
+                                    content="⚠️ Detailed tool log thread unavailable for this run. "
+                                    "Progress is still shown here.",
+                                )
+                            except Exception:
+                                pass
+
+                    if detail_backlog:
+                        if progress_thread_chat_id:
+                            while detail_backlog:
+                                ts, entry = detail_backlog.pop(0)
+                                await adapter.send(
+                                    chat_id=progress_thread_chat_id,
+                                    content=f"`{ts}` {entry}",
+                                )
+                        elif not thread_logs_enabled or thread_log_failed:
+                            detail_backlog.clear()
+
+                    await asyncio.sleep(0.2)
                 except asyncio.CancelledError:
-                    # Drain remaining messages
-                    while not progress_queue.empty():
-                        try:
-                            msg = progress_queue.get_nowait()
-                            await adapter.send(chat_id=source.chat_id, content=msg)
-                        except Exception:
-                            break
+                    if tool_log_path:
+                        _append_artifact(f"[{datetime.now().isoformat()}] finished")
+                        _append_artifact(f"log_file={tool_log_path}")
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
@@ -1889,6 +2339,9 @@ class GatewayRunner:
                 logger.debug("agent:step hook error: %s", _e)
 
         def run_sync():
+            if tool_progress_enabled:
+                _set_progress_state(phase="starting", detail="🚀 initializing gateway turn")
+
             # Pass session_key to process registry via env var so background
             # processes can be mapped back to this gateway session
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
@@ -1908,9 +2361,9 @@ class GatewayRunner:
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart).
             try:
-                load_dotenv(_env_path, override=True, encoding="utf-8")
-            except UnicodeDecodeError:
-                load_dotenv(_env_path, override=True, encoding="latin-1")
+                load_dotenv_with_fallback(_env_path, override=True, logger=logging.getLogger(__name__))
+            except ValueError as exc:
+                logger.error("Failed to load %s: %s", _env_path, exc)
             except Exception:
                 pass
 
@@ -1920,7 +2373,7 @@ class GatewayRunner:
                 import yaml as _y
                 _cfg_path = _hermes_home / "config.yaml"
                 if _cfg_path.exists():
-                    with open(_cfg_path) as _f:
+                    with open(_cfg_path, encoding="utf-8") as _f:
                         _cfg = _y.safe_load(_f) or {}
                     _model_cfg = _cfg.get("model", {})
                     if isinstance(_model_cfg, str):
@@ -1933,6 +2386,12 @@ class GatewayRunner:
             try:
                 runtime_kwargs = _resolve_runtime_agent_kwargs()
             except Exception as exc:
+                if tool_progress_enabled:
+                    _set_progress_state(
+                        phase="finalizing",
+                        detail=f"❌ provider auth/config error: {exc}",
+                        tool_call=False,
+                    )
                 return {
                     "final_response": f"⚠️ Provider authentication failed: {exc}",
                     "messages": [],
@@ -2024,14 +2483,34 @@ class GatewayRunner:
                             _p = _match.group(1).strip().rstrip('",}')
                             if _p:
                                 _history_media_paths.add(_p)
+
+            if tool_progress_enabled:
+                _set_progress_state(
+                    phase="thinking",
+                    detail=f"🛰️ calling model {model}",
+                    tool_call=False,
+                )
             
             result = agent.run_conversation(message, conversation_history=agent_history)
             result_holder[0] = result
+
+            if tool_progress_enabled:
+                _set_progress_state(
+                    phase="finalizing",
+                    detail="🧾 synthesizing final response",
+                    tool_call=False,
+                )
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else "(No response generated)"
+                if tool_progress_enabled:
+                    _set_progress_state(
+                        phase="finalizing",
+                        detail=f"❌ no final response generated | {error_msg}",
+                        tool_call=False,
+                    )
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -2073,6 +2552,13 @@ class GatewayRunner:
                     if has_voice_directive:
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
+
+            if tool_progress_enabled:
+                _set_progress_state(
+                    phase="finalizing",
+                    detail="✅ response ready",
+                    tool_call=False,
+                )
             
             return {
                 "final_response": final_response,

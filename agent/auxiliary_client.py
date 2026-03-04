@@ -74,7 +74,6 @@ class _CodexCompletionsAdapter:
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
-        temperature = kwargs.get("temperature")
 
         # Separate system/instructions from conversation messages
         instructions = "You are a helpful assistant."
@@ -91,15 +90,12 @@ class _CodexCompletionsAdapter:
             "model": model,
             "instructions": instructions,
             "input": input_msgs or [{"role": "user", "content": ""}],
-            "stream": True,
             "store": False,
         }
 
-        max_tokens = kwargs.get("max_output_tokens") or kwargs.get("max_completion_tokens") or kwargs.get("max_tokens")
-        if max_tokens is not None:
-            resp_kwargs["max_output_tokens"] = int(max_tokens)
-        if temperature is not None:
-            resp_kwargs["temperature"] = temperature
+        # Some Codex Responses stream backends reject token-limit kwargs entirely.
+        # We intentionally omit max token params here for compatibility.
+        # Some Codex Responses backends reject temperature for streamed calls.
 
         # Tools support for flush_memories and similar callers
         tools = kwargs.get("tools")
