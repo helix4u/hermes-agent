@@ -2881,7 +2881,8 @@ class AIAgent:
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
-            compressed.append({"role": "user", "content": todo_snapshot})
+            # Preserve task state without presenting it as a fresh user request.
+            compressed.append({"role": "assistant", "content": todo_snapshot})
 
         self._invalidate_system_prompt()
         new_system_prompt = self._build_system_prompt(system_message)

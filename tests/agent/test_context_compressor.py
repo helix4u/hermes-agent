@@ -176,3 +176,6 @@ class TestCompressWithClient:
         contents = [m.get("content", "") for m in result]
         assert any("CONTEXT SUMMARY" in c for c in contents)
         assert len(result) < len(msgs)
+
+        summary_msg = next(m for m in result if "CONTEXT SUMMARY" in (m.get("content") or ""))
+        assert summary_msg["role"] == "assistant"

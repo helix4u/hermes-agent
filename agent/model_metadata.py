@@ -19,6 +19,11 @@ _model_metadata_cache_time: float = 0
 _MODEL_CACHE_TTL = 3600
 
 DEFAULT_CONTEXT_LENGTHS = {
+    "gpt-5.4": 1050000,
+    "gpt-5.3-codex": 400000,
+    "gpt-5.2": 400000,
+    "gpt-5.1": 400000,
+    "gpt-5": 400000,
     "anthropic/claude-opus-4": 200000,
     "anthropic/claude-opus-4.5": 200000,
     "anthropic/claude-opus-4.6": 200000,

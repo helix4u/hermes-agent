@@ -80,7 +80,7 @@ DEFAULT_CONFIG = {
         "threshold": 0.85,
         "summary_provider": "auto",
         "summary_model": "google/gemini-3-flash-preview",
-        "protect_last_n": 3,
+        "protect_last_n": 8,
         "summary_target_tokens": 2048,
     },
     

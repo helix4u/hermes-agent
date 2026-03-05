@@ -227,7 +227,10 @@ Write only the structured summary."""
                 msg["content"] = (msg.get("content") or "") + "\n\n[Note: Some earlier conversation turns may be summarized to preserve context space.]"
             compressed.append(msg)
 
-        compressed.append({"role": "user", "content": summary})
+        # Keep summarized context out of the "latest user intent" slot.
+        # Injecting this as a synthetic user turn makes the model more likely
+        # to answer the handoff text instead of the user's actual pending ask.
+        compressed.append({"role": "assistant", "content": summary})
 
         for i in range(compress_end, n_messages):
             compressed.append(messages[i].copy())
