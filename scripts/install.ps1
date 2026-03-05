@@ -8,13 +8,14 @@
 #   irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex
 #
 # Or download and run with options:
-#   .\install.ps1 -NoVenv -SkipSetup
+#   .\install.ps1 -NoVenv -SkipSetup -SkipOptionalDeps
 #
 # ============================================================================
 
 param(
     [switch]$NoVenv,
     [switch]$SkipSetup,
+    [switch]$SkipOptionalDeps,
     [string]$Branch = "main",
     [string]$HermesHome = "$env:LOCALAPPDATA\hermes",
     [string]$InstallDir = "$env:LOCALAPPDATA\hermes\hermes-agent"
@@ -901,7 +902,13 @@ function Main {
     if (-not (Test-Python)) { throw "Python $PythonVersion not available — cannot continue" }
     if (-not (Test-Git)) { throw "Git not found — install from https://git-scm.com/download/win" }
     Test-Node              # Auto-installs if missing
-    Install-SystemPackages  # ripgrep + ffmpeg in one step
+    if ($SkipOptionalDeps) {
+        Write-Info "Skipping optional system dependencies (-SkipOptionalDeps)"
+        $script:HasRipgrep = [bool](Get-Command rg -ErrorAction SilentlyContinue)
+        $script:HasFfmpeg = [bool](Get-Command ffmpeg -ErrorAction SilentlyContinue)
+    } else {
+        Install-SystemPackages  # ripgrep + ffmpeg in one step
+    }
     
     Install-Repository
     Install-Venv

@@ -36,6 +36,7 @@ NODE_VERSION="22"
 # Options
 USE_VENV=true
 RUN_SETUP=true
+INSTALL_OPTIONAL_DEPS=true
 BRANCH="main"
 
 # Detect non-interactive mode (e.g. curl | bash)
@@ -58,6 +59,10 @@ while [[ $# -gt 0 ]]; do
             RUN_SETUP=false
             shift
             ;;
+        --skip-optional-deps)
+            INSTALL_OPTIONAL_DEPS=false
+            shift
+            ;;
         --branch)
             BRANCH="$2"
             shift 2
@@ -72,11 +77,12 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: install.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --no-venv      Don't create virtual environment"
-            echo "  --skip-setup   Skip interactive setup wizard"
-            echo "  --branch NAME  Git branch to install (default: main)"
-            echo "  --dir PATH     Installation directory (default: ~/.hermes/hermes-agent)"
-            echo "  -h, --help     Show this help"
+            echo "  --no-venv            Don't create virtual environment"
+            echo "  --skip-setup         Skip interactive setup wizard"
+            echo "  --skip-optional-deps Skip ripgrep/ffmpeg auto-install"
+            echo "  --branch NAME        Git branch to install (default: main)"
+            echo "  --dir PATH           Installation directory (default: ~/.hermes/hermes-agent)"
+            echo "  -h, --help           Show this help"
             exit 0
             ;;
         *)
@@ -521,20 +527,30 @@ install_system_packages() {
     fi
 }
 
-show_manual_install_hint() {
+manual_install_cmd() {
     local pkg="$1"
-    log_info "To install $pkg manually:"
     case "$OS" in
         linux)
             case "$DISTRO" in
-                ubuntu|debian) log_info "  sudo apt install $pkg" ;;
-                fedora)        log_info "  sudo dnf install $pkg" ;;
-                arch)          log_info "  sudo pacman -S $pkg"   ;;
-                *)             log_info "  Use your package manager or visit the project homepage" ;;
+                ubuntu|debian) echo "sudo apt install $pkg" ;;
+                fedora)        echo "sudo dnf install $pkg" ;;
+                arch)          echo "sudo pacman -S $pkg"   ;;
+                *)             echo "Use your package manager or visit the project homepage" ;;
             esac
             ;;
-        macos) log_info "  brew install $pkg" ;;
+        macos)
+            echo "brew install $pkg"
+            ;;
+        *)
+            echo "Use your package manager or visit the project homepage"
+            ;;
     esac
+}
+
+show_manual_install_hint() {
+    local pkg="$1"
+    log_info "To install $pkg manually:"
+    log_info "  $(manual_install_cmd "$pkg")"
 }
 
 # ============================================================================
@@ -990,7 +1006,11 @@ print_success() {
     echo ""
     echo -e "${YELLOW}⚡ Reload your shell to use 'hermes' command:${NC}"
     echo ""
-    echo "   source ~/.bashrc   # or ~/.zshrc"
+    local shell_reload_cmd="source ~/.bashrc   # or ~/.zshrc"
+    if [ "$OS" = "macos" ]; then
+        shell_reload_cmd="source ~/.zshrc   # or ~/.bashrc"
+    fi
+    echo "   $shell_reload_cmd"
     echo ""
 
     # Show Node.js warning if auto-install failed
@@ -1007,7 +1027,7 @@ print_success() {
         echo -e "${YELLOW}"
         echo "Note: ripgrep (rg) was not found. File search will use"
         echo "grep as a fallback. For faster search in large codebases,"
-        echo "install ripgrep: sudo apt install ripgrep (or brew install ripgrep)"
+        echo "install ripgrep: $(manual_install_cmd ripgrep)"
         echo -e "${NC}"
     fi
 }
@@ -1024,7 +1044,13 @@ main() {
     check_python
     check_git
     check_node
-    install_system_packages
+    if [ "$INSTALL_OPTIONAL_DEPS" = true ]; then
+        install_system_packages
+    else
+        log_info "Skipping optional system dependencies (--skip-optional-deps)"
+        command -v rg >/dev/null 2>&1 && HAS_RIPGREP=true || HAS_RIPGREP=false
+        command -v ffmpeg >/dev/null 2>&1 && HAS_FFMPEG=true || HAS_FFMPEG=false
+    fi
 
     clone_repo
     setup_venv

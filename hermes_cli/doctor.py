@@ -10,7 +10,7 @@ import subprocess
 import shutil
 from pathlib import Path
 
-from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
+from hermes_cli.config import get_project_root, get_hermes_home, get_env_path, load_config
 
 PROJECT_ROOT = get_project_root()
 HERMES_HOME = get_hermes_home()
@@ -44,6 +44,37 @@ def check_fail(text: str, detail: str = ""):
 
 def check_info(text: str):
     print(f"    {color('→', Colors.CYAN)} {text}")
+
+
+def _ripgrep_install_hint() -> str:
+    """Return platform-appropriate install command for ripgrep."""
+    if sys.platform == "darwin":
+        return "brew install ripgrep"
+    if sys.platform.startswith("linux"):
+        return "sudo apt install ripgrep"
+    if os.name == "nt":
+        return "winget install BurntSushi.ripgrep.MSVC"
+    return "install ripgrep with your package manager"
+
+
+def _resolve_terminal_backend() -> str:
+    """Resolve terminal backend from config/.env with sane fallback."""
+    backend = "local"
+
+    try:
+        terminal_cfg = load_config().get("terminal", {})
+        if isinstance(terminal_cfg, dict):
+            cfg_backend = terminal_cfg.get("backend")
+            if isinstance(cfg_backend, str) and cfg_backend.strip():
+                backend = cfg_backend.strip().lower()
+    except Exception:
+        pass
+
+    env_backend = os.getenv("TERMINAL_ENV")
+    if env_backend and env_backend.strip():
+        backend = env_backend.strip().lower()
+
+    return backend
 
 
 def run_doctor(args):
@@ -314,10 +345,10 @@ def run_doctor(args):
         check_ok("ripgrep (rg)", "(faster file search)")
     else:
         check_warn("ripgrep (rg) not found", "(file search uses grep fallback)")
-        check_info("Install for faster search: sudo apt install ripgrep")
+        check_info(f"Install for faster search: {_ripgrep_install_hint()}")
     
     # Docker (optional)
-    terminal_env = os.getenv("TERMINAL_ENV", "local")
+    terminal_env = _resolve_terminal_backend()
     if terminal_env == "docker":
         if shutil.which("docker"):
             # Check if docker daemon is running

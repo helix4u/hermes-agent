@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="$ROOT/venv/bin/python3"
+if [[ ! -x "$PY" ]]; then
+  PY="$ROOT/venv/bin/python"
+fi
+HERMES=("$PY" -m hermes_cli.main)
+
+log() {
+  printf '%s\n' "$*"
+}
+
+reload_shell_probe() {
+  if command -v zsh >/dev/null 2>&1; then
+    if zsh -lc 'source ~/.zshrc >/dev/null 2>&1 || true; command -v hermes >/dev/null 2>&1'; then
+      log "✓ Reloaded ~/.zshrc in a fresh zsh shell (hermes is on PATH)"
+    else
+      log "⚠ Reloaded ~/.zshrc in a fresh zsh shell, but hermes was not found on PATH"
+    fi
+  else
+    log "⚠ zsh not found; skipped shell reload check"
+  fi
+}
+
+restart_gateway() {
+  local has_service=0
+  if [[ -f "$HOME/Library/LaunchAgents/ai.hermes.gateway.plist" ]]; then
+    has_service=1
+  elif [[ -f "$HOME/.config/systemd/user/hermes-gateway.service" ]]; then
+    has_service=1
+  fi
+
+  if (( has_service == 1 )); then
+    log "↻ Restarting installed gateway service..."
+    "${HERMES[@]}" gateway restart
+  else
+    log "↻ No installed gateway service detected; restarting manual gateway process..."
+    "${HERMES[@]}" gateway stop >/dev/null 2>&1 || true
+    mkdir -p "$HOME/.hermes/logs"
+    nohup "${HERMES[@]}" gateway run >>"$HOME/.hermes/logs/gateway.manual.log" 2>&1 &
+    local pid=$!
+    sleep 2
+    log "✓ Started manual gateway in background (PID: $pid)"
+  fi
+}
+
+verify_gateway_running() {
+  local pids
+  pids="$($PY -c 'from hermes_cli.gateway import find_gateway_pids; p=find_gateway_pids(); print(",".join(map(str, p)))')"
+  if [[ -n "$pids" ]]; then
+    log "✓ Gateway process is running (PID(s): $pids)"
+    return 0
+  fi
+
+  log "✗ No running gateway process detected"
+  return 1
+}
+
+main() {
+  reload_shell_probe
+  restart_gateway
+
+  log ""
+  log "Gateway status:"
+  "${HERMES[@]}" gateway status || true
+  verify_gateway_running
+
+  log ""
+  log "If you want to reload your current interactive terminal session too, run:"
+  log "  source ~/.zshrc"
+}
+
+main "$@"

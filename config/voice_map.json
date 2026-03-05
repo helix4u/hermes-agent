@@ -1,0 +1,30 @@
+{
+  "HOUSE": {
+    "voice": "en-US-ChristopherNeural",
+    "rate": "+0%"
+  },
+  "WAYNE": {
+    "voice": "en-US-BrianNeural",
+    "rate": "-6%"
+  },
+  "DARYL": {
+    "voice": "en-US-RogerNeural",
+    "rate": "+2%"
+  },
+  "SQUIRRELY_DAN": {
+    "voice": "en-US-GuyNeural",
+    "rate": "-4%"
+  },
+  "KATY": {
+    "voice": "en-US-AriaNeural",
+    "rate": "+0%"
+  },
+  "SHELDON": {
+    "voice": "en-US-EricNeural",
+    "rate": "+15%"
+  },
+  "NARRATOR": {
+    "voice": "en-US-AndrewNeural",
+    "rate": "-10%"
+  }
+}

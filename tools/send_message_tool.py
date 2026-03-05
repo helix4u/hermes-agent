@@ -11,6 +11,16 @@ import os
 
 logger = logging.getLogger(__name__)
 
+# Discord embed description hard limit.
+DISCORD_EMBED_DESCRIPTION_LIMIT = 4096
+
+
+def _chunk_text(text: str, chunk_size: int) -> list[str]:
+    """Split text into fixed-size chunks."""
+    if not text:
+        return [""]
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
 
 SEND_MESSAGE_SCHEMA = {
     "name": "send_message",
@@ -185,17 +195,24 @@ async def _send_discord(token, chat_id, message):
     try:
         url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
         headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
-        chunks = [message[i:i+2000] for i in range(0, len(message), 2000)]
+        chunks = _chunk_text(message, DISCORD_EMBED_DESCRIPTION_LIMIT)
         message_ids = []
         async with aiohttp.ClientSession() as session:
             for chunk in chunks:
-                async with session.post(url, headers=headers, json={"content": chunk}) as resp:
+                payload = {"embeds": [{"description": chunk}]}
+                async with session.post(url, headers=headers, json=payload) as resp:
                     if resp.status not in (200, 201):
                         body = await resp.text()
                         return {"error": f"Discord API error ({resp.status}): {body}"}
                     data = await resp.json()
                     message_ids.append(data.get("id"))
-        return {"success": True, "platform": "discord", "chat_id": chat_id, "message_ids": message_ids}
+        return {
+            "success": True,
+            "platform": "discord",
+            "chat_id": chat_id,
+            "message_ids": message_ids,
+            "format": "embed",
+        }
     except Exception as e:
         return {"error": f"Discord send failed: {e}"}
 

@@ -75,6 +75,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._client: Optional[commands.Bot] = None
         self._client_task: Optional[asyncio.Task] = None
         self._presence_task: Optional[asyncio.Task] = None
+        self._post_ready_task: Optional[asyncio.Task] = None
+        self._post_ready_initialized = False
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._seen_message_ids: Dict[int, float] = {}
@@ -146,6 +148,36 @@ class DiscordAdapter(BasePlatformAdapter):
         if self._presence_task and not self._presence_task.done():
             return
         self._presence_task = asyncio.create_task(self._presence_refresh_loop())
+
+    async def _run_post_ready_startup(self, *, members: bool) -> None:
+        """Run slow, non-critical startup steps after the gateway is marked ready."""
+        if not self._client:
+            return
+        logger.info("[discord] post-ready startup begin")
+        if members:
+            try:
+                await self._resolve_allowed_usernames()
+            except Exception:
+                logger.exception("[discord] failed to resolve allowed usernames")
+
+        try:
+            synced = await self._client.tree.sync()
+            print(f"[{self.name}] Synced {len(synced)} slash command(s)")
+            try:
+                synced_names = [cmd.name for cmd in synced]
+                print(f"[{self.name}] Synced command names: {', '.join(synced_names)}")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[{self.name}] Slash command sync failed: {e}")
+
+        if not self._listen_view_registered:
+            try:
+                self._client.add_view(PersistentListenButtonView(self))
+                self._listen_view_registered = True
+            except Exception:
+                logger.exception("[discord] failed to register persistent listen view")
+        logger.info("[discord] post-ready startup complete")
     
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -170,6 +202,7 @@ class DiscordAdapter(BasePlatformAdapter):
         async def _attempt_connect(*, message_content: bool, members: bool) -> tuple[bool, Optional[Exception]]:
             """Try one connect profile and return (success, startup_exception)."""
             self._ready_event.clear()
+            self._post_ready_initialized = False
 
             intents = Intents.default()
             intents.message_content = message_content
@@ -200,29 +233,18 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_ready():
                 print(f"[{adapter_self.name}] Connected as {adapter_self._client.user}")
-                await adapter_self._set_online_presence()
-                adapter_self._ensure_presence_task()
-
-                # Resolve any usernames in the allowed list to numeric IDs
-                # only if members intent is enabled.
-                if members:
-                    await adapter_self._resolve_allowed_usernames()
-
-                # Sync slash commands with Discord
                 try:
-                    synced = await adapter_self._client.tree.sync()
-                    print(f"[{adapter_self.name}] Synced {len(synced)} slash command(s)")
-                    try:
-                        synced_names = [cmd.name for cmd in synced]
-                        print(f"[{adapter_self.name}] Synced command names: {', '.join(synced_names)}")
-                    except Exception:
-                        pass
-                except Exception as e:
-                    print(f"[{adapter_self.name}] Slash command sync failed: {e}")
-                if not adapter_self._listen_view_registered:
-                    adapter_self._client.add_view(PersistentListenButtonView(adapter_self))
-                    adapter_self._listen_view_registered = True
+                    await adapter_self._set_online_presence()
+                except Exception:
+                    logger.exception("[discord] failed to set presence in on_ready")
+                adapter_self._ensure_presence_task()
+                # Mark ready immediately; post-ready setup may be slow on large guilds.
                 adapter_self._ready_event.set()
+                if not adapter_self._post_ready_initialized:
+                    adapter_self._post_ready_initialized = True
+                    adapter_self._post_ready_task = asyncio.create_task(
+                        adapter_self._run_post_ready_startup(members=members)
+                    )
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -376,6 +398,12 @@ class DiscordAdapter(BasePlatformAdapter):
     
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
+        if self._post_ready_task and not self._post_ready_task.done():
+            self._post_ready_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._post_ready_task
+        self._post_ready_task = None
+        self._post_ready_initialized = False
         if self._presence_task and not self._presence_task.done():
             self._presence_task.cancel()
             with suppress(asyncio.CancelledError):
