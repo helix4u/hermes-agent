@@ -2,17 +2,8 @@
 """
 Session Search Tool - Long-Term Conversation Recall
 
-Searches past session transcripts in SQLite via FTS5, then summarizes the top
-matching sessions using a cheap/fast model (same pattern as web_extract).
-Returns focused summaries of past conversations rather than raw transcripts,
-keeping the main model's context window clean.
-
-Flow:
-  1. FTS5 search finds matching messages ranked by relevance
-  2. Groups by session, takes the top N unique sessions (default 3)
-  3. Loads each session's conversation, truncates to ~100k chars centered on matches
-  4. Sends to Gemini Flash with a focused summarization prompt
-  5. Returns per-session summaries with metadata
+Searches past session transcripts in SQLite via FTS5, then returns either raw
+conversation transcripts or concise session summaries, depending on caller intent.
 """
 
 import asyncio
@@ -85,6 +76,25 @@ def _format_conversation(messages: List[Dict[str, Any]]) -> str:
             parts.append(f"[{role}]: {content}")
 
     return "\n\n".join(parts)
+
+
+def _serialize_raw_conversation(messages: List[Dict[str, Any]]) -> str:
+    """Return an unmangled transcript payload for direct review."""
+    try:
+        return json.dumps(messages, ensure_ascii=False)
+    except TypeError:
+        # Fallback for unexpected payload types in legacy transcript rows.
+        sanitized = []
+        for msg in messages:
+            sanitized_msg = {}
+            if isinstance(msg, dict):
+                for key, value in msg.items():
+                    if isinstance(value, (bytes, bytearray)):
+                        sanitized_msg[key] = value.decode("utf-8", errors="replace")
+                    else:
+                        sanitized_msg[key] = value
+            sanitized.append(sanitized_msg)
+        return json.dumps(sanitized, ensure_ascii=False, default=str)
 
 
 def _truncate_around_matches(
@@ -182,12 +192,11 @@ def session_search(
     query: str,
     role_filter: str = None,
     limit: int = 3,
+    return_raw: bool = True,
     db=None,
 ) -> str:
     """
-    Search past sessions and return focused summaries of matching conversations.
-
-    Uses FTS5 to find matches, then summarizes the top sessions with Gemini Flash.
+    Search past sessions and return focused summaries or raw transcripts.
     """
     if db is None:
         return json.dumps({"success": False, "error": "Session database not available."}, ensure_ascii=False)
@@ -250,19 +259,51 @@ def session_search(
             if len(seen_sessions) >= limit:
                 break
 
-        # Prepare all sessions for parallel summarization
+        # Prepare session payloads. Raw mode returns original-like transcript JSON.
         tasks = []
+        results = []
         for session_id, match_info in seen_sessions.items():
             try:
                 messages = db.get_messages_as_conversation(session_id)
                 if not messages:
                     continue
                 session_meta = db.get_session(session_id) or {}
+                if return_raw:
+                    raw_payload = _serialize_raw_conversation(messages)
+                    raw_payload = _truncate_around_matches(raw_payload, query)
+                    results.append({
+                        "session_id": session_id,
+                        "when": _format_timestamp(match_info.get("session_started")),
+                        "source": match_info.get("source", "unknown"),
+                        "model": match_info.get("model"),
+                        "raw_transcript": raw_payload,
+                    })
+                    continue
+
                 conversation_text = _format_conversation(messages)
                 conversation_text = _truncate_around_matches(conversation_text, query)
                 tasks.append((session_id, match_info, conversation_text, session_meta))
             except Exception as e:
                 logging.warning(f"Failed to prepare session {session_id}: {e}")
+
+        if return_raw:
+            return json.dumps({
+                "success": True,
+                "query": query,
+                "results": results,
+                "count": len(results),
+                "sessions_searched": len(seen_sessions),
+            }, ensure_ascii=False)
+
+        if _async_aux_client is None or _SUMMARIZER_MODEL is None:
+            return json.dumps({
+                "success": False,
+                "query": query,
+                "error": "No auxiliary model available for session summarization.",
+                "results": [],
+                "count": 0,
+                "sessions_searched": len(seen_sessions),
+            }, ensure_ascii=False)
 
         # Summarize all sessions in parallel
         async def _summarize_all():
@@ -306,9 +347,7 @@ def session_search(
 
 
 def check_session_search_requirements() -> bool:
-    """Requires SQLite state database and an auxiliary text model."""
-    if _async_aux_client is None:
-        return False
+    """Requires a local conversation database."""
     try:
         from hermes_state import DEFAULT_DB_PATH
         return DEFAULT_DB_PATH.parent.exists()
@@ -320,7 +359,8 @@ SESSION_SEARCH_SCHEMA = {
     "name": "session_search",
     "description": (
         "Search your long-term memory of past conversations. This is your recall -- "
-        "every past session is searchable, and this tool summarizes what happened.\n\n"
+        "every past session is searchable, and this tool can return either raw "
+        "transcripts or concise summaries.\n\n"
         "USE THIS PROACTIVELY when:\n"
         "- The user says 'we did this before', 'remember when', 'last time', 'as I mentioned'\n"
         "- The user asks about a topic you worked on before but don't have in current context\n"
@@ -333,7 +373,8 @@ SESSION_SEARCH_SCHEMA = {
         "phrases for exact match (\"docker networking\"), boolean (python NOT java), prefix (deploy*). "
         "IMPORTANT: Use OR between keywords for best results — FTS5 defaults to AND which misses "
         "sessions that only mention some terms. If a broad OR query returns nothing, try individual "
-        "keyword searches in parallel. Returns summaries of the top matching sessions."
+        "keyword searches in parallel. By default it returns raw, unprocessed "
+        "transcripts for review."
     ),
     "parameters": {
         "type": "object",
@@ -348,8 +389,16 @@ SESSION_SEARCH_SCHEMA = {
             },
             "limit": {
                 "type": "integer",
-                "description": "Max sessions to summarize (default: 3, max: 5).",
+                "description": "Max sessions to return (default: 3, max: 5).",
                 "default": 3,
+            },
+            "return_raw": {
+                "type": "boolean",
+                "description": (
+                    "If true (default), return raw transcript JSON with no LLM "
+                    "summarization so the review context remains intact."
+                ),
+                "default": True,
             },
         },
         "required": ["query"],
@@ -368,6 +417,7 @@ registry.register(
         query=args.get("query", ""),
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
+        return_raw=args.get("return_raw", True),
         db=kw.get("db")),
     check_fn=check_session_search_requirements,
 )

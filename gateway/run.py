@@ -967,7 +967,24 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
                 session_key=session_key
             )
-            
+            returned_session_id = str(agent_result.get("session_id") or "").strip()
+            if returned_session_id and returned_session_id != session_entry.session_id:
+                if self.session_store.update_session_id(session_entry.session_key, returned_session_id):
+                    logger.info(
+                        "Session handoff: %s -> %s (key=%s)",
+                        session_entry.session_id,
+                        returned_session_id,
+                        session_entry.session_key,
+                    )
+                    session_entry.session_id = returned_session_id
+                    hook_ctx["session_id"] = returned_session_id
+                else:
+                    logger.warning(
+                        "Agent returned new session_id=%s but session mapping update failed for key=%s",
+                        returned_session_id,
+                        session_entry.session_key,
+                    )
+
             response = agent_result.get("final_response", "")
             agent_messages = agent_result.get("messages", [])
             
@@ -2348,8 +2365,7 @@ class GatewayRunner:
             default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
             enabled_toolsets = [default_toolset]
         
-        # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
-        # Falls back to env vars for backward compatibility
+        # Tool progress and log configuration
         _progress_cfg = {}
         try:
             _tp_cfg_path = _hermes_home / "config.yaml"
@@ -2360,22 +2376,111 @@ class GatewayRunner:
                 _progress_cfg = _tp_data.get("display", {})
         except Exception:
             pass
+
+        def _as_bool(val: Any, default: bool = False) -> bool:
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                v = val.strip().lower()
+                if v in {"1", "true", "yes", "on"}:
+                    return True
+                if v in {"0", "false", "no", "off"}:
+                    return False
+            return default
+
         progress_mode = (
             _progress_cfg.get("tool_progress")
             or os.getenv("HERMES_TOOL_PROGRESS_MODE")
             or "all"
         )
+        progress_style = (
+            _progress_cfg.get("tool_progress_style")
+            or os.getenv("HERMES_TOOL_PROGRESS_STYLE")
+            or "single"
+        ).strip().lower()
+        if progress_style not in {"feed", "single"}:
+            progress_style = "single"
         tool_progress_enabled = progress_mode != "off"
-        
-        # Queue for progress messages (thread-safe)
+        try:
+            progress_rolling_entries = int(
+                _progress_cfg.get("tool_progress_rolling_entries")
+                or os.getenv("HERMES_TOOL_PROGRESS_ROLLING_ENTRIES", "3")
+            )
+        except Exception:
+            progress_rolling_entries = 3
+        progress_rolling_entries = max(1, min(progress_rolling_entries, 8))
+        try:
+            progress_embed_max_chars = int(
+                os.getenv("HERMES_TOOL_PROGRESS_EMBED_MAX_CHARS", "3800")
+            )
+        except Exception:
+            progress_embed_max_chars = 3800
+        progress_embed_max_chars = max(1200, min(progress_embed_max_chars, 3900))
+
+        thread_logs_enabled = _as_bool(
+            _progress_cfg.get("tool_thread_logs", os.getenv("HERMES_TOOL_THREAD_LOGS", "true")),
+            default=True,
+        )
+        artifact_logs_enabled = _as_bool(
+            _progress_cfg.get("tool_log_artifacts", os.getenv("HERMES_TOOL_LOG_ARTIFACTS", "true")),
+            default=True,
+        )
+
+        # Discord only supports threads in server channels, not DMs.
+        thread_logs_enabled = bool(
+            thread_logs_enabled
+            and source.platform == Platform.DISCORD
+            and source.chat_type != "dm"
+        )
+
+        tool_log_path: Optional[Path] = None
+        if artifact_logs_enabled:
+            try:
+                tool_log_dir = _hermes_home / "logs" / "tool_runs"
+                tool_log_dir.mkdir(parents=True, exist_ok=True)
+                tool_log_path = tool_log_dir / f"{session_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+                tool_log_path.write_text(
+                    f"session_id={session_id}\n"
+                    f"session_key={session_key or ''}\n"
+                    f"platform={source.platform.value if source.platform else ''}\n"
+                    f"chat_id={source.chat_id}\n"
+                    f"started_at={datetime.now().isoformat()}\n"
+                    f"user_message={message}\n"
+                    "----\n",
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                logger.debug("Could not create tool log artifact file: %s", e)
+                tool_log_path = None
+
+        def _append_artifact(line: str) -> None:
+            if not tool_log_path:
+                return
+            try:
+                with tool_log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line.rstrip() + "\n")
+            except Exception as e:
+                logger.debug("Tool log artifact append failed: %s", e)
+
+        # Queue for progress/status ticks and detailed log entries (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
-        last_tool = [None]  # Mutable container for tracking in closure
+        detail_queue = queue.Queue() if tool_progress_enabled else None
+        detail_backlog_max = max(
+            50,
+            int(os.getenv("HERMES_TOOL_DETAIL_BACKLOG_MAX", "400")),
+        )
+        thread_create_max_attempts = max(
+            1,
+            int(os.getenv("HERMES_TOOL_THREAD_CREATE_MAX_ATTEMPTS", "3")),
+        )
+        last_tool = [None]
         progress_state = {
             "started_at": time.monotonic(),
             "phase": "thinking",
             "last_detail": "Queued request...",
             "tool_calls": 0,
             "updates": 0,
+            "recent_events": [],
         }
         heartbeat_faces_by_phase = {
             "starting": ["(^_^)/", "(^o^)/", "(o^▽^o)"],
@@ -2397,17 +2502,29 @@ class GatewayRunner:
             "finalizing": "🧾",
         }
 
+        def _push_recent_event(detail: str) -> None:
+            text = (detail or "").strip()
+            if not text:
+                return
+            ts = datetime.now().strftime("%H:%M:%S")
+            event_line = f"`{ts}` {text}"
+            recent_events = progress_state.setdefault("recent_events", [])
+            if recent_events and recent_events[-1] == event_line:
+                return
+            recent_events.append(event_line)
+            while len(recent_events) > progress_rolling_entries:
+                recent_events.pop(0)
+
         def _set_progress_state(*, phase: str | None = None, detail: str | None = None, tool_call: bool = False):
             if phase:
                 progress_state["phase"] = phase
             if detail:
                 progress_state["last_detail"] = detail
+                _push_recent_event(detail)
             if tool_call:
                 progress_state["tool_calls"] += 1
             progress_state["updates"] += 1
             if progress_queue:
-                # A tiny queue signal wakes the async updater. Actual text is built
-                # centrally so tool updates + heartbeat share one edited message.
                 progress_queue.put("__tick__")
 
         def _build_progress_message() -> str:
@@ -2417,26 +2534,97 @@ class GatewayRunner:
             face = pool[elapsed % len(pool)]
             phase_text = phase_labels.get(phase, "working")
             phase_emoji = phase_emojis.get(phase, "⚙️")
-            detail = (progress_state.get("last_detail") or "Working...").strip()
-            if len(detail) > 180:
-                detail = detail[:177] + "..."
-            return (
-                f"{phase_emoji} {face} Hermes is {phase_text}... ({elapsed}s)\n"
-                f"{detail}\n"
-                f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
-            )
-        
+            header = f"{phase_emoji} {face} Hermes is {phase_text}... ({elapsed}s)"
+            footer = f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
+
+            events = list(progress_state.get("recent_events") or [])
+            if not events:
+                fallback = (progress_state.get("last_detail") or "Working...").strip()
+                events = [f"`{datetime.now().strftime('%H:%M:%S')}` {fallback}"]
+
+            def _render(lines: list[str]) -> str:
+                body = "\n".join(f"• {line}" for line in lines)
+                return f"{header}\n{body}\n{footer}"
+
+            msg = _render(events[-progress_rolling_entries:])
+            if len(msg) <= progress_embed_max_chars:
+                return msg
+
+            lines = events[-progress_rolling_entries:]
+            while len(lines) > 1:
+                lines = lines[1:]
+                msg = _render(lines)
+                if len(msg) <= progress_embed_max_chars:
+                    return msg
+
+            lone = lines[0] if lines else ""
+            overhead = len(f"{header}\n• \n{footer}")
+            available = max(80, progress_embed_max_chars - overhead)
+            if len(lone) > available:
+                lone = lone[: max(0, available - 24)] + "... [trimmed for embed]"
+            return _render([lone])
+
+        def _summarize_result_for_status(result_text: str, is_error: bool) -> str:
+            text = (result_text or "").strip()
+            if not text:
+                return ""
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return text if is_error else ""
+
+            if isinstance(parsed, dict):
+                parts: list[str] = []
+                if "exit_code" in parsed:
+                    parts.append(f"exit={parsed.get('exit_code')}")
+                err = parsed.get("error")
+                if err:
+                    parts.append(f"error={err}")
+                stderr = parsed.get("stderr")
+                if not err and is_error and isinstance(stderr, str) and stderr.strip():
+                    parts.append(f"stderr={stderr.strip()}")
+                if not parts and is_error:
+                    message_text = parsed.get("message")
+                    if isinstance(message_text, str) and message_text.strip():
+                        parts.append(message_text.strip())
+                return " | ".join(parts)
+            return text if is_error else ""
+
         def progress_callback(tool_name: str, preview: str = None, args: dict = None):
-            """Callback invoked by agent when a tool is called."""
             if not progress_queue:
                 return
-            
-            # "new" mode: only report when tool changes
+
+            # Tool completion event (emitted after each tool finishes).
+            if tool_name == "_tool_result":
+                payload = args or {}
+                completed_tool = str(payload.get("tool") or preview or "tool")
+                duration = payload.get("duration_seconds")
+                is_error = bool(payload.get("is_error"))
+                result_text = str(payload.get("result") or "").strip()
+                status_emoji = "❌" if is_error else "✅"
+                if isinstance(duration, (int, float)):
+                    duration_text = f" in {float(duration):.2f}s"
+                else:
+                    duration_text = ""
+                summary_suffix = _summarize_result_for_status(result_text, is_error)
+                done_msg = f"{status_emoji} {completed_tool} finished{duration_text}"
+                if summary_suffix:
+                    done_msg = f"{done_msg} | {summary_suffix}"
+                _set_progress_state(phase="tool", detail=done_msg, tool_call=False)
+
+                detail_payload = f"{status_emoji} RESULT {completed_tool}{duration_text}"
+                if result_text:
+                    detail_payload = f"{detail_payload}\n{result_text}"
+                ts = datetime.now().strftime("%H:%M:%S")
+                if detail_queue:
+                    detail_queue.put((ts, detail_payload))
+                _append_artifact(f"[{datetime.now().isoformat()}] {detail_payload}")
+                return
+
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-            
-            # Build progress message with primary argument preview
+
             tool_emojis = {
                 "terminal": "💻",
                 "process": "⚙️",
@@ -2476,92 +2664,175 @@ class GatewayRunner:
                 "delegate_task": "🔀",
                 "clarify": "❓",
                 "skill_manage": "📝",
+                "_thinking": "💡",
             }
             emoji = tool_emojis.get(tool_name, "⚙️")
-            
-            # Verbose mode: show detailed arguments
-            if progress_mode == "verbose" and args:
-                import json as _json
-                args_str = _json.dumps(args, ensure_ascii=False, default=str)
-                if len(args_str) > 200:
-                    args_str = args_str[:197] + "..."
-                msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
-                _set_progress_state(phase="tool", detail=msg, tool_call=tool_name != "_thinking")
-                return
-            
+
+            args_text = ""
+            if args:
+                try:
+                    args_text = json.dumps(args, ensure_ascii=False, default=str)
+                except Exception:
+                    args_text = str(args)
+
             if preview:
-                # Truncate preview to keep messages clean
-                if len(preview) > 80:
-                    preview = preview[:77] + "..."
                 msg = f"{emoji} {tool_name}: \"{preview}\""
             else:
                 msg = f"{emoji} {tool_name}..."
 
+            live_detail = msg
+            if args_text and tool_name != "_thinking":
+                live_detail = f"{emoji} CALL {tool_name}\n{args_text}"
+
             if tool_name == "_thinking":
                 _set_progress_state(phase="thinking", detail=f"💡 thinking: {preview or 'working...'}")
             else:
-                _set_progress_state(phase="tool", detail=msg, tool_call=True)
-        
-        # Background task to send progress messages
+                _set_progress_state(phase="tool", detail=live_detail, tool_call=True)
+
+            detail_payload = msg
+            if args_text:
+                detail_payload = f"{emoji} CALL {tool_name}\n{args_text}"
+
+            if detail_queue:
+                ts = datetime.now().strftime("%H:%M:%S")
+                detail_queue.put((ts, detail_payload))
+            _append_artifact(f"[{datetime.now().isoformat()}] {detail_payload}")
+
         async def send_progress_messages():
             if not progress_queue:
                 return
-            
+
             adapter = self.adapters.get(source.platform)
             if not adapter:
                 return
 
-            # Keep track of a single in-flight progress message so we can edit
-            # it in place instead of spamming the channel with many updates.
             progress_message_id: str | None = None
+            progress_thread_chat_id: str | None = None
+            thread_announced = False
+            thread_log_failed = False
+            thread_create_attempts = 0
+            detail_backlog: list[tuple[str, str]] = []
+            dropped_detail_entries = 0
             last_heartbeat_at = 0.0
             last_rendered = ""
 
             while True:
-                # Drain queue signals so bursts collapse into one edit.
-                got_signal = False
                 while True:
                     try:
                         progress_queue.get_nowait()
-                        got_signal = True
                     except queue.Empty:
                         break
+                while detail_queue:
+                    try:
+                        entry = detail_queue.get_nowait()
+                        if isinstance(entry, tuple) and len(entry) == 2:
+                            ts, text = entry
+                        else:
+                            ts, text = datetime.now().strftime("%H:%M:%S"), str(entry)
+                        if len(detail_backlog) >= detail_backlog_max:
+                            dropped_detail_entries += 1
+                            continue
+                        detail_backlog.append((str(ts), str(text)))
+                    except queue.Empty:
+                        break
+                if dropped_detail_entries:
+                    note = (
+                        f"[{datetime.now().isoformat()}] "
+                        f"dropped_detail_entries={dropped_detail_entries} "
+                        f"(backlog_limit={detail_backlog_max})"
+                    )
+                    _append_artifact(note)
+                    dropped_detail_entries = 0
 
                 try:
                     now = time.monotonic()
                     heartbeat_due = (now - last_heartbeat_at) >= 1.0
-                    if not got_signal and not heartbeat_due:
-                        await asyncio.sleep(0.2)
-                        continue
 
                     msg = _build_progress_message()
-                    if not got_signal and not heartbeat_due and msg == last_rendered:
-                        await asyncio.sleep(0.2)
-                        continue
 
-                    # For platforms that support edits (Discord/Telegram/etc.),
-                    # send the first progress message and then edit it in place
-                    # for subsequent updates.
-                    if progress_message_id is None:
-                        result = await adapter.send(chat_id=source.chat_id, content=msg)
-                        if result and result.success and result.message_id:
-                            progress_message_id = result.message_id
-                    else:
-                        try:
-                            await adapter.edit_message(
-                                chat_id=source.chat_id,
-                                message_id=progress_message_id,
-                                content=msg,
-                            )
-                        except Exception:
+                    if heartbeat_due or msg != last_rendered:
+                        if progress_style == "single" and progress_message_id and hasattr(adapter, "edit_message"):
+                            try:
+                                await adapter.edit_message(
+                                    chat_id=source.chat_id,
+                                    message_id=progress_message_id,
+                                    content=msg,
+                                )
+                            except Exception:
+                                result = await adapter.send(chat_id=source.chat_id, content=msg)
+                                if result and result.success and result.message_id:
+                                    progress_message_id = result.message_id
+                        else:
                             result = await adapter.send(chat_id=source.chat_id, content=msg)
-                            if result and result.success and result.message_id:
+                            if result and result.success and result.message_id and progress_style == "single":
                                 progress_message_id = result.message_id
 
-                    last_rendered = msg
-                    last_heartbeat_at = now
-                    await adapter.send_typing(source.chat_id)
+                        last_rendered = msg
+                        last_heartbeat_at = now
+                        await adapter.send_typing(source.chat_id)
+
+                    # Server-channel detailed logs: create thread from live status msg.
+                    if (
+                        thread_logs_enabled
+                        and not thread_log_failed
+                        and progress_thread_chat_id is None
+                        and progress_message_id
+                        and hasattr(adapter, "create_tool_log_thread")
+                    ):
+                        thread_create_attempts += 1
+                        title = f"Hermes Tool Log {datetime.now().strftime('%H:%M:%S')}"
+                        progress_thread_chat_id = await adapter.create_tool_log_thread(
+                            chat_id=source.chat_id,
+                            seed_message_id=progress_message_id,
+                            title=title,
+                        )
+                        if progress_thread_chat_id and not thread_announced:
+                            try:
+                                await adapter.send(
+                                    chat_id=source.chat_id,
+                                    content=f"🧵 Detailed tool log: <#{progress_thread_chat_id}>",
+                                )
+                            except Exception:
+                                pass
+                            thread_announced = True
+                            _append_artifact(
+                                f"[{datetime.now().isoformat()}] thread_created={progress_thread_chat_id}"
+                            )
+                        elif (
+                            not progress_thread_chat_id
+                            and thread_create_attempts >= thread_create_max_attempts
+                        ):
+                            thread_log_failed = True
+                            _append_artifact(
+                                f"[{datetime.now().isoformat()}] "
+                                f"thread_create_failed attempts={thread_create_attempts}"
+                            )
+                            detail_backlog.clear()
+                            try:
+                                await adapter.send(
+                                    chat_id=source.chat_id,
+                                    content="⚠️ Detailed tool log thread unavailable for this run. "
+                                    "Progress is still shown here.",
+                                )
+                            except Exception:
+                                pass
+
+                    if detail_backlog:
+                        if progress_thread_chat_id:
+                            while detail_backlog:
+                                ts, entry = detail_backlog.pop(0)
+                                await adapter.send(
+                                    chat_id=progress_thread_chat_id,
+                                    content=f"`{ts}` {entry}",
+                                )
+                        elif not thread_logs_enabled or thread_log_failed:
+                            detail_backlog.clear()
+
+                    await asyncio.sleep(0.2)
                 except asyncio.CancelledError:
+                    if tool_log_path:
+                        _append_artifact(f"[{datetime.now().isoformat()}] finished")
+                        _append_artifact(f"log_file={tool_log_path}")
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
@@ -2667,11 +2938,18 @@ class GatewayRunner:
             try:
                 runtime_kwargs = _resolve_runtime_agent_kwargs()
             except Exception as exc:
+                if tool_progress_enabled:
+                    _set_progress_state(
+                        phase="finalizing",
+                        detail=f"❌ provider auth/config error: {exc}",
+                        tool_call=False,
+                    )
                 return {
                     "final_response": f"⚠️ Provider authentication failed: {exc}",
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
+                    "session_id": session_id,
                 }
 
             pr = self._provider_routing
@@ -2776,6 +3054,7 @@ class GatewayRunner:
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
                     "tools": tools_holder[0] or [],
+                    "session_id": result.get("session_id") or getattr(agent, "session_id", session_id),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -2856,6 +3135,11 @@ class GatewayRunner:
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "tools": tools_holder[0] or [],
+                "session_id": (
+                    result_holder[0].get("session_id")
+                    if isinstance(result_holder[0], dict)
+                    else getattr(agent, "session_id", session_id)
+                ),
             }
         
         # Start progress message sender if enabled

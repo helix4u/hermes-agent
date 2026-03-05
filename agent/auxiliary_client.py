@@ -51,6 +51,7 @@ _OPENROUTER_MODEL = "google/gemini-3-flash-preview"
 _NOUS_MODEL = "gemini-3-flash"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _AUTH_JSON_PATH = Path.home() / ".hermes" / "auth.json"
+_AUX_PROVIDER_ENV = "CONTEXT_COMPRESSION_PROVIDER"
 
 # Codex fallback: uses the Responses API (the only endpoint the Codex
 # OAuth token can access) with a fast model for auxiliary tasks.
@@ -288,6 +289,65 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
     """
     global auxiliary_is_nous
     auxiliary_is_nous = False
+
+    forced_provider_raw = os.getenv(_AUX_PROVIDER_ENV, "auto").strip().lower()
+    provider_aliases = {
+        "codex": "openai-codex",
+        "openai_codex": "openai-codex",
+    }
+    forced_provider = provider_aliases.get(forced_provider_raw, forced_provider_raw)
+    valid_providers = {"auto", "openrouter", "nous", "custom", "openai-codex"}
+    if forced_provider not in valid_providers:
+        logger.warning(
+            "Unknown %s value '%s'; using auto auxiliary provider selection",
+            _AUX_PROVIDER_ENV,
+            forced_provider_raw,
+        )
+        forced_provider = "auto"
+
+    # Explicit provider selection (strict): if a forced provider is selected
+    # but not configured, return no client rather than silently falling through.
+    if forced_provider == "openrouter":
+        or_key = os.getenv("OPENROUTER_API_KEY")
+        if not or_key:
+            logger.warning("%s=openrouter but OPENROUTER_API_KEY is not set", _AUX_PROVIDER_ENV)
+            return None, None
+        logger.debug("Auxiliary text client: OpenRouter (forced)")
+        return (
+            OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL, default_headers=_OR_HEADERS),
+            _OPENROUTER_MODEL,
+        )
+    if forced_provider == "nous":
+        nous = _read_nous_auth()
+        if not nous:
+            logger.warning("%s=nous but no active Nous auth was found", _AUX_PROVIDER_ENV)
+            return None, None
+        auxiliary_is_nous = True
+        logger.debug("Auxiliary text client: Nous Portal (forced)")
+        return (
+            OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url()),
+            _NOUS_MODEL,
+        )
+    if forced_provider == "custom":
+        custom_base = os.getenv("OPENAI_BASE_URL")
+        custom_key = os.getenv("OPENAI_API_KEY")
+        if not (custom_base and custom_key):
+            logger.warning(
+                "%s=custom but OPENAI_BASE_URL/OPENAI_API_KEY are not fully configured",
+                _AUX_PROVIDER_ENV,
+            )
+            return None, None
+        model = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
+        logger.debug("Auxiliary text client: custom endpoint (%s, forced)", model)
+        return OpenAI(api_key=custom_key, base_url=custom_base), model
+    if forced_provider == "openai-codex":
+        codex_token = _read_codex_access_token()
+        if not codex_token:
+            logger.warning("%s=openai-codex but no Codex token was found", _AUX_PROVIDER_ENV)
+            return None, None
+        logger.debug("Auxiliary text client: Codex OAuth (%s, forced)", _CODEX_AUX_MODEL)
+        real_client = OpenAI(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL)
+        return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
 
     # 1. OpenRouter
     or_key = os.getenv("OPENROUTER_API_KEY")

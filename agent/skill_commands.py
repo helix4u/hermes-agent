@@ -97,7 +97,7 @@ def build_skill_invocation_message(cmd_key: str, user_instruction: str = "") -> 
         if subdir_path.exists():
             for f in sorted(subdir_path.rglob("*")):
                 if f.is_file():
-                    rel = str(f.relative_to(skill_dir))
+                    rel = f.relative_to(skill_dir).as_posix()
                     supporting.append(rel)
 
     if supporting:
@@ -105,7 +105,7 @@ def build_skill_invocation_message(cmd_key: str, user_instruction: str = "") -> 
         parts.append("[This skill has supporting files you can load with the skill_view tool:]")
         for sf in supporting:
             parts.append(f"- {sf}")
-        parts.append(f'\nTo view any of these, use: skill_view(name="{skill_name}", file="<path>")')
+        parts.append(f'\nTo view any of these, use: skill_view(name="{skill_name}", file_path="<path>")')
 
     if user_instruction:
         parts.append("")

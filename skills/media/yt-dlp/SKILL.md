@@ -11,18 +11,18 @@ metadata:
 
 # yt-dlp
 
-Use a dedicated temp folder for **all yt-dlp work** so you never spray files around the workspace. The default temp root is `TMP/yt-dlp` **inside the workspace root** (for Hermes this means a relative path `TMP/yt-dlp` from the current working directory). Always create it if missing, and keep intermediate JSON, subtitles, and media in that folder unless the user explicitly asks for a different destination. Prefer writing outputs into temp and then moving or copying to a final location if needed. If you create helper scripts, put them under `workspace/scripts/yt-dlp` and delete one-off scripts after use. Before fetching channel stats or user-specific data, check TOOLS.md for usernames and tool variables.
+Use a dedicated temp folder for **all yt-dlp work** so you never spray files around the workspace. The default temp root is `data/tmp/yt-dlp` **inside the workspace root** (for Hermes this means a relative path `data/tmp/yt-dlp` from the current working directory). Always create it if missing, and keep intermediate JSON, subtitles, and media in that folder unless the user explicitly asks for a different destination. Prefer writing outputs into temp and then moving or copying to a final location if needed. If you create helper scripts, put them under `workspace/scripts/yt-dlp` and delete one-off scripts after use. Before fetching channel stats or user-specific data, check TOOLS.md for usernames and tool variables.
 
 When constructing commands, **never run yt-dlp in random directories**; always either:
 
-- `cd` into `TMP/yt-dlp` first, **or**
-- pass `--paths TMP/yt-dlp` / `-P TMP/yt-dlp` so all output files land there.
+- `cd` into `data/tmp/yt-dlp` first, **or**
+- pass `--paths data/tmp/yt-dlp` / `-P data/tmp/yt-dlp` so all output files land there.
 
 On Windows / PowerShell (your setup), use **this pattern only**:
 
 ```powershell
-New-Item -ItemType Directory -Force -Path "TMP/yt-dlp" | Out-Null
-yt-dlp --paths "TMP/yt-dlp" ...
+New-Item -ItemType Directory -Force -Path "data/tmp/yt-dlp" | Out-Null
+yt-dlp --paths "data/tmp/yt-dlp" ...
 ```
 
 ## Plain YouTube URL (default: summarize)
@@ -33,16 +33,16 @@ When given a **plain YouTube URL with no extra instruction**, treat it as:
 Default flow (run **at most once per URL**; if any yt-dlp step fails, show the error and explain it instead of looping retries):
 
 1. **Prep temp folder**
-   - Ensure `TMP/yt-dlp` exists as above.
+   - Ensure `data/tmp/yt-dlp` exists as above.
 2. **Metadata JSON**
    - Run yt-dlp with `--dump-single-json` into temp, e.g.:
      - PowerShell:
        ```powershell
-       yt-dlp --dump-single-json --paths \"TMP/yt-dlp\" -o \"%(title)s [%(id)s].%(ext)s\" <URL> > \"TMP/yt-dlp\\meta.json\"
+       yt-dlp --dump-single-json --paths \"data/tmp/yt-dlp\" -o \"%(title)s [%(id)s].%(ext)s\" <URL> > \"data/tmp/yt-dlp\\meta.json\"
        ```
      - POSIX:
        ```bash
-       yt-dlp --dump-single-json --paths TMP/yt-dlp -o '%(title)s [%(id)s].%(ext)s' <URL> > TMP/yt-dlp/meta.json
+       yt-dlp --dump-single-json --paths data/tmp/yt-dlp -o '%(title)s [%(id)s].%(ext)s' <URL> > data/tmp/yt-dlp/meta.json
        ```
 3. **Subtitles first (preferred)**
    - Try captions with **no media download**:
@@ -50,10 +50,10 @@ Default flow (run **at most once per URL**; if any yt-dlp step fails, show the e
      - `--sub-langs en` (or the user’s language)
      - `--sub-format vtt`
      - `--skip-download`
-     - Always keep output in `TMP/yt-dlp` via `--paths` / `-P`.
-   - Then use `read_file` to open the `.vtt` from `TMP/yt-dlp` and summarize **from the transcript**.
+     - Always keep output in `data/tmp/yt-dlp` via `--paths` / `-P`.
+   - Then use `read_file` to open the `.vtt` from `data/tmp/yt-dlp` and summarize **from the transcript**.
 4. **If no captions exist**
-   - Extract audio into `TMP/yt-dlp` with `--extract-audio` and an audio format (e.g. `mp3`), then summarize from the audio (or via Whisper if available).
+   - Extract audio into `data/tmp/yt-dlp` with `--extract-audio` and an audio format (e.g. `mp3`), then summarize from the audio (or via Whisper if available).
 5. **Summary style**
    - Write a **detailed, self-contained explanation** as if the user will **never watch the video**:
      - Who is speaking / main actors
@@ -103,3 +103,22 @@ yt-dlp --help
 ```
 
 and then adjust the command based on the documented `Usage: yt-dlp [OPTIONS] URL [URL...]` and options. Never keep retrying the same failing command blindly; check `--help` or the error message once, fix the command, and then try again **at most one more time**.
+
+## Transcript Helper (canonical)
+
+Use the canonical helper script in this skill for transcript pulls:
+
+```bash
+python SKILL_DIR/scripts/fetch_transcript.py "https://youtube.com/watch?v=VIDEO_ID"
+python SKILL_DIR/scripts/fetch_transcript.py "https://youtube.com/watch?v=VIDEO_ID" --timestamps
+python SKILL_DIR/scripts/fetch_transcript.py "https://youtube.com/watch?v=VIDEO_ID" --text-only
+python SKILL_DIR/scripts/fetch_transcript.py "https://youtube.com/watch?v=VIDEO_ID" --language tr,en
+```
+
+If both `yt-dlp` subtitles and `youtube-transcript-api` are available:
+- Prefer `yt-dlp` subtitle extraction for consistent `data/tmp/yt-dlp` file artifacts.
+- Use `fetch_transcript.py` as fallback (or when plain JSON/plain-text transcript is explicitly requested).
+
+## Canonical Skill Note
+
+This is the canonical YouTube skill for this project. The `youtube-content` skill is a compatibility alias and should defer to this one.

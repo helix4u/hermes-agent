@@ -330,10 +330,14 @@ class SessionStore:
         """Save sessions index to disk (kept for session key -> ID mapping)."""
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         sessions_file = self.sessions_dir / "sessions.json"
-        
+
         data = {key: entry.to_dict() for key, entry in self._entries.items()}
-        with open(sessions_file, "w", encoding="utf-8", newline="") as f:
+        tmp_file = self.sessions_dir / "sessions.json.tmp"
+        with open(tmp_file, "w", encoding="utf-8", newline="") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, sessions_file)
     
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
@@ -488,6 +492,27 @@ class SessionStore:
                     )
                 except Exception as e:
                     logger.debug("Session DB operation failed: %s", e)
+
+    def update_session_id(self, session_key: str, new_session_id: str) -> bool:
+        """Update the active session ID mapped to a session key."""
+        self._ensure_loaded()
+        if session_key not in self._entries:
+            return False
+
+        normalized = (new_session_id or "").strip()
+        if not normalized:
+            return False
+
+        entry = self._entries[session_key]
+        if entry.session_id == normalized:
+            entry.updated_at = datetime.now()
+            self._save()
+            return True
+
+        entry.session_id = normalized
+        entry.updated_at = datetime.now()
+        self._save()
+        return True
     
     def reset_session(self, session_key: str) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""

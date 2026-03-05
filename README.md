@@ -738,12 +738,24 @@ sessions/
 Schedule tasks to run automatically:
 
 ```bash
-# In the CLI (/cron slash commands)
+# In Hermes messaging text commands
 /cron add 30m "Remind me to check the build"
 /cron add "every 2h" "Check server status"
+/cron add every 2h "Check server status"
 /cron add "0 9 * * *" "Morning briefing"
 /cron list
 /cron remove <job_id>
+# Run one job immediately
+/cron run <job_id>
+```
+
+For Discord, these are registered slash commands as a `/cron` group:
+
+```bash
+/cron add <schedule> <prompt>
+/cron list
+/cron remove <job_id>
+/cron run <job_id>
 ```
 
 The agent can also self-schedule using the `schedule_cronjob` tool from any platform (CLI, Telegram, Discord, etc.).
@@ -1698,7 +1710,9 @@ All variables go in `~/.hermes/.env`. Run `hermes config set VAR value` to set t
 |----------|-------------|
 | `CONTEXT_COMPRESSION_ENABLED` | Enable auto-compression (default: true) |
 | `CONTEXT_COMPRESSION_THRESHOLD` | Trigger at this % of limit (default: 0.85) |
+| `CONTEXT_COMPRESSION_PROVIDER` | Summary backend provider: `auto`, `openrouter`, `nous`, `custom`, `openai-codex` |
 | `CONTEXT_COMPRESSION_MODEL` | Model for summaries |
+| `CONTEXT_COMPRESSION_SUMMARY_TARGET_TOKENS` | Approx summary target size in tokens (default: 2048) |
 
 ---
 
@@ -1758,3 +1772,4 @@ Common issues:
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+

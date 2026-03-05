@@ -465,16 +465,19 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             try:
                 resolved = target_file.resolve()
                 skill_dir_resolved = skill_dir.resolve()
-                if not str(resolved).startswith(str(skill_dir_resolved) + "/") and resolved != skill_dir_resolved:
+                # Cross-platform boundary check (Windows + POSIX): using
+                # relative_to avoids slash-separator assumptions.
+                resolved.relative_to(skill_dir_resolved)
+                if resolved == skill_dir_resolved:
                     return json.dumps({
                         "success": False,
-                        "error": "Path escapes skill directory boundary.",
-                        "hint": "Use a relative path within the skill directory"
+                        "error": "Path must point to a file inside the skill directory.",
+                        "hint": "Use a relative file path within the skill directory"
                     }, ensure_ascii=False)
             except (OSError, ValueError):
                 return json.dumps({
                     "success": False,
-                    "error": f"Invalid file path: '{file_path}'",
+                    "error": "Path escapes skill directory boundary.",
                     "hint": "Use a valid relative path within the skill directory"
                 }, ensure_ascii=False)
             if not target_file.exists():
@@ -490,7 +493,7 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
                 # Scan for all readable files
                 for f in skill_dir.rglob("*"):
                     if f.is_file() and f.name != "SKILL.md":
-                        rel = str(f.relative_to(skill_dir))
+                        rel = f.relative_to(skill_dir).as_posix()
                         if rel.startswith("references/"):
                             available_files["references"].append(rel)
                         elif rel.startswith("templates/"):

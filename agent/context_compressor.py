@@ -30,8 +30,8 @@ class ContextCompressor:
         model: str,
         threshold_percent: float = 0.85,
         protect_first_n: int = 3,
-        protect_last_n: int = 8,
-        summary_target_tokens: int = 2500,
+        protect_last_n: int = 3,
+        summary_target_tokens: int = 2048,
         quiet_mode: bool = False,
         summary_model_override: str = None,
     ):
