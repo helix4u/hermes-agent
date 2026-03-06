@@ -282,6 +282,7 @@ def tick(verbose: bool = True) -> int:
     _LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
+    lock_fd = None
     try:
         lock_fd = open(_LOCK_FILE, "w", encoding="utf-8")
         if fcntl:
@@ -290,6 +291,8 @@ def tick(verbose: bool = True) -> int:
             msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
     except (OSError, IOError):
         logger.debug("Tick skipped — another instance holds the lock")
+        if lock_fd is not None:
+            lock_fd.close()
         return 0
 
     try:
