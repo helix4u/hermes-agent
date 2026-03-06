@@ -1263,8 +1263,8 @@ class ShellFileOperations(FileOperations):
         
         result = self._exec(cmd, timeout=60)
         
-        if result.exit_code != 0 and not result.stdout.strip():
-            # Try without -printf (BSD find compatibility)
+        if not result.stdout.strip():
+            # Try without -printf (BSD find compatibility -- macOS)
             cmd_simple = (
                 f"find {self._escape_shell_arg(path)} -type f -name "
                 f"{self._escape_shell_arg(search_pattern)} ! -name '.env' "
