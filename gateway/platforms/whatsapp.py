@@ -176,10 +176,14 @@ class WhatsAppAdapter(BasePlatformAdapter):
             
             # Wait for bridge to be ready via HTTP health check
             import aiohttp
+            http_ready = False
+            data = {}
             for attempt in range(15):
                 await asyncio.sleep(1)
                 if self._bridge_process.poll() is not None:
                     print(f"[{self.name}] Bridge process died (exit code {self._bridge_process.returncode})")
+                    print(f"[{self.name}] Check log: {self._bridge_log}")
+                    self._close_bridge_log()
                     return False
                 try:
                     async with aiohttp.ClientSession() as session:
@@ -188,15 +192,50 @@ class WhatsAppAdapter(BasePlatformAdapter):
                             timeout=aiohttp.ClientTimeout(total=2)
                         ) as resp:
                             if resp.status == 200:
+                                http_ready = True
                                 data = await resp.json()
                                 print(f"[{self.name}] Bridge ready (status: {data.get('status', '?')})")
                                 break
                 except Exception:
                     continue
-            else:
-                print(f"[{self.name}] Bridge did not become ready in 15s")
+
+            if not http_ready:
+                print(f"[{self.name}] Bridge HTTP server did not start in 15s")
+                print(f"[{self.name}] Check log: {self._bridge_log}")
+                self._close_bridge_log()
                 return False
             
+            # Phase 2: HTTP is up but WhatsApp may still be connecting.
+            # Give it more time to authenticate with saved credentials.
+            if data.get("status") != "connected":
+                print(f"[{self.name}] Bridge HTTP ready, waiting for WhatsApp connection...")
+                for attempt in range(15):
+                    await asyncio.sleep(1)
+                    if self._bridge_process.poll() is not None:
+                        print(f"[{self.name}] Bridge process died during connection")
+                        print(f"[{self.name}] Check log: {self._bridge_log}")
+                        self._close_bridge_log()
+                        return False
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(
+                                f"http://localhost:{self._bridge_port}/health",
+                                timeout=aiohttp.ClientTimeout(total=2)
+                            ) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    if data.get("status") == "connected":
+                                        print(f"[{self.name}] Bridge ready (status: connected)")
+                                        break
+                    except Exception:
+                        continue
+                else:
+                    # Still not connected — warn but proceed (bridge may
+                    # auto-reconnect later, e.g. after a code 515 restart).
+                    print(f"[{self.name}] ⚠ WhatsApp not connected after 30s")
+                    print(f"[{self.name}]   Bridge log: {self._bridge_log}")
+                    print(f"[{self.name}]   If session expired, re-pair: hermes whatsapp")
+
             # Start message polling task
             asyncio.create_task(self._poll_messages())
             
@@ -207,8 +246,18 @@ class WhatsAppAdapter(BasePlatformAdapter):
             
         except Exception as e:
             logger.error("[%s] Failed to start bridge: %s", self.name, e, exc_info=True)
+            self._close_bridge_log()
             return False
     
+    def _close_bridge_log(self) -> None:
+        """Close the bridge log file handle if open."""
+        if self._bridge_log_fh:
+            try:
+                self._bridge_log_fh.close()
+            except Exception:
+                pass
+            self._bridge_log_fh = None
+
     async def disconnect(self) -> None:
         """Stop the WhatsApp bridge and clean up any orphaned processes."""
         if self._bridge_process:
@@ -245,6 +294,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
         
         self._running = False
         self._bridge_process = None
+        self._close_bridge_log()
         print(f"[{self.name}] Disconnected")
     
     async def send(
