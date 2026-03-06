@@ -17,14 +17,20 @@ import asyncio
 import logging
 import os
 import re
+import shlex
+import shutil
+import socket
 import sys
 import signal
+import tempfile
 import threading
 import time
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List, Callable
+from urllib.request import urlopen
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -199,6 +205,240 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
+def _load_user_config() -> dict:
+    """Load ~/.hermes/config.yaml as a dictionary."""
+    import yaml
+
+    config_path = _hermes_home / "config.yaml"
+    if not config_path.exists():
+        return {}
+    with open(config_path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _save_user_config(config: dict) -> None:
+    """Persist ~/.hermes/config.yaml."""
+    import yaml
+
+    config_path = _hermes_home / "config.yaml"
+    with open(config_path, "w", encoding="utf-8", newline="") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+
+def _get_image_generation_defaults() -> Optional[dict]:
+    """Return persisted image-generation defaults, if any."""
+    try:
+        config = _load_user_config()
+    except Exception:
+        return None
+    image_cfg = config.get("image_generation", {})
+    if not isinstance(image_cfg, dict):
+        return None
+    defaults = image_cfg.get("defaults", {})
+    if not isinstance(defaults, dict):
+        return None
+    model = str(defaults.get("model") or "").strip()
+    if not model:
+        return None
+    raw_aspect_ratio = defaults.get("aspect_ratio")
+    sexagesimal_map = {
+        61: "1:1",
+        243: "4:3",
+        184: "3:4",
+        556: "9:16",
+        969: "16:9",
+    }
+    if isinstance(raw_aspect_ratio, int):
+        defaults["aspect_ratio"] = sexagesimal_map.get(raw_aspect_ratio, str(raw_aspect_ratio))
+    elif raw_aspect_ratio is not None:
+        defaults["aspect_ratio"] = str(raw_aspect_ratio).strip()
+    return defaults
+
+
+def _save_image_generation_defaults(
+    *,
+    model: str,
+    aspect_ratio: str,
+    width: int,
+    height: int,
+) -> None:
+    """Persist image-generation defaults into config.yaml."""
+    config = _load_user_config()
+    image_cfg = config.setdefault("image_generation", {})
+    if not isinstance(image_cfg, dict):
+        image_cfg = {}
+        config["image_generation"] = image_cfg
+    defaults = image_cfg.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        defaults = {}
+        image_cfg["defaults"] = defaults
+
+    defaults.update({
+        "provider": "invokeai-local-api",
+        "model": model,
+        "aspect_ratio": aspect_ratio,
+        "width": int(width),
+        "height": int(height),
+    })
+    _save_user_config(config)
+
+
+def _format_image_defaults(defaults: dict) -> str:
+    """Human-readable summary of saved image defaults."""
+    model = defaults.get("model", "")
+    aspect_ratio = defaults.get("aspect_ratio", "1:1")
+    width = defaults.get("width")
+    height = defaults.get("height")
+    lines = [
+        "🖼️ **Current image defaults**",
+        f"- Model: `{model}`",
+        f"- Aspect ratio: `{aspect_ratio}`",
+    ]
+    if width and height:
+        lines.append(f"- Resolution: `{width}x{height}`")
+    return "\n".join(lines)
+
+
+def _get_wiki_source_root() -> Path:
+    """Return the on-disk source root that contains wiki content."""
+    return _hermes_home / "workspace" / "data"
+
+
+def _get_wiki_web_root_base() -> Path:
+    """Return the parent directory used for generated LAN wiki roots."""
+    return _get_wiki_source_root() / "wiki_serve"
+
+
+def _link_or_copy_path(source: Path, dest: Path) -> None:
+    """Create a symlink when possible, otherwise copy the source into place."""
+    try:
+        os.symlink(source, dest, target_is_directory=source.is_dir())
+        return
+    except OSError:
+        pass
+
+    if source.is_dir():
+        shutil.copytree(source, dest)
+    else:
+        shutil.copy2(source, dest)
+
+
+def _build_wiki_web_root() -> Path:
+    """Create an isolated web root that exposes only the wiki landing page and wiki tree."""
+    source_root = _get_wiki_source_root()
+    landing_page = source_root / "knowledge_wiki.html"
+    wiki_root = source_root / "wiki"
+    if not landing_page.exists():
+        raise FileNotFoundError(f"Wiki landing page not found: {landing_page}")
+    if not wiki_root.exists():
+        raise FileNotFoundError(f"Wiki content directory not found: {wiki_root}")
+
+    web_root_base = _get_wiki_web_root_base()
+    web_root_base.mkdir(parents=True, exist_ok=True)
+    web_root = Path(tempfile.mkdtemp(prefix="lan_wiki_", dir=web_root_base))
+
+    _link_or_copy_path(landing_page, web_root / "knowledge_wiki.html")
+    _link_or_copy_path(landing_page, web_root / "index.html")
+    _link_or_copy_path(wiki_root, web_root / "wiki")
+    return web_root
+
+
+def _cleanup_wiki_web_root(web_root: Optional[Path]) -> None:
+    """Remove a generated LAN wiki root without touching the source wiki content."""
+    if not web_root:
+        return
+    try:
+        shutil.rmtree(web_root, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _get_wiki_host_config() -> dict:
+    """Load persisted wiki-hosting configuration."""
+    try:
+        config = _load_user_config()
+    except Exception:
+        return {}
+    wiki_cfg = config.get("wiki_hosting", {})
+    return wiki_cfg if isinstance(wiki_cfg, dict) else {}
+
+
+def _save_wiki_host_config(*, enabled: bool, port: Optional[int]) -> None:
+    """Persist wiki-hosting configuration to config.yaml."""
+    config = _load_user_config()
+    wiki_cfg = config.setdefault("wiki_hosting", {})
+    if not isinstance(wiki_cfg, dict):
+        wiki_cfg = {}
+        config["wiki_hosting"] = wiki_cfg
+    wiki_cfg["enabled"] = bool(enabled)
+    if port is not None:
+        wiki_cfg["port"] = int(port)
+    _save_user_config(config)
+
+
+def _resolve_lan_ip() -> str:
+    """Best-effort LAN IPv4 for URLs shown to the user."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    candidates: list[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET):
+            candidate = info[4][0]
+            if candidate and not candidate.startswith("127.") and candidate not in candidates:
+                candidates.append(candidate)
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if candidate.startswith("192.168.1."):
+            return candidate
+    for candidate in candidates:
+        if candidate.startswith(("192.168.", "10.", "172.")):
+            return candidate
+    return "127.0.0.1"
+
+
+class _QuietWikiRequestHandler(SimpleHTTPRequestHandler):
+    """Simple static-file handler with quieter logging."""
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path in {"/wiki/knowledge_wiki.html", "/wiki/"}:
+            self.send_response(302)
+            self.send_header("Location", "/knowledge_wiki.html")
+            self.end_headers()
+            return
+        super().do_GET()
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A003
+        logger.debug("wiki-host: " + format, *args)
+
+
+class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """HTTP server that requests exclusive port ownership when available."""
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        super().server_bind()
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -237,6 +477,10 @@ class GatewayRunner:
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str}
         self._pending_approvals: Dict[str, Dict[str, str]] = {}
+        self._wiki_server: ThreadingHTTPServer | None = None
+        self._wiki_server_thread: threading.Thread | None = None
+        self._wiki_host_port: int | None = None
+        self._wiki_web_root: Path | None = None
         
         # Initialize session database for session_search tool support
         self._session_db = None
@@ -253,6 +497,91 @@ class GatewayRunner:
         # Event hook system
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
+
+    def _wiki_host_status_message(self) -> str:
+        """Human-readable current wiki hosting state."""
+        if not self._wiki_server or not self._wiki_host_port:
+            return (
+                "📚 Wiki hosting is currently disabled.\n\n"
+                "Use `/wiki-host enable <port>` to expose the local wiki on your LAN."
+            )
+
+        lan_ip = _resolve_lan_ip()
+        url = f"http://{lan_ip}:{self._wiki_host_port}/knowledge_wiki.html"
+        web_root = self._wiki_web_root or _get_wiki_web_root_base()
+        return (
+            "📚 Wiki hosting is enabled.\n"
+            f"- Root: `{web_root}`\n"
+            f"- Port: `{self._wiki_host_port}`\n"
+            f"- URL: {url}"
+        )
+
+    def _start_wiki_host(self, port: int) -> str:
+        """Start or restart the local LAN wiki host."""
+        if self._wiki_server and self._wiki_host_port == port:
+            return self._wiki_host_status_message()
+
+        self._stop_wiki_host()
+        web_root = _build_wiki_web_root()
+
+        handler = lambda *args, **kwargs: _QuietWikiRequestHandler(  # noqa: E731
+            *args,
+            directory=str(web_root),
+            **kwargs,
+        )
+        server = _ExclusiveThreadingHTTPServer(("0.0.0.0", int(port)), handler)
+        server.daemon_threads = True
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name=f"wiki-host-{port}",
+            daemon=True,
+        )
+        thread.start()
+
+        self._wiki_server = server
+        self._wiki_server_thread = thread
+        self._wiki_host_port = int(port)
+        self._wiki_web_root = web_root
+        probe_url = f"http://127.0.0.1:{port}/knowledge_wiki.html"
+        deadline = time.time() + 3
+        last_error: Exception | None = None
+        while time.time() < deadline:
+            try:
+                with urlopen(probe_url, timeout=1) as resp:
+                    if getattr(resp, "status", 200) == 200:
+                        last_error = None
+                        break
+            except Exception as e:
+                last_error = e
+                time.sleep(0.1)
+        if last_error is not None:
+            self._stop_wiki_host()
+            raise RuntimeError(f"Wiki host started but self-probe failed for {probe_url}: {last_error}")
+        _save_wiki_host_config(enabled=True, port=port)
+        return self._wiki_host_status_message()
+
+    def _stop_wiki_host(self) -> None:
+        """Stop the local wiki host if it is running."""
+        server = self._wiki_server
+        thread = self._wiki_server_thread
+        web_root = self._wiki_web_root
+        self._wiki_server = None
+        self._wiki_server_thread = None
+        self._wiki_host_port = None
+        self._wiki_web_root = None
+
+        if server:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        if thread and thread.is_alive():
+            thread.join(timeout=2)
+        _cleanup_wiki_web_root(web_root)
     
     def _flush_memories_before_reset(self, old_entry):
         """Prompt the agent to save memories/skills before an auto-reset.
@@ -505,6 +834,15 @@ class GatewayRunner:
             logger.info("Channel directory built: %d target(s)", ch_count)
         except Exception as e:
             logger.warning("Channel directory build failed: %s", e)
+
+        wiki_cfg = _get_wiki_host_config()
+        if wiki_cfg.get("enabled"):
+            try:
+                wiki_port = int(wiki_cfg.get("port") or 8008)
+                logger.info("Restoring wiki host on port %s", wiki_port)
+                self._start_wiki_host(wiki_port)
+            except Exception as e:
+                logger.warning("Failed to restore wiki host: %s", e)
         
         logger.info("Press Ctrl+C to stop")
         
@@ -514,6 +852,7 @@ class GatewayRunner:
         """Stop the gateway and disconnect all adapters."""
         logger.info("Stopping gateway...")
         self._running = False
+        self._stop_wiki_host()
         
         for platform, adapter in self.adapters.items():
             try:
@@ -715,7 +1054,8 @@ class GatewayRunner:
             "new", "reset", "help", "status", "stop", "model",
             "personality", "retry", "undo", "sethome", "set-home",
             "terminal", "shell", "compress", "usage", "reload-mcp",
-            "cron"
+            "cron", "invokeai-defaults", "invokeai_defaults",
+            "wiki-host", "wiki_host"
         }
         if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
@@ -739,6 +1079,12 @@ class GatewayRunner:
         
         if command == "model":
             return await self._handle_model_command(event)
+
+        if command in ["invokeai-defaults", "invokeai_defaults"]:
+            return await self._handle_image_defaults_command(event)
+
+        if command in ["wiki-host", "wiki_host"]:
+            return await self._handle_wiki_host_command(event)
         
         if command == "personality":
             return await self._handle_personality_command(event)
@@ -1219,6 +1565,8 @@ class GatewayRunner:
             "`/status` — Show session info",
             "`/stop` — Interrupt the running agent",
             "`/model [name]` — Show or change the model",
+            "`/invokeai-defaults [model] [aspect]` — Show or change default InvokeAI image settings",
+            "`/wiki-host [enable|disable|status] [port]` — Toggle LAN hosting for the local wiki",
             "`/personality [name]` — Set a personality",
             "`/retry` — Retry your last message",
             "`/undo` — Remove the last exchange",
@@ -1702,6 +2050,147 @@ class GatewayRunner:
         os.environ["HERMES_MODEL"] = args
 
         return f"🤖 Model changed to `{args}`\n_(takes effect on next message)_"
+
+    async def _handle_image_defaults_command(self, event: MessageEvent) -> str:
+        """Handle /invokeai-defaults command - show or change InvokeAI image defaults."""
+        aspect_presets = {
+            "1:1": (1024, 1024),
+            "16:9": (1344, 768),
+            "9:16": (768, 1344),
+            "4:3": (1152, 896),
+            "3:4": (896, 1152),
+        }
+
+        args = event.get_command_args().strip()
+        current = _get_image_generation_defaults()
+
+        if not args:
+            if current:
+                return (
+                    f"{_format_image_defaults(current)}\n"
+                    "\nTo change these, use `/invokeai-defaults <model> <aspect_ratio>`."
+                )
+            return (
+                "🖼️ No image defaults saved yet.\n\n"
+                "Use `/invokeai-defaults <model> <aspect_ratio>`.\n"
+                "Supported aspect ratios: `1:1`, `16:9`, `9:16`, `4:3`, `3:4`."
+            )
+
+        try:
+            tokens = shlex.split(args)
+        except ValueError as e:
+            return f"⚠️ Could not parse image defaults: {e}"
+
+        if len(tokens) > 2:
+            return (
+                "⚠️ Too many arguments for `/invokeai-defaults`.\n\n"
+                "Usage: `/invokeai-defaults <model> <aspect_ratio>`\n"
+                "Example: `/invokeai-defaults \"Z-Image Turbo (quantized)\" 1:1`"
+            )
+
+        model = current.get("model") if current else None
+        aspect_ratio = current.get("aspect_ratio") if current else None
+
+        if len(tokens) == 1:
+            token = tokens[0]
+            if token in aspect_presets:
+                aspect_ratio = token
+            else:
+                model = token
+        elif len(tokens) == 2:
+            model, aspect_ratio = tokens
+
+        if not model:
+            return (
+                "⚠️ Please pick a model.\n\n"
+                "The command can update just the aspect ratio if a model is already saved."
+            )
+
+        if not aspect_ratio:
+            aspect_ratio = "1:1"
+
+        if aspect_ratio not in aspect_presets:
+            valid = ", ".join(f"`{key}`" for key in aspect_presets)
+            return (
+                f"⚠️ Unknown aspect ratio: `{aspect_ratio}`\n\n"
+                f"Valid options: {valid}"
+            )
+
+        width, height = aspect_presets[aspect_ratio]
+
+        try:
+            _save_image_generation_defaults(
+                model=model,
+                aspect_ratio=aspect_ratio,
+                width=width,
+                height=height,
+            )
+        except Exception as e:
+            return f"⚠️ Failed to save image defaults: {e}"
+
+        os.environ["HERMES_IMAGE_DEFAULT_MODEL"] = model
+        os.environ["HERMES_IMAGE_DEFAULT_ASPECT_RATIO"] = aspect_ratio
+        os.environ["HERMES_IMAGE_DEFAULT_WIDTH"] = str(width)
+        os.environ["HERMES_IMAGE_DEFAULT_HEIGHT"] = str(height)
+
+        saved = {
+            "model": model,
+            "aspect_ratio": aspect_ratio,
+            "width": width,
+            "height": height,
+        }
+        return (
+            f"✅ Saved image defaults.\n\n"
+            f"{_format_image_defaults(saved)}\n"
+            "\nThese will be used as the starting image settings after your next message unless you override them."
+        )
+
+    async def _handle_wiki_host_command(self, event: MessageEvent) -> str:
+        """Handle /wiki-host command for LAN wiki hosting."""
+        args = event.get_command_args().strip()
+        if not args:
+            return self._wiki_host_status_message()
+
+        try:
+            tokens = shlex.split(args)
+        except ValueError as e:
+            return f"⚠️ Could not parse wiki-host command: {e}"
+
+        action = (tokens[0] or "").strip().lower()
+        port_token = tokens[1].strip() if len(tokens) > 1 else ""
+
+        if action in {"status", "show"}:
+            return self._wiki_host_status_message()
+
+        if action in {"disable", "off", "stop"}:
+            self._stop_wiki_host()
+            _save_wiki_host_config(enabled=False, port=None)
+            return "📚 Wiki hosting disabled."
+
+        if action in {"enable", "on", "start"}:
+            port = self._wiki_host_port or int((_get_wiki_host_config().get("port") or 8008))
+            if port_token:
+                try:
+                    port = int(port_token)
+                except ValueError:
+                    return f"⚠️ Invalid port: `{port_token}`"
+            if not (1 <= int(port) <= 65535):
+                return f"⚠️ Invalid port: `{port}`"
+
+            try:
+                return self._start_wiki_host(int(port))
+            except OSError as e:
+                return f"⚠️ Could not start wiki host on port `{port}`: {e}"
+            except Exception as e:
+                return f"⚠️ Failed to start wiki host: {e}"
+
+        return (
+            f"⚠️ Unknown wiki-host action: `{action}`\n\n"
+            "Usage:\n"
+            "- `/wiki-host status`\n"
+            "- `/wiki-host enable 8008`\n"
+            "- `/wiki-host disable`"
+        )
     
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""

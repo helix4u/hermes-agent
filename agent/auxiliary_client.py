@@ -52,11 +52,16 @@ _NOUS_MODEL = "gemini-3-flash"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _AUTH_JSON_PATH = Path.home() / ".hermes" / "auth.json"
 _AUX_PROVIDER_ENV = "CONTEXT_COMPRESSION_PROVIDER"
+_CONFIG_YAML_PATH = Path.home() / ".hermes" / "config.yaml"
 
 # Codex fallback: uses the Responses API (the only endpoint the Codex
 # OAuth token can access) with a fast model for auxiliary tasks.
-_CODEX_AUX_MODEL = "gpt-5.3-codex"
+_CODEX_AUX_MODEL = "gpt-5.4"
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+_PROVIDER_ALIASES = {
+    "codex": "openai-codex",
+    "openai_codex": "openai-codex",
+}
 
 
 # ── Codex Responses → chat.completions adapter ─────────────────────────────
@@ -280,6 +285,38 @@ def _read_codex_access_token() -> Optional[str]:
         return None
 
 
+def _normalize_provider_name(value: str) -> str:
+    raw = (value or "").strip().lower()
+    return _PROVIDER_ALIASES.get(raw, raw)
+
+
+def _resolve_auto_provider_preference() -> str:
+    """Best-effort provider hint for auto mode.
+
+    Priority:
+    1. HERMES_INFERENCE_PROVIDER env var
+    2. ~/.hermes/config.yaml -> model.provider
+    """
+    env_pref = _normalize_provider_name(os.getenv("HERMES_INFERENCE_PROVIDER", ""))
+    if env_pref and env_pref != "auto":
+        return env_pref
+
+    try:
+        if _CONFIG_YAML_PATH.is_file():
+            import yaml
+
+            data = yaml.safe_load(_CONFIG_YAML_PATH.read_text(encoding="utf-8")) or {}
+            model_cfg = data.get("model", {})
+            if isinstance(model_cfg, dict):
+                cfg_pref = _normalize_provider_name(str(model_cfg.get("provider", "")))
+                if cfg_pref and cfg_pref != "auto":
+                    return cfg_pref
+    except Exception as exc:
+        logger.debug("Could not read model.provider from config for auxiliary client: %s", exc)
+
+    return "auto"
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
 def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
@@ -291,11 +328,7 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
     auxiliary_is_nous = False
 
     forced_provider_raw = os.getenv(_AUX_PROVIDER_ENV, "auto").strip().lower()
-    provider_aliases = {
-        "codex": "openai-codex",
-        "openai_codex": "openai-codex",
-    }
-    forced_provider = provider_aliases.get(forced_provider_raw, forced_provider_raw)
+    forced_provider = _normalize_provider_name(forced_provider_raw)
     valid_providers = {"auto", "openrouter", "nous", "custom", "openai-codex"}
     if forced_provider not in valid_providers:
         logger.warning(
@@ -348,6 +381,19 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
         logger.debug("Auxiliary text client: Codex OAuth (%s, forced)", _CODEX_AUX_MODEL)
         real_client = OpenAI(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL)
         return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
+
+    # Auto mode: if runtime model provider is explicitly codex, use Codex first.
+    if forced_provider == "auto":
+        preferred_provider = _resolve_auto_provider_preference()
+        if preferred_provider == "openai-codex":
+            codex_token = _read_codex_access_token()
+            if codex_token:
+                logger.debug(
+                    "Auxiliary text client: Codex OAuth (%s via runtime provider preference)",
+                    _CODEX_AUX_MODEL,
+                )
+                real_client = OpenAI(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL)
+                return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
 
     # 1. OpenRouter
     or_key = os.getenv("OPENROUTER_API_KEY")

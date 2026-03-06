@@ -49,3 +49,16 @@ cli-config.yaml
 # Skills Hub state (lives in ~/.hermes/skills/.hub/ at runtime, but just in case)
 skills/.hub/
 ignored/
+
+# Runtime audio cache artifacts
+audio_cache/
+*.mp3
+*.ogg
+
+# Local runtime/state artifacts
+cache/
+cron/output/
+cron/jobs.json
+cron/.tick.lock
+hermes-agent/
+upstream/

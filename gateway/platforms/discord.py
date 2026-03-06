@@ -16,6 +16,9 @@ import logging
 import os
 import time
 from typing import Dict, List, Optional, Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,86 @@ from gateway.platforms.base import (
 def check_discord_requirements() -> bool:
     """Check if Discord dependencies are available."""
     return DISCORD_AVAILABLE
+
+
+_DEFAULT_INVOKEAI_HOST = "http://192.168.1.101:9090"
+_FALLBACK_IMAGE_MODEL_CHOICES = [
+    "badmix10step_badmix10stepQ4KS.gguf",
+    "brainflux_v10-Q4_K_S.gguf",
+    "FLUX Dev (Quantized)",
+    "FLUX.1 Kontext dev (quantized)",
+    "flux1-dev-Q3_K_S.gguf",
+    "flux1-krea-dev-Q4_K_M.gguf",
+    "flux1-schnell-Q2_K.gguf",
+    "fluxFusionV24StepsGGUFNF4_V2GGUFQ3KS.gguf",
+    "pixelwave_flux1_dev_Q4_K_M_03.gguf",
+    "526Mix-Anime-unreleased",
+    "526Mix-AnimeMac",
+    "526RealForTune",
+    "GMR4T_W5",
+    "MegaDistortedSerenity",
+    "NewerShitNormalizing_pass1",
+    "R4TGM",
+    "stable-diffusion-v1-5",
+    "stable-diffusion-v1-5-inpainting",
+    "memesXL_v10",
+    "SSD-1B",
+    "stable-diffusion-xl-refiner-1-0",
+    "Z-Image Turbo (quantized)",
+]
+_ASPECT_RATIO_CHOICES = [
+    ("Square 1:1", "1:1"),
+    ("Landscape 16:9", "16:9"),
+    ("Portrait 9:16", "9:16"),
+    ("Photo 4:3", "4:3"),
+    ("Photo 3:4", "3:4"),
+]
+
+
+def _get_invokeai_host() -> str:
+    """Resolve the configured InvokeAI host used for image-default choices."""
+    hermes_home = _Path(os.getenv("HERMES_HOME", _Path.home() / ".hermes"))
+    config_path = hermes_home / "config.yaml"
+    try:
+        import yaml
+
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+            image_cfg = config.get("image_generation", {})
+            if isinstance(image_cfg, dict):
+                invokeai_cfg = image_cfg.get("invokeai", {})
+                if isinstance(invokeai_cfg, dict):
+                    host = (invokeai_cfg.get("host") or "").strip()
+                    if host:
+                        return host.rstrip("/")
+    except Exception:
+        logger.debug("[discord] failed to read InvokeAI host from config", exc_info=True)
+    return _DEFAULT_INVOKEAI_HOST
+
+
+def _fetch_invokeai_model_names(limit: int = 25) -> List[str]:
+    """Fetch up to `limit` model names for the invokeai-defaults dropdown."""
+    host = _get_invokeai_host().rstrip("/")
+    query = urlencode({"model_type": "main"})
+    url = f"{host}/api/v2/models/?{query}"
+    req = Request(url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8")
+            data = json.loads(raw) if raw else {}
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        logger.debug("[discord] using fallback image model choices", exc_info=True)
+        return _FALLBACK_IMAGE_MODEL_CHOICES[:limit]
+
+    models = data.get("models", [])
+    names = [
+        (model.get("name") or "").strip()
+        for model in models
+        if isinstance(model, dict) and (model.get("name") or "").strip()
+    ]
+    unique_names = sorted(dict.fromkeys(names), key=str.lower)
+    return (unique_names or _FALLBACK_IMAGE_MODEL_CHOICES)[:limit]
 
 
 class DiscordAdapter(BasePlatformAdapter):
@@ -687,6 +770,14 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         tree = self._client.tree
+        image_model_choices = [
+            discord.app_commands.Choice(name=name[:100], value=name)
+            for name in _fetch_invokeai_model_names(limit=25)
+        ]
+        aspect_ratio_choices = [
+            discord.app_commands.Choice(name=label, value=value)
+            for label, value in _ASPECT_RATIO_CHOICES
+        ]
 
         @tree.command(name="ask", description="Ask Hermes a question")
         @discord.app_commands.describe(question="Your question for Hermes")
@@ -731,6 +822,61 @@ class DiscordAdapter(BasePlatformAdapter):
                 await interaction.followup.send("Done~", ephemeral=True)
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
+
+        @tree.command(name="invokeai-defaults", description="Show or change default InvokeAI image settings")
+        @discord.app_commands.describe(
+            model="Default InvokeAI model. Leave empty to see current.",
+            aspect_ratio="Default aspect ratio preset. Leave empty to keep current.",
+        )
+        @discord.app_commands.choices(
+            model=image_model_choices,
+            aspect_ratio=aspect_ratio_choices,
+        )
+        async def slash_invokeai_defaults(
+            interaction: discord.Interaction,
+            model: Optional[str] = None,
+            aspect_ratio: Optional[str] = None,
+        ):
+            await interaction.response.defer(ephemeral=True)
+            parts = ["/invokeai-defaults"]
+            if model:
+                parts.append(json.dumps(model))
+            if aspect_ratio:
+                parts.append(json.dumps(aspect_ratio))
+            event = self._build_slash_event(interaction, " ".join(parts))
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug("Discord delete_original_response failed: %s", e)
+
+        @tree.command(name="wiki-host", description="Enable, disable, or inspect LAN hosting for the local wiki")
+        @discord.app_commands.describe(
+            action="enable, disable, or status",
+            port="LAN port to use when enabling wiki hosting",
+        )
+        @discord.app_commands.choices(
+            action=[
+                discord.app_commands.Choice(name="Enable", value="enable"),
+                discord.app_commands.Choice(name="Disable", value="disable"),
+                discord.app_commands.Choice(name="Status", value="status"),
+            ],
+        )
+        async def slash_wiki_host(
+            interaction: discord.Interaction,
+            action: str,
+            port: Optional[int] = None,
+        ):
+            await interaction.response.defer(ephemeral=True)
+            text = f"/wiki-host {action}"
+            if port is not None:
+                text += f" {port}"
+            event = self._build_slash_event(interaction, text)
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug("Discord delete_original_response failed: %s", e)
 
         @tree.command(name="terminal", description="Show or change the local terminal shell (Windows)")
         @discord.app_commands.describe(mode="powershell, wsl, auto, or cmd. Leave empty to show current.")
