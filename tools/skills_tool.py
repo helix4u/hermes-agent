@@ -465,10 +465,7 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             try:
                 resolved = target_file.resolve()
                 skill_dir_resolved = skill_dir.resolve()
-                # Cross-platform boundary check (Windows + POSIX): using
-                # relative_to avoids slash-separator assumptions.
-                resolved.relative_to(skill_dir_resolved)
-                if resolved == skill_dir_resolved:
+                if not resolved.is_relative_to(skill_dir_resolved) or resolved == skill_dir_resolved:
                     return json.dumps({
                         "success": False,
                         "error": "Path must point to a file inside the skill directory.",
