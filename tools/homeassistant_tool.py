@@ -42,7 +42,6 @@ _BLOCKED_DOMAINS = frozenset({
     "rest_command",     # HTTP requests from HA server (SSRF vector)
 })
 
-
 def _get_config():
     """Return (hass_url, hass_token) from env vars at call time."""
     return (
@@ -64,8 +63,6 @@ _BLOCKED_DOMAINS = frozenset({
     "hassio",           # addon control, host shutdown/reboot, stdin to containers
     "rest_command",     # HTTP requests from HA server (SSRF vector)
 })
-
-
 def _get_headers(token: str = "") -> Dict[str, str]:
     """Return authorization headers for HA REST API."""
     if not token:
