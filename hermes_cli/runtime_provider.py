@@ -15,6 +15,8 @@ from hermes_cli.auth import (
 from hermes_cli.config import load_config
 from hermes_constants import OPENROUTER_BASE_URL
 
+CODEX_DEFAULT_MODEL = (os.getenv("CODEX_DEFAULT_MODEL") or "gpt-5.4").strip() or "gpt-5.4"
+
 
 def _get_model_config() -> Dict[str, Any]:
     config = load_config()
@@ -24,6 +26,35 @@ def _get_model_config() -> Dict[str, Any]:
     if isinstance(model_cfg, str) and model_cfg.strip():
         return {"default": model_cfg.strip()}
     return {}
+
+
+def normalize_model_for_runtime(
+    model: Optional[str],
+    provider: Optional[str],
+    default_model: Optional[str] = CODEX_DEFAULT_MODEL,
+) -> str:
+    """Normalize model names after provider resolution.
+
+    OpenRouter-style provider-prefixed models are valid for chat-completions
+    backends, but Codex Responses expects plain OpenAI model IDs.
+    """
+    model_name = model.strip() if isinstance(model, str) else ""
+    provider_name = provider.strip().lower() if isinstance(provider, str) else ""
+    fallback_model = (
+        default_model.strip()
+        if isinstance(default_model, str) and default_model.strip()
+        else CODEX_DEFAULT_MODEL
+    )
+
+    if provider_name != "openai-codex":
+        return model_name
+    if not model_name:
+        return fallback_model
+    if model_name.lower().startswith("openai/"):
+        return model_name.split("/", 1)[1]
+    if "/" in model_name:
+        return fallback_model
+    return model_name
 
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:

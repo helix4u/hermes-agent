@@ -41,6 +41,7 @@ _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+_DEFAULT_MODEL = "google/gemini-2.0-flash-001:free"
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -53,6 +54,34 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     if platform and chat_id:
         return origin
     return None
+
+
+def _resolve_cron_model(provider: Optional[str]) -> str:
+    """Resolve cron runtime model after provider selection."""
+    from hermes_cli.runtime_provider import normalize_model_for_runtime
+
+    model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL")
+    if model:
+        return normalize_model_for_runtime(model.strip(), provider, default_model=_DEFAULT_MODEL)
+
+    try:
+        import yaml
+
+        cfg_path = _hermes_home / "config.yaml"
+        if cfg_path.exists():
+            with open(cfg_path, encoding="utf-8") as fh:
+                cfg = yaml.safe_load(fh) or {}
+            model_cfg = cfg.get("model", {})
+            if isinstance(model_cfg, str) and model_cfg.strip():
+                return normalize_model_for_runtime(model_cfg.strip(), provider, default_model=_DEFAULT_MODEL)
+            if isinstance(model_cfg, dict):
+                default_model = str(model_cfg.get("default") or "").strip()
+                if default_model:
+                    return normalize_model_for_runtime(default_model, provider, default_model=_DEFAULT_MODEL)
+    except Exception:
+        pass
+
+    return normalize_model_for_runtime(_DEFAULT_MODEL, provider, default_model=_DEFAULT_MODEL)
 
 
 def _deliver_result(job: dict, content: str) -> None:
@@ -173,22 +202,6 @@ def run_job(job: dict, tool_progress_callback=None) -> tuple[bool, str, str, Opt
         except UnicodeDecodeError:
             load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
 
-        model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
-
-        try:
-            import yaml
-            _cfg_path = str(_hermes_home / "config.yaml")
-            if os.path.exists(_cfg_path):
-                with open(_cfg_path, encoding="utf-8") as _f:
-                    _cfg = yaml.safe_load(_f) or {}
-                _model_cfg = _cfg.get("model", {})
-                if isinstance(_model_cfg, str):
-                    model = _model_cfg
-                elif isinstance(_model_cfg, dict):
-                    model = _model_cfg.get("default", model)
-        except Exception:
-            pass
-
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
             format_runtime_provider_error,
@@ -200,6 +213,8 @@ def run_job(job: dict, tool_progress_callback=None) -> tuple[bool, str, str, Opt
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
+
+        model = _resolve_cron_model(runtime.get("provider"))
 
         agent = AIAgent(
             model=model,

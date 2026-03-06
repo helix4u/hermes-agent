@@ -168,7 +168,7 @@ def _resolve_gateway_model() -> str:
         return model.strip()
     try:
         import yaml as _yaml
-        cfg_path = Path.home() / ".hermes" / "config.yaml"
+        cfg_path = _hermes_home / "config.yaml"
         if cfg_path.exists():
             with open(cfg_path, encoding="utf-8") as _f:
                 cfg = _yaml.safe_load(_f) or {}
@@ -182,6 +182,13 @@ def _resolve_gateway_model() -> str:
     except Exception:
         pass
     return _DEFAULT_MODEL
+
+
+def _resolve_gateway_runtime_model(provider: Optional[str]) -> str:
+    """Resolve the gateway model after runtime provider selection."""
+    from hermes_cli.runtime_provider import normalize_model_for_runtime
+
+    return normalize_model_for_runtime(_resolve_gateway_model(), provider)
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -1999,21 +2006,7 @@ class GatewayRunner:
 
         args = event.get_command_args().strip()
         config_path = _hermes_home / 'config.yaml'
-
-        # Resolve current model the same way the agent init does:
-        # env vars first, then config.yaml always overrides.
-        current = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
-        try:
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f) or {}
-                model_cfg = cfg.get("model", {})
-                if isinstance(model_cfg, str):
-                    current = model_cfg
-                elif isinstance(model_cfg, dict):
-                    current = model_cfg.get("default", current)
-        except Exception:
-            pass
+        current = _resolve_gateway_model()
 
         if not args:
             return f"🤖 **Current model:** `{current}`\n\nTo change: `/model provider/model-name`"
@@ -3397,7 +3390,7 @@ class GatewayRunner:
             except Exception:
                 pass
 
-            model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
+            model = _resolve_gateway_model()
 
             try:
                 import yaml as _y
@@ -3405,11 +3398,6 @@ class GatewayRunner:
                 if _cfg_path.exists():
                     with open(_cfg_path, encoding="utf-8") as _f:
                         _cfg = _y.safe_load(_f) or {}
-                    _model_cfg = _cfg.get("model", {})
-                    if isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        model = _model_cfg.get("default", model)
                     # Apply persisted terminal mode so /terminal choice wins over .env.
                     # Otherwise load_dotenv(override=True) can overwrite in-memory wsl with .env's value.
                     _shell = _cfg.get("HERMES_WINDOWS_SHELL")
@@ -3434,6 +3422,8 @@ class GatewayRunner:
                     "tools": [],
                     "session_id": session_id,
                 }
+
+            model = _resolve_gateway_runtime_model(runtime_kwargs.get("provider"))
 
             pr = self._provider_routing
             agent = AIAgent(

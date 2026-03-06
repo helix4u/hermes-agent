@@ -154,7 +154,7 @@ class AIAgent:
         api_key: str = None,
         provider: str = None,
         api_mode: str = None,
-        model: str = "anthropic/claude-opus-4.6",  # OpenRouter format
+        model: str = "google/gemini-2.0-flash-001:free",  # OpenRouter-style format
         max_iterations: int = 60,  # Default tool-calling iterations
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
@@ -192,7 +192,7 @@ class AIAgent:
             api_key (str): API key for authentication (optional, uses env var if not provided)
             provider (str): Provider identifier (optional; used for telemetry/routing hints)
             api_mode (str): API mode override: "chat_completions" or "codex_responses"
-            model (str): Model name to use (default: "anthropic/claude-opus-4.6")
+            model (str): Model name to use (default: "google/gemini-2.0-flash-001:free")
             max_iterations (int): Maximum number of tool calling iterations (default: 60)
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
             enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
@@ -250,6 +250,8 @@ class AIAgent:
             self.provider = "openai-codex"
         else:
             self.api_mode = "chat_completions"
+        from hermes_cli.runtime_provider import normalize_model_for_runtime
+        self.model = normalize_model_for_runtime(self.model, self.provider)
         if base_url and "api.anthropic.com" in base_url.strip().lower():
             raise ValueError(
                 "Anthropic's native /v1/messages API is not supported yet (planned for a future release). "
