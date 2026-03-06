@@ -1414,9 +1414,12 @@ class GatewayRunner:
                 self.session_store.update_session(session_entry.session_key)
                 return response
             
-            # Find only the NEW messages from this turn (skip history we loaded)
-            history_len = len(history)
-            new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else agent_messages
+            # Find only the NEW messages from this turn (skip history we loaded).
+            # Use the filtered history length (history_offset) that was actually
+            # passed to the agent, not len(history) which includes session_meta
+            # entries that were stripped before the agent saw them.
+            history_len = agent_result.get("history_offset", len(history))
+            new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
             
             # If no new messages found (edge case), fall back to simple user/assistant
             if not new_messages:
@@ -3620,6 +3623,7 @@ class GatewayRunner:
                     if isinstance(result_holder[0], dict)
                     else getattr(agent, "session_id", session_id)
                 ),
+                "history_offset": len(agent_history),
             }
         
         # Start progress message sender if enabled
