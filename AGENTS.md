@@ -5,6 +5,15 @@ Instructions for AI coding assistants (GitHub Copilot, Cursor, etc.) and human d
 NEVER PUSH TO REMOTE WITHOUT THE USER ASKING!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 Force encoding of things that could use another characterset to utf-8 encoding for safely running it on windows.
 
+## Upstream Integration Policy
+
+When integrating commits from upstream:
+
+1. Stay on `main` unless the user explicitly asks for another branch.
+2. Do not add or restore upstream `tests/` content.
+3. Prefer Windows-safe and UTF-8-safe behavior whenever there is a merge or implementation choice.
+4. Continue integrating upstream fixes and features under those constraints.
+
 Hermes Agent is an AI agent harness with tool-calling capabilities, interactive CLI, messaging integrations, and scheduled tasks.
 
 ## Development Environment
