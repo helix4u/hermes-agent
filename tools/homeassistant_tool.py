@@ -27,6 +27,21 @@ logger = logging.getLogger(__name__)
 _HASS_URL: str = ""
 _HASS_TOKEN: str = ""
 
+# Regex for valid HA entity_id format (e.g. "light.living_room", "sensor.temperature_1")
+_ENTITY_ID_RE = re.compile(r"^[a-z_][a-z0-9_]*\.[a-z0-9_]+$")
+
+# Service domains blocked for security -- these allow arbitrary code/command
+# execution on the HA host or enable SSRF attacks on the local network.
+# HA provides zero service-level access control; all safety must be in our layer.
+_BLOCKED_DOMAINS = frozenset({
+    "shell_command",    # arbitrary shell commands as root in HA container
+    "command_line",     # sensors/switches that execute shell commands
+    "python_script",    # sandboxed but can escalate via hass.services.call()
+    "pyscript",         # scripting integration with broader access
+    "hassio",           # addon control, host shutdown/reboot, stdin to containers
+    "rest_command",     # HTTP requests from HA server (SSRF vector)
+})
+
 
 def _get_config():
     """Return (hass_url, hass_token) from env vars at call time."""
