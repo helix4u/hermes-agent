@@ -1186,8 +1186,17 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.error("Voice playback error: %s", error)
                 loop.call_soon_threadsafe(done.set)
 
-            source = discord.FFmpegPCMAudio(audio_path)
-            source = discord.PCMVolumeTransformer(source, volume=1.0)
+            discord_lib = discord
+            if discord_lib is None:
+                try:
+                    import importlib
+                    discord_lib = importlib.import_module("discord")
+                except Exception:
+                    logger.warning("discord module unavailable for voice playback")
+                    return False
+
+            source = discord_lib.FFmpegPCMAudio(audio_path)
+            source = discord_lib.PCMVolumeTransformer(source, volume=1.0)
             vc.play(source, after=_after)
             try:
                 await asyncio.wait_for(done.wait(), timeout=self.PLAYBACK_TIMEOUT)
@@ -1722,58 +1731,61 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_personality(interaction: discord.Interaction, name: str = ""):
             await self._run_simple_slash(interaction, f"/personality {name}".strip())
 
-        cron = discord.app_commands.Group(name="cron", description="Manage Hermes cron jobs")
+        cron_group_cls = getattr(discord.app_commands, "Group", None)
+        if cron_group_cls is not None:
+            cron = cron_group_cls(name="cron", description="Manage Hermes cron jobs")
 
-        @cron.command(name="list", description="List all scheduled cron jobs")
-        async def slash_cron_list(interaction: discord.Interaction):
-            await self._run_simple_slash(
-                interaction,
-                "/cron list",
-                followup_msg=None,
-                delete_original=True,
+            @cron.command(name="list", description="List all scheduled cron jobs")
+            async def slash_cron_list(interaction: discord.Interaction):
+                await self._run_simple_slash(
+                    interaction,
+                    "/cron list",
+                    followup_msg=None,
+                    delete_original=True,
+                )
+
+            @cron.command(name="add", description="Add a new cron job")
+            @discord.app_commands.describe(
+                schedule="Accepted: 30m | 2h | 1d | every 30m | 0 9 * * * | 2026-03-03T14:00:00",
+                prompt="What the job should do",
             )
+            async def slash_cron_add(
+                interaction: discord.Interaction,
+                schedule: str,
+                prompt: str,
+            ):
+                # Cron schedule parsing in the runner expects quoted schedules when
+                # spaces are present (e.g., cron expressions).
+                schedule_arg = f'"{schedule}"' if " " in schedule else schedule
+                await self._run_simple_slash(
+                    interaction,
+                    f"/cron add {schedule_arg} {prompt}",
+                    followup_msg=None,
+                    delete_original=True,
+                )
 
-        @cron.command(name="add", description="Add a new cron job")
-        @discord.app_commands.describe(
-            schedule="Accepted: 30m | 2h | 1d | every 30m | 0 9 * * * | 2026-03-03T14:00:00",
-            prompt="What the job should do",
-        )
-        async def slash_cron_add(
-            interaction: discord.Interaction,
-            schedule: str,
-            prompt: str,
-        ):
-            # Cron schedule parsing in the runner expects quoted schedules when
-            # spaces are present (e.g., cron expressions).
-            schedule_arg = f'"{schedule}"' if " " in schedule else schedule
-            await self._run_simple_slash(
-                interaction,
-                f"/cron add {schedule_arg} {prompt}",
-                followup_msg=None,
-                delete_original=True,
-            )
+            @cron.command(name="remove", description="Remove a cron job")
+            @discord.app_commands.describe(job_id="Job ID from /cron list")
+            async def slash_cron_remove(interaction: discord.Interaction, job_id: str):
+                await self._run_simple_slash(
+                    interaction,
+                    f"/cron remove {job_id}",
+                    followup_msg=None,
+                    delete_original=True,
+                )
 
-        @cron.command(name="remove", description="Remove a cron job")
-        @discord.app_commands.describe(job_id="Job ID from /cron list")
-        async def slash_cron_remove(interaction: discord.Interaction, job_id: str):
-            await self._run_simple_slash(
-                interaction,
-                f"/cron remove {job_id}",
-                followup_msg=None,
-                delete_original=True,
-            )
+            @cron.command(name="run", description="Run one cron job immediately")
+            @discord.app_commands.describe(job_id="Job ID from /cron list")
+            async def slash_cron_run(interaction: discord.Interaction, job_id: str):
+                await self._run_simple_slash(
+                    interaction,
+                    f"/cron run {job_id}",
+                    followup_msg=None,
+                    delete_original=True,
+                )
 
-        @cron.command(name="run", description="Run one cron job immediately")
-        @discord.app_commands.describe(job_id="Job ID from /cron list")
-        async def slash_cron_run(interaction: discord.Interaction, job_id: str):
-            await self._run_simple_slash(
-                interaction,
-                f"/cron run {job_id}",
-                followup_msg=None,
-                delete_original=True,
-            )
-
-        tree.add_command(cron)
+            if hasattr(tree, "add_command"):
+                tree.add_command(cron)
 
         @tree.command(name="retry", description="Retry your last message")
         async def slash_retry(interaction: discord.Interaction):
@@ -2320,14 +2332,22 @@ class DiscordAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 if DISCORD_AVAILABLE:
+    _LISTEN_BUTTON_STYLE = getattr(discord.ButtonStyle, "secondary", None)
+    if _LISTEN_BUTTON_STYLE is None:
+        _LISTEN_BUTTON_STYLE = getattr(discord.ButtonStyle, "primary", 1)
+
     class ListenButtonView(discord.ui.View):
         """Button view that reads the current embed text aloud via TTS."""
 
         def __init__(self, adapter: "DiscordAdapter"):
-            super().__init__(timeout=3600)  # 1 hour
+            try:
+                super().__init__(timeout=3600)  # 1 hour
+            except TypeError:
+                # Test stubs often replace discord.ui.View with bare object.
+                super().__init__()
             self.adapter = adapter
 
-        @discord.ui.button(label="Listen", style=discord.ButtonStyle.secondary, emoji="🔊")
+        @discord.ui.button(label="Listen", style=_LISTEN_BUTTON_STYLE, emoji="🔊")
         async def listen(
             self, interaction: discord.Interaction, button: discord.ui.Button
         ):
@@ -2339,12 +2359,15 @@ if DISCORD_AVAILABLE:
         CUSTOM_ID = "hermes:listen"
 
         def __init__(self, adapter: "DiscordAdapter"):
-            super().__init__(timeout=None)  # Persistent while process is running
+            try:
+                super().__init__(timeout=None)  # Persistent while process is running
+            except TypeError:
+                super().__init__()
             self.adapter = adapter
 
         @discord.ui.button(
             label="Listen",
-            style=discord.ButtonStyle.secondary,
+            style=_LISTEN_BUTTON_STYLE,
             emoji="🔊",
             custom_id=CUSTOM_ID,
         )

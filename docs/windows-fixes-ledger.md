@@ -262,6 +262,25 @@ Scope: `hermes-agent` Windows install/startup/runtime reliability fixes validate
 - Validation notes:
 - `python -m py_compile tools/transcription_tools.py` passed.
 
+### WF-016 - Windows browser CLI resolution hardening (`npx.CMD` + PATH separator safety)
+- Status: `done`
+- Problem:
+- Browser tool calls could fail immediately on Windows with `[WinError 2] The system cannot find the file specified` when `agent-browser` was invoked via `npx` fallback.
+- Root cause:
+- Fallback execution used `npx` as a bare command token (not absolute `npx.CMD`), and PATH mutation logic used Unix `:` separators instead of `os.pathsep`.
+- Code evidence:
+- `tools/browser_tool.py` now resolves browser launcher commands as tokenized command parts:
+- global install -> `[<absolute-agent-browser-path>]`
+- local install -> supports both `node_modules/.bin/agent-browser` and `agent-browser.cmd`
+- fallback -> `[<absolute-npx-path>, "agent-browser"]`
+- `_run_browser_command()` now uses `os.pathsep` for PATH split/join and normalized dedupe.
+- File refs:
+- `tools/browser_tool.py`
+- Validation notes:
+- `python -m py_compile tools/browser_tool.py` passed.
+- Direct runtime probe passed:
+- `.venv\Scripts\python -c "import tools.browser_tool as b, subprocess; p=b._find_agent_browser(); print(p); print(subprocess.run(p+['--version'], capture_output=True, text=True, timeout=20).returncode)"` -> resolved `npx.CMD` path and returned `0`.
+
 ## Open Follow-ups
 - Re-run targeted pytest in your preferred Windows environment after current merge work settles to confirm no hidden cross-fixture assumptions remain.
 - Keep this ledger as source-of-truth for Windows stability fixes; append entries instead of rewriting history.

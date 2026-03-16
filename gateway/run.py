@@ -1055,9 +1055,9 @@ class GatewayRunner:
 
     def _stop_wiki_host(self) -> None:
         """Stop the local wiki host if it is running."""
-        server = self._wiki_server
-        thread = self._wiki_server_thread
-        web_root = self._wiki_web_root
+        server = getattr(self, "_wiki_server", None)
+        thread = getattr(self, "_wiki_server_thread", None)
+        web_root = getattr(self, "_wiki_web_root", None)
         self._wiki_server = None
         self._wiki_server_thread = None
         self._wiki_host_port = None
@@ -2046,17 +2046,20 @@ class GatewayRunner:
         self._stop_wiki_host()
 
         # Stop browser sidecar work first so no new sidecar requests are accepted.
-        if self._browser_bridge:
+        browser_bridge = getattr(self, "_browser_bridge", None)
+        if browser_bridge:
             try:
-                self._browser_bridge.stop()
+                browser_bridge.stop()
             except Exception as e:
                 logger.debug("Failed stopping browser bridge: %s", e)
             self._browser_bridge = None
-        for session_key, task in list(self._browser_bridge_tasks.items()):
+        for session_key, task in list(getattr(self, "_browser_bridge_tasks", {}).items()):
             if not task.done():
                 task.cancel()
             self._browser_bridge_tasks.pop(session_key, None)
-        self._browser_bridge_pending_interrupts.clear()
+        pending_interrupts = getattr(self, "_browser_bridge_pending_interrupts", None)
+        if pending_interrupts is not None:
+            pending_interrupts.clear()
 
         for session_key, agent in list(self._running_agents.items()):
             try:
@@ -5669,6 +5672,9 @@ class GatewayRunner:
                     now = time.monotonic()
                     heartbeat_due = (now - last_emit_at) >= 1.0
                     should_emit = updated or (progress_style == "single" and heartbeat_due)
+                    if progress_state["updates"] <= 0 and not updated:
+                        await asyncio.sleep(0.25)
+                        continue
                     if not should_emit:
                         await asyncio.sleep(0.25)
                         continue

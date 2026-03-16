@@ -195,6 +195,10 @@ def _get_provider(stt_config: dict) -> str:
         else:
             provider = DEFAULT_PROVIDER
     provider = str(provider).strip().lower()
+    strict_provider = str(
+        stt_config.get("strict_provider")
+        or os.getenv("HERMES_STT_STRICT_PROVIDER", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     if provider == "local":
         if _HAS_FASTER_WHISPER:
@@ -243,7 +247,7 @@ def _get_provider(stt_config: dict) -> str:
     if provider == "openai":
         if _HAS_OPENAI and _resolve_openai_api_key():
             return "openai"
-        if provider_is_explicit:
+        if provider_is_explicit and strict_provider:
             # Honor explicit provider choice so users get a direct config/runtime
             # error instead of silently falling back to a different backend.
             return "openai"
@@ -251,12 +255,12 @@ def _get_provider(stt_config: dict) -> str:
         if _HAS_FASTER_WHISPER:
             logger.info("OpenAI STT key not set, falling back to local faster-whisper")
             return "local"
-        if _has_local_command():
-            logger.info("OpenAI STT key not set, falling back to local STT command")
-            return "local_command"
         if _HAS_OPENAI and os.getenv("GROQ_API_KEY"):
             logger.info("OpenAI STT key not set, falling back to Groq Whisper API")
             return "groq"
+        if _has_local_command():
+            logger.info("OpenAI STT key not set, falling back to local STT command")
+            return "local_command"
         return "none"
 
     return provider  # Unknown — let it fail downstream

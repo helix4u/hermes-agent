@@ -75,9 +75,6 @@ This ledger tracks private integration work by **code comparison and runtime val
 
 ### PRI-005 - Discord terminal switching + embed response behavior
 - Status: `done`
-- Current code compare signal:
-- `gateway/platforms/discord.py` is heavily divergent vs personal repo (`813 insertions, 1343 deletions` in no-index compare).
-- `cli.py` is heavily divergent vs personal repo (`995 insertions, 4061 deletions` in no-index compare).
 - Integrated slices:
 - `gateway/platforms/discord.py` now sends regular assistant responses as chained embeds (instead of plain message content), with bounded chunk size, retry pacing, and system-message reply fallback.
 - `gateway/platforms/discord.py` `edit_message()` now edits embed descriptions to match embed-based send behavior.
@@ -355,6 +352,67 @@ This ledger tracks private integration work by **code comparison and runtime val
 - `C:\Users\btgil\.hermes\config.yaml`
 - Validation:
 - `python -m py_compile tools/transcription_tools.py` passed.
+
+### PRI-020 - Browser tool Windows execution parity (`agent-browser`/`npx` launch path)
+- Status: `done`
+- Integrated slices:
+- Hardened browser launcher resolution in `tools/browser_tool.py` for Windows:
+- `_find_agent_browser()` now returns command-part lists (not split-sensitive strings).
+- Added local `node_modules/.bin/agent-browser.cmd` detection.
+- `npx` fallback now uses absolute path from `shutil.which("npx")` (`npx.CMD` on Windows) plus `"agent-browser"` arg.
+- Hardened PATH augmentation in `_run_browser_command()`:
+- replaced hardcoded `:` split/join with `os.pathsep`.
+- normalized PATH dedupe to avoid duplicate/variant entries.
+- Result:
+- Eliminates Windows `[WinError 2]` failure mode seen during browser tool startup when only `npx` fallback is available.
+- File refs:
+- `tools/browser_tool.py`
+- Validation:
+- `python -m py_compile tools/browser_tool.py` passed.
+- Direct probe in repo venv confirmed resolved command executes:
+- `_find_agent_browser()` returned `['C:\\Program Files\\nodejs\\npx.CMD', 'agent-browser']`.
+- `subprocess.run(parts + ['--version'])` returned rc `0` and printed `agent-browser 0.20.13`.
+
+### PRI-021 - CI stabilization batch (deploy checkout auth + compatibility regressions)
+- Status: `done`
+- Integrated slices:
+- Fixed GitHub Pages deploy checkout auth failure:
+- Added `permissions.contents: read` in `.github/workflows/deploy-site.yml` so `actions/checkout` can fetch private repo contents.
+- Added Discord compatibility guardrails for lightweight test stubs:
+- Listen button style now falls back to `ButtonStyle.primary` when `secondary` is unavailable.
+- `discord.ui.View` init in button views now tolerates stubbed `object` base classes.
+- Cron slash-command group registration now gracefully skips `app_commands.Group` when unavailable in mocks.
+- Hardened gateway shutdown behavior for partially initialized runners (common in unit tests):
+- `GatewayRunner.stop()` now uses `getattr(...)` guards for browser-bridge state.
+- `_stop_wiki_host()` now uses `getattr(...)` guards for wiki host attributes.
+- Reduced tool-progress startup noise and restored topic test compatibility:
+- progress sender no longer emits heartbeat-only messages before first real progress update.
+- Restored backward-compatible tool-budget guidance defaults:
+- `_append_tool_budget_guidance()` now defaults to `auto` mode and only injects guidance when a soft cap is explicitly configured (or forced by env).
+- Refined STT provider fallback compatibility:
+- OpenAI fallback order restored to `local -> groq -> local_command -> none` when OpenAI key is unavailable.
+- Added optional strict provider pin (`stt.strict_provider` / `HERMES_STT_STRICT_PROVIDER`) to preserve explicit-pin behavior when desired.
+- Updated targeted tests for intentional behavior changes (embed/progress/STT-env resilience):
+- `tests/gateway/test_discord_send.py`
+- `tests/gateway/test_run_progress_topics.py`
+- `tests/gateway/test_voice_command.py`
+- `tests/tools/test_transcription.py`
+- `tests/tools/test_transcription_tools.py`
+- File refs:
+- `.github/workflows/deploy-site.yml`
+- `gateway/platforms/discord.py`
+- `gateway/run.py`
+- `run_agent.py`
+- `tools/transcription_tools.py`
+- `tests/gateway/test_discord_send.py`
+- `tests/gateway/test_run_progress_topics.py`
+- `tests/gateway/test_voice_command.py`
+- `tests/tools/test_transcription.py`
+- `tests/tools/test_transcription_tools.py`
+- Validation:
+- `python -m py_compile gateway/platforms/discord.py gateway/run.py run_agent.py tools/transcription_tools.py tools/browser_tool.py` passed.
+- Targeted regression suite passed:
+- `11 passed, 294 deselected` across previously failing CI slices.
 
 ## Merge Safety Rules
 - Keep upstream `main` behavior as baseline.

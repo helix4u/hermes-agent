@@ -69,7 +69,14 @@ from agent.auxiliary_client import call_llm
 logger = logging.getLogger(__name__)
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services)
-_SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_SANE_PATH_DIRS = (
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+)
 
 # Throttle screenshot cleanup to avoid repeated full directory scans.
 _last_screenshot_cleanup_by_dir: dict[str, float] = {}
@@ -717,14 +724,14 @@ def _get_browserbase_config() -> Dict[str, str]:
     }
 
 
-def _find_agent_browser() -> str:
+def _find_agent_browser() -> List[str]:
     """
     Find the agent-browser CLI executable.
     
     Checks in order: PATH, local node_modules/.bin/, npx fallback.
     
     Returns:
-        Path to agent-browser executable
+        Base command parts for invoking agent-browser
         
     Raises:
         FileNotFoundError: If agent-browser is not installed
@@ -733,18 +740,21 @@ def _find_agent_browser() -> str:
     # Check if it's in PATH (global install)
     which_result = shutil.which("agent-browser")
     if which_result:
-        return which_result
+        return [which_result]
     
     # Check local node_modules/.bin/ (npm install in repo root)
     repo_root = Path(__file__).parent.parent
     local_bin = repo_root / "node_modules" / ".bin" / "agent-browser"
+    local_bin_cmd = repo_root / "node_modules" / ".bin" / "agent-browser.cmd"
     if local_bin.exists():
-        return str(local_bin)
+        return [str(local_bin)]
+    if local_bin_cmd.exists():
+        return [str(local_bin_cmd)]
     
     # Check common npx locations
     npx_path = shutil.which("npx")
     if npx_path:
-        return "npx agent-browser"
+        return [npx_path, "agent-browser"]
     
     raise FileNotFoundError(
         "agent-browser CLI not found. Install it with: npm install -g agent-browser\n"
@@ -796,7 +806,7 @@ def _run_browser_command(
     
     # Build the command
     try:
-        browser_cmd = _find_agent_browser()
+        browser_cmd_parts = _find_agent_browser()
     except FileNotFoundError as e:
         logger.warning("agent-browser CLI not found: %s", e)
         return {"success": False, "error": str(e)}
@@ -825,7 +835,7 @@ def _run_browser_command(
         # Local mode — launch a headless Chromium instance
         backend_args = ["--session", session_info["session_name"]]
 
-    cmd_parts = browser_cmd.split() + backend_args + [
+    cmd_parts = browser_cmd_parts + backend_args + [
         "--json",
         command
     ] + args
@@ -849,14 +859,17 @@ def _run_browser_command(
         hermes_node_bin = str(hermes_home / "node" / "bin")
 
         existing_path = browser_env.get("PATH", "")
-        path_parts = [p for p in existing_path.split(":") if p]
-        candidate_dirs = [hermes_node_bin] + [p for p in _SANE_PATH.split(":") if p]
+        path_parts = [p for p in existing_path.split(os.pathsep) if p]
+        seen_parts = {os.path.normcase(os.path.normpath(p)) for p in path_parts}
+        candidate_dirs = [hermes_node_bin] + list(_SANE_PATH_DIRS)
 
         for part in reversed(candidate_dirs):
-            if os.path.isdir(part) and part not in path_parts:
+            normalized = os.path.normcase(os.path.normpath(part))
+            if os.path.isdir(part) and normalized not in seen_parts:
                 path_parts.insert(0, part)
+                seen_parts.add(normalized)
 
-        browser_env["PATH"] = ":".join(path_parts)
+        browser_env["PATH"] = os.pathsep.join(path_parts)
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
         
         result = subprocess.run(

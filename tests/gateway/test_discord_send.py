@@ -52,8 +52,15 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
     sent_msg = SimpleNamespace(id=1234)
     send_calls = []
 
-    async def fake_send(*, content, reference=None):
-        send_calls.append({"content": content, "reference": reference})
+    async def fake_send(*, content=None, embed=None, reference=None, view=None):
+        send_calls.append(
+            {
+                "content": content,
+                "embed": embed,
+                "reference": reference,
+                "view": view,
+            }
+        )
         if len(send_calls) == 1:
             raise RuntimeError(
                 "400 Bad Request (error code: 50035): Invalid Form Body\n"

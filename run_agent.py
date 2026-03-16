@@ -4348,8 +4348,8 @@ class AIAgent:
         if not api_messages:
             return api_messages
 
-        enabled = os.getenv("HERMES_TOOL_BUDGET_GUIDANCE", "true").strip().lower()
-        if enabled not in {"1", "true", "yes", "on"}:
+        enabled = os.getenv("HERMES_TOOL_BUDGET_GUIDANCE", "auto").strip().lower()
+        if enabled in {"0", "false", "no", "off"}:
             return api_messages
 
         max_tool_calls = self.max_tool_calls_per_run
@@ -4364,6 +4364,10 @@ class AIAgent:
             except (TypeError, ValueError):
                 max_tool_calls = 0
             if max_tool_calls <= 0:
+                # Backward compatible default: do not inject budget guidance unless
+                # a soft cap is explicitly configured for this run.
+                if enabled == "auto":
+                    return api_messages
                 max_tool_calls = max(self.max_iterations * 4, 8)
 
         used_tool_calls = int(getattr(self, "_tool_calls_executed_total", 0))
