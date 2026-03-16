@@ -365,7 +365,10 @@ This ledger tracks private integration work by **code comparison and runtime val
 - Set local `main` upstream to `helix4u/main`.
 - Set default push remote to `helix4u` (`remote.pushDefault=helix4u`).
 - Current state note:
-- `main` is currently diverged from `helix4u/main` (`ahead 1360, behind 91`) before any reconciliation.
+- `main` handoff finalized and pushed to `helix4u/main`.
+- Baseline commits pushed:
+- `dfb3b0fe` - checkpoint snapshot of current integration/Windows merge state
+- `b089ef03` - cleanup commit removing accidental generated `build/` artifacts
 - Validation:
 - Verified upstream ref resolves to `helix4u/main`.
 - Verified backup branch exists and points to pre-handoff commit.
