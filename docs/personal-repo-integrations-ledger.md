@@ -572,6 +572,73 @@ This ledger tracks private integration work by **code comparison and runtime val
 - `python -m py_compile tools/environments/local.py tests/tools/test_local_windows_shell_dispatch.py` passed.
 - `pytest -q -o addopts='' tests/tools/test_local_windows_shell_dispatch.py` passed (`2 passed`).
 
+### PRI-030 - Windows live-CDP browser bridge stabilization + latency guardrails
+- Status: `done`
+- Integrated slices:
+- Hardened Windows CDP command construction in `tools/browser_tool.py`:
+- when `cdp_url` is active on Windows, invoke `agent-browser` with `--session <session_name> --cdp <url>` for startup stability.
+- added Windows+CDP compatibility mode that skips `AGENT_BROWSER_SOCKET_DIR` env injection (uses default agent-browser socket dir).
+- Extended bind-10013 recovery behavior:
+- retains stream-port retries plus stale-daemon cleanup (`pid` kill + `taskkill` image fallback).
+- Retry responsiveness improvements:
+- bind-recovery retries now use capped short timeout (`min(timeout, 10)`).
+- `browser_navigate()` timeout reduced from 60s to 30s to avoid long perceived hangs.
+- Added regression tests:
+- `tests/tools/test_browser_windows_stream_port.py`
+- `test_windows_cdp_mode_includes_session_arg_for_stability`
+- `test_windows_cdp_mode_skips_custom_socket_dir_env`
+- File refs:
+- `tools/browser_tool.py`
+- `tests/tools/test_browser_windows_stream_port.py`
+- Validation:
+- `python -m py_compile tools/browser_tool.py tests/tools/test_browser_windows_stream_port.py` passed.
+- `pytest -q -o addopts='' tests/tools/test_browser_windows_stream_port.py` passed (`5 passed`).
+
+### PRI-031 - Shutdown cleanup resilience (interrupt-safe browser/session teardown)
+- Status: `done`
+- Integrated slices:
+- Hardened shutdown cleanup exception boundaries:
+- `cli.py` `_run_cleanup()` now catches `BaseException` across terminal/browser/MCP cleanup steps.
+- Browser cleanup path now handles interrupt conditions without traceback spam:
+- `tools/browser_tool.py` `_emergency_cleanup_all_sessions()` catches `BaseException`.
+- `cleanup_browser()` now catches `BaseException` around `close` command and uses shorter close timeout (`4s`) for faster exit.
+- Added regression test:
+- `tests/tools/test_browser_windows_stream_port.py`
+- `test_cleanup_browser_handles_keyboard_interrupt_during_close`
+- File refs:
+- `cli.py`
+- `tools/browser_tool.py`
+- `tests/tools/test_browser_windows_stream_port.py`
+- Validation:
+- `python -m py_compile tools/browser_tool.py cli.py tests/tools/test_browser_windows_stream_port.py` passed.
+- `pytest -q -o addopts='' tests/tools/test_browser_windows_stream_port.py` passed (`6 passed`).
+
+### PRI-032 - Deterministic terminal runtime imports + Windows browser command unstick
+- Status: `done`
+- Integrated slices:
+- Added project-root precedence guards:
+- `cli.py` and `run_agent.py` now force their own project root to `sys.path[0]` before local imports to prevent cwd shadowing by sibling modules.
+- Hardened browser CDP argument handling:
+- `tools/browser_tool.py` adds `_normalize_agent_browser_cdp_arg()` to convert localhost ws/wss CDP URLs to plain port for agent-browser invocation.
+- Replaced Windows browser subprocess pipe capture:
+- new `_run_agent_browser_subprocess()` uses file-based stdout/stderr capture on Windows, avoiding hangs caused by inherited pipe handles from daemon descendants.
+- Integrated into `_run_browser_command()` for primary and retry paths.
+- Updated regression suite:
+- `tests/tools/test_browser_windows_stream_port.py` now mocks `_run_agent_browser_subprocess`.
+- added CDP normalization tests for localhost and remote endpoints.
+- Environment cleanup executed to remove import-shadow collisions from `C:\Users\btgil\.hermes` root:
+- moved conflicting paths to `C:\Users\btgil\.hermes\_shadow_backup_20260316_172529`.
+- File refs:
+- `cli.py`
+- `run_agent.py`
+- `tools/browser_tool.py`
+- `tests/tools/test_browser_windows_stream_port.py`
+- Validation:
+- `python -m py_compile tools/browser_tool.py tests/tools/test_browser_windows_stream_port.py run_agent.py cli.py` passed.
+- `pytest -q -o addopts='' tests/tools/test_browser_windows_stream_port.py` passed (`8 passed`).
+- Live uv-tool runtime probe from `C:\Users\btgil\.hermes`:
+- `_run_browser_command(... open https://github.com ...)` returned success in ~`1.16s`.
+
 ## Merge Safety Rules
 - Keep upstream `main` behavior as baseline.
 - Port integrations in small slices with compile/smoke validation per slice.

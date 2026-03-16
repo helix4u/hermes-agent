@@ -35,14 +35,14 @@ def test_windows_sets_stream_port_zero_when_missing():
 
     observed_envs = []
 
-    def _fake_run(cmd_parts, capture_output, text, timeout, env):
+    def _fake_run(*, cmd_parts, timeout, env):
         observed_envs.append(dict(env))
         return _success_result()
 
     with (
         patch("tools.browser_tool._find_agent_browser", return_value=["agent-browser"]),
         patch("tools.browser_tool._get_session_info", return_value={"session_name": "win_sess"}),
-        patch("tools.browser_tool.subprocess.run", side_effect=_fake_run),
+        patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
         patch("tools.browser_tool.os.name", "nt"),
         patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
         patch.dict(
@@ -84,7 +84,7 @@ def test_windows_retries_bind_10013_with_safe_stream_port():
 
     observed_envs = []
 
-    def _fake_run(cmd_parts, capture_output, text, timeout, env):
+    def _fake_run(*, cmd_parts, timeout, env):
         observed_envs.append(dict(env))
         if len(observed_envs) == 1:
             return bind_failure
@@ -93,7 +93,7 @@ def test_windows_retries_bind_10013_with_safe_stream_port():
     with (
         patch("tools.browser_tool._find_agent_browser", return_value=["agent-browser"]),
         patch("tools.browser_tool._get_session_info", return_value={"session_name": "win_retry"}),
-        patch("tools.browser_tool.subprocess.run", side_effect=_fake_run),
+        patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
         patch("tools.browser_tool.os.name", "nt"),
         patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
         patch.dict(
@@ -112,3 +112,163 @@ def test_windows_retries_bind_10013_with_safe_stream_port():
     assert len(observed_envs) == 2
     assert observed_envs[0].get("AGENT_BROWSER_STREAM_PORT") == "9223"
     assert observed_envs[1].get("AGENT_BROWSER_STREAM_PORT") == "0"
+
+
+def test_windows_retries_after_stale_daemon_cleanup_when_bind_persists():
+    from tools import browser_tool
+
+    bind_failure = subprocess.CompletedProcess(
+        args=["agent-browser"],
+        returncode=1,
+        stdout=json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "Daemon process exited during startup:\n"
+                    "Daemon error: Failed to bind TCP: "
+                    "An attempt was made to access a socket in a way forbidden "
+                    "by its access permissions. (os error 10013)"
+                ),
+            }
+        ),
+        stderr="",
+    )
+    success = _success_result()
+
+    observed_envs = []
+
+    def _fake_run(*, cmd_parts, timeout, env):
+        observed_envs.append(dict(env))
+        if len(observed_envs) < 3:
+            return bind_failure
+        return success
+
+    with (
+        patch("tools.browser_tool._find_agent_browser", return_value=["agent-browser"]),
+        patch("tools.browser_tool._get_session_info", return_value={"session_name": "win_retry_cleanup"}),
+        patch("tools.browser_tool._kill_daemon_pid_from_socket_dir", return_value=True) as kill_pid,
+        patch("tools.browser_tool._kill_windows_agent_browser_processes", return_value=1) as kill_taskkill,
+        patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
+        patch("tools.browser_tool.os.name", "nt"),
+        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch.dict(
+            "tools.browser_tool.os.environ",
+            {
+                "PATH": "C:\\Windows\\System32",
+                "HERMES_HOME": "C:\\Users\\btgil\\.hermes",
+                "AGENT_BROWSER_STREAM_PORT": "9223",
+            },
+            clear=True,
+        ),
+    ):
+        result = browser_tool._run_browser_command("task-3", "open", ["https://example.com"])
+
+    assert result.get("success") is True
+    assert len(observed_envs) == 3
+    assert observed_envs[0].get("AGENT_BROWSER_STREAM_PORT") == "9223"
+    assert observed_envs[1].get("AGENT_BROWSER_STREAM_PORT") == "0"
+    assert observed_envs[2].get("AGENT_BROWSER_STREAM_PORT") not in ("", "0", None)
+    kill_pid.assert_called_once()
+    kill_taskkill.assert_called_once()
+
+
+def test_windows_cdp_mode_includes_session_arg_for_stability():
+    from tools import browser_tool
+
+    observed_cmds = []
+
+    def _fake_run(*, cmd_parts, timeout, env):
+        observed_cmds.append(list(cmd_parts))
+        return _success_result()
+
+    with (
+        patch("tools.browser_tool._find_agent_browser", return_value=["agent-browser"]),
+        patch(
+            "tools.browser_tool._get_session_info",
+            return_value={"session_name": "cdp_win_sess", "cdp_url": "ws://localhost:9222"},
+        ),
+        patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
+        patch("tools.browser_tool.os.name", "nt"),
+        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch.dict(
+            "tools.browser_tool.os.environ",
+            {
+                "PATH": "C:\\Windows\\System32",
+                "HERMES_HOME": "C:\\Users\\btgil\\.hermes",
+            },
+            clear=True,
+        ),
+    ):
+        result = browser_tool._run_browser_command("task-cdp", "open", ["https://example.com"])
+
+    assert result.get("success") is True
+    assert observed_cmds
+    cmd = observed_cmds[0]
+    assert "--session" in cmd
+    assert "cdp_win_sess" in cmd
+    assert "--cdp" in cmd
+    assert "9222" in cmd
+
+
+def test_cdp_arg_normalization_localhost_ws_url_to_port():
+    from tools import browser_tool
+
+    assert browser_tool._normalize_agent_browser_cdp_arg("ws://localhost:9222") == "9222"
+    assert browser_tool._normalize_agent_browser_cdp_arg("ws://127.0.0.1:9222/devtools/browser/abc") == "9222"
+
+
+def test_cdp_arg_normalization_keeps_non_localhost_url():
+    from tools import browser_tool
+
+    remote = "wss://connect.browserbase.com/devtools/browser/abc"
+    assert browser_tool._normalize_agent_browser_cdp_arg(remote) == remote
+
+
+def test_windows_cdp_mode_skips_custom_socket_dir_env():
+    from tools import browser_tool
+
+    observed_envs = []
+
+    def _fake_run(*, cmd_parts, timeout, env):
+        observed_envs.append(dict(env))
+        return _success_result()
+
+    with (
+        patch("tools.browser_tool._find_agent_browser", return_value=["agent-browser"]),
+        patch(
+            "tools.browser_tool._get_session_info",
+            return_value={"session_name": "cdp_win_env", "cdp_url": "ws://localhost:9222"},
+        ),
+        patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
+        patch("tools.browser_tool.os.name", "nt"),
+        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch.dict(
+            "tools.browser_tool.os.environ",
+            {
+                "PATH": "C:\\Windows\\System32",
+                "HERMES_HOME": "C:\\Users\\btgil\\.hermes",
+            },
+            clear=True,
+        ),
+    ):
+        result = browser_tool._run_browser_command("task-cdp-env", "open", ["https://example.com"])
+
+    assert result.get("success") is True
+    assert observed_envs
+    assert "AGENT_BROWSER_SOCKET_DIR" not in observed_envs[0]
+
+
+def test_cleanup_browser_handles_keyboard_interrupt_during_close():
+    from tools import browser_tool
+
+    with (
+        patch.dict(browser_tool._active_sessions, {"task-kbi": {"session_name": "sess_kbi"}}, clear=True),
+        patch.dict(browser_tool._session_last_activity, {"task-kbi": 123.0}, clear=True),
+        patch("tools.browser_tool._maybe_stop_recording"),
+        patch("tools.browser_tool._run_browser_command", side_effect=KeyboardInterrupt),
+        patch("tools.browser_tool._is_local_mode", return_value=True),
+        patch("tools.browser_tool.os.path.exists", return_value=False),
+    ):
+        browser_tool.cleanup_browser("task-kbi")
+
+    assert "task-kbi" not in browser_tool._active_sessions

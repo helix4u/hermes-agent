@@ -30,6 +30,33 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _ensure_project_root_precedence() -> None:
+    """Put this project root first on sys.path to avoid cwd shadowing.
+
+    On Windows, launching `hermes` from `C:\\Users\\...\\.hermes` can expose an
+    unrelated sibling `tools/` package ahead of the editable repo modules,
+    causing imports like `from tools.browser_tool import ...` to resolve to the
+    wrong code. Force this file's directory to index 0 before local imports.
+    """
+    project_root = Path(__file__).resolve().parent
+    target = os.path.normcase(os.path.normpath(str(project_root)))
+    cleaned = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        try:
+            norm = os.path.normcase(os.path.normpath(entry))
+        except Exception:
+            norm = entry
+        if norm == target:
+            continue
+        cleaned.append(entry)
+    sys.path[:] = [str(project_root), *cleaned]
+
+
+_ensure_project_root_precedence()
+
 # Suppress startup messages for clean CLI experience
 os.environ["MSWEA_SILENT_STARTUP"] = "1"  # mini-swe-agent
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -486,16 +513,16 @@ def _run_cleanup():
     _cleanup_done = True
     try:
         _cleanup_all_terminals()
-    except Exception:
+    except BaseException:
         pass
     try:
         _cleanup_all_browsers()
-    except Exception:
+    except BaseException:
         pass
     try:
         from tools.mcp_tool import shutdown_mcp_servers
         shutdown_mcp_servers()
-    except Exception:
+    except BaseException:
         pass
 
 

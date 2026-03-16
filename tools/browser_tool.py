@@ -65,6 +65,7 @@ import time
 import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
+from urllib.parse import urlparse
 from agent.auxiliary_client import call_llm
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,31 @@ def _get_cdp_override() -> str:
     the supplied Chrome DevTools Protocol endpoint.
     """
     return os.environ.get("BROWSER_CDP_URL", "").strip()
+
+
+def _normalize_agent_browser_cdp_arg(cdp_url: str) -> str:
+    """Normalize CDP argument for agent-browser CLI compatibility.
+
+    agent-browser is most reliable on Windows when localhost CDP targets are
+    passed as a bare port (e.g., "9222") instead of "ws://localhost:9222".
+    Keep non-localhost endpoints untouched (Browserbase/cloud URLs).
+    """
+    raw = (cdp_url or "").strip()
+    if not raw:
+        return raw
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return raw
+
+    if (
+        parsed.scheme in ("ws", "wss")
+        and parsed.hostname in ("localhost", "127.0.0.1")
+        and parsed.port
+    ):
+        return str(parsed.port)
+
+    return raw
 
 
 def _is_local_mode() -> bool:
@@ -191,8 +217,8 @@ def _emergency_cleanup_all_sessions():
 
     try:
         cleanup_all_browsers()
-    except Exception as e:
-        logger.error("Emergency cleanup error: %s", e)
+    except BaseException as e:
+        logger.debug("Emergency cleanup interrupted: %s", e)
     finally:
         with _cleanup_lock:
             _active_sessions.clear()
@@ -804,6 +830,110 @@ def _allocate_free_tcp_port() -> str:
         return str(sock.getsockname()[1])
 
 
+def _kill_daemon_pid_from_socket_dir(session_name: str, socket_dir: str) -> bool:
+    """Best-effort kill of an agent-browser daemon using its pid file."""
+    pid_file = os.path.join(socket_dir, f"{session_name}.pid")
+    if not os.path.isfile(pid_file):
+        return False
+
+    try:
+        daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+
+    try:
+        os.kill(daemon_pid, signal.SIGTERM)
+        logger.warning("Killed stale agent-browser daemon pid=%s session=%s", daemon_pid, session_name)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def _kill_windows_agent_browser_processes() -> int:
+    """Best-effort termination of stale Windows agent-browser daemon executables."""
+    if os.name != "nt":
+        return 0
+
+    killed = 0
+    for image_name in ("agent-browser-win32-x64.exe", "agent-browser.exe"):
+        try:
+            result = subprocess.run(
+                ["taskkill", "/F", "/T", "/IM", image_name],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            if result.returncode == 0:
+                killed += 1
+                logger.warning("Terminated stale Windows browser daemon image=%s", image_name)
+        except Exception as exc:
+            logger.debug("taskkill failed for image=%s: %s", image_name, exc)
+    return killed
+
+
+def _run_agent_browser_subprocess(
+    cmd_parts: List[str],
+    timeout: int,
+    env: Dict[str, str],
+) -> subprocess.CompletedProcess:
+    """Run agent-browser with robust output capture on Windows.
+
+    On Windows, capture_output pipes can stall if daemon descendants inherit
+    stdout/stderr handles. File-based capture avoids pipe EOF deadlocks while
+    preserving command output for parsing.
+    """
+    if os.name != "nt":
+        return subprocess.run(
+            cmd_parts,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+
+    out_fd, out_path = tempfile.mkstemp(prefix="hermes-browser-out-", suffix=".log")
+    err_fd, err_path = tempfile.mkstemp(prefix="hermes-browser-err-", suffix=".log")
+    os.close(out_fd)
+    os.close(err_fd)
+    try:
+        try:
+            with open(out_path, "w", encoding="utf-8", errors="replace") as out_file, open(
+                err_path, "w", encoding="utf-8", errors="replace"
+            ) as err_file:
+                base = subprocess.run(
+                    cmd_parts,
+                    stdout=out_file,
+                    stderr=err_file,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                )
+        except subprocess.TimeoutExpired as exc:
+            partial_out = Path(out_path).read_text(encoding="utf-8", errors="replace")
+            partial_err = Path(err_path).read_text(encoding="utf-8", errors="replace")
+            raise subprocess.TimeoutExpired(
+                cmd=exc.cmd,
+                timeout=exc.timeout,
+                output=partial_out,
+                stderr=partial_err,
+            ) from exc
+
+        stdout_text = Path(out_path).read_text(encoding="utf-8", errors="replace")
+        stderr_text = Path(err_path).read_text(encoding="utf-8", errors="replace")
+        return subprocess.CompletedProcess(
+            args=cmd_parts,
+            returncode=base.returncode,
+            stdout=stdout_text,
+            stderr=stderr_text,
+        )
+    finally:
+        for tmp_path in (out_path, err_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -843,14 +973,21 @@ def _run_browser_command(
         return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
     
     # Build the command with the appropriate backend flag.
-    # Cloud mode: --cdp <websocket_url> connects to Browserbase.
+    # Cloud/live-CDP mode: --cdp <endpoint> connects to an existing browser.
     # Local mode: --session <name> launches a local headless Chromium.
     # The rest of the command (--json, command, args) is identical.
     if session_info.get("cdp_url"):
-        # Cloud mode — connect to remote Browserbase browser via CDP
-        # IMPORTANT: Do NOT use --session with --cdp. In agent-browser >=0.13,
-        # --session creates a local browser instance and silently ignores --cdp.
-        backend_args = ["--cdp", session_info["cdp_url"]]
+        # CDP mode — connect to Browserbase/live Chrome via CDP.
+        cdp_target = _normalize_agent_browser_cdp_arg(session_info["cdp_url"])
+        #
+        # Windows-specific workaround:
+        # With agent-browser 0.20.x, "--cdp" alone can fail daemon startup with
+        # "Failed to bind TCP ... (os error 10013)". Including a deterministic
+        # session name stabilizes daemon startup while preserving CDP connectivity.
+        if os.name == "nt":
+            backend_args = ["--session", session_info["session_name"], "--cdp", cdp_target]
+        else:
+            backend_args = ["--cdp", cdp_target]
     else:
         # Local mode — launch a headless Chromium instance
         backend_args = ["--session", session_info["session_name"]]
@@ -862,15 +999,28 @@ def _run_browser_command(
     
     try:
         # Give each task its own socket directory to prevent concurrency conflicts.
-        # Without this, parallel workers fight over the same default socket path,
-        # causing "Failed to create socket directory: Permission denied" errors.
+        # Without this, parallel workers can fight over the same default socket path.
+        #
+        # Windows + CDP compatibility:
+        # agent-browser 0.20.x can fail with stream bind 10013 when
+        # AGENT_BROWSER_SOCKET_DIR is overridden while connected via --cdp.
+        # In that mode we let agent-browser choose its default socket dir.
+        use_custom_socket_dir = not (os.name == "nt" and session_info.get("cdp_url"))
         task_socket_dir = os.path.join(
             _socket_safe_tmpdir(),
             f"agent-browser-{session_info['session_name']}"
         )
-        os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
-        logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
-                     command, task_id, task_socket_dir, len(task_socket_dir))
+        if use_custom_socket_dir:
+            os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
+            logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
+                         command, task_id, task_socket_dir, len(task_socket_dir))
+        else:
+            logger.debug(
+                "browser cmd=%s task=%s using agent-browser default socket dir "
+                "(Windows CDP compatibility mode)",
+                command,
+                task_id,
+            )
         
         browser_env = {**os.environ}
 
@@ -890,7 +1040,8 @@ def _run_browser_command(
                 seen_parts.add(normalized)
 
         browser_env["PATH"] = os.pathsep.join(path_parts)
-        browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
+        if use_custom_socket_dir:
+            browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
 
         # Windows workaround: agent-browser daemon TCP stream bind can fail with
         # WinError 10013 under default port selection on some hosts.
@@ -898,13 +1049,13 @@ def _run_browser_command(
         if os.name == "nt" and not browser_env.get("AGENT_BROWSER_STREAM_PORT"):
             browser_env["AGENT_BROWSER_STREAM_PORT"] = "0"
         
-        result = subprocess.run(
-            cmd_parts,
-            capture_output=True,
-            text=True,
+        result = _run_agent_browser_subprocess(
+            cmd_parts=cmd_parts,
             timeout=timeout,
             env=browser_env,
         )
+
+        retry_timeout = min(timeout, 10)
 
         if os.name == "nt" and _is_agent_browser_bind_10013_error(result.stderr, result.stdout):
             retry_env = {**browser_env}
@@ -918,12 +1069,40 @@ def _run_browser_command(
                 command,
                 retry_env["AGENT_BROWSER_STREAM_PORT"],
             )
-            result = subprocess.run(
-                cmd_parts,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+            result = _run_agent_browser_subprocess(
+                cmd_parts=cmd_parts,
+                timeout=retry_timeout,
                 env=retry_env,
+            )
+
+        if os.name == "nt" and _is_agent_browser_bind_10013_error(result.stderr, result.stdout):
+            killed_from_pid = False
+            if use_custom_socket_dir:
+                killed_from_pid = _kill_daemon_pid_from_socket_dir(
+                    session_info["session_name"],
+                    task_socket_dir,
+                )
+            killed_from_taskkill = _kill_windows_agent_browser_processes()
+            if use_custom_socket_dir:
+                shutil.rmtree(task_socket_dir, ignore_errors=True)
+                os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
+
+            recovery_env = {**browser_env}
+            if use_custom_socket_dir:
+                recovery_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
+            recovery_env["AGENT_BROWSER_STREAM_PORT"] = _allocate_free_tcp_port()
+            logger.warning(
+                "browser '%s' still hit bind 10013; retrying after stale-daemon cleanup "
+                "(pid_file_killed=%s, taskkill_images=%d) with AGENT_BROWSER_STREAM_PORT=%s",
+                command,
+                killed_from_pid,
+                killed_from_taskkill,
+                recovery_env["AGENT_BROWSER_STREAM_PORT"],
+            )
+            result = _run_agent_browser_subprocess(
+                cmd_parts=cmd_parts,
+                timeout=retry_timeout,
+                env=recovery_env,
             )
         
         # Log stderr for diagnostics — use warning level on failure so it's visible
@@ -990,8 +1169,9 @@ def _run_browser_command(
         return {"success": True, "data": {}}
         
     except subprocess.TimeoutExpired:
+        socket_label = task_socket_dir or "<default>"
         logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
-                       command, timeout, task_id, task_socket_dir)
+                       command, timeout, task_id, socket_label)
         return {"success": False, "error": f"Command timed out after {timeout} seconds"}
     except Exception as e:
         logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
@@ -1089,7 +1269,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         session_info["_first_nav"] = False
         _maybe_start_recording(effective_task_id)
     
-    result = _run_browser_command(effective_task_id, "open", [url], timeout=60)
+    # Keep navigation responsive; Windows CDP retries have their own short caps.
+    result = _run_browser_command(effective_task_id, "open", [url], timeout=30)
     
     if result.get("success"):
         data = result.get("data", {})
@@ -1770,10 +1951,10 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         
         # Try to close via agent-browser first (needs session in _active_sessions)
         try:
-            _run_browser_command(task_id, "close", [], timeout=10)
+            _run_browser_command(task_id, "close", [], timeout=4)
             logger.debug("agent-browser close command completed for task %s", task_id)
-        except Exception as e:
-            logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+        except BaseException as e:
+            logger.debug("agent-browser close interrupted for task %s: %s", task_id, e)
         
         # Now remove from tracking under lock
         with _cleanup_lock:

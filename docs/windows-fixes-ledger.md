@@ -441,6 +441,78 @@ Scope: `hermes-agent` Windows install/startup/runtime reliability fixes validate
 - `python -m py_compile tools/environments/local.py tests/tools/test_local_windows_shell_dispatch.py` passed.
 - `pytest -q -o addopts='' tests/tools/test_local_windows_shell_dispatch.py` -> `2 passed`.
 
+### WF-024 - Windows live-CDP browser stability + faster bind-failure turnaround
+- Status: `done`
+- Problem:
+- `/browser connect` could succeed, but follow-up `browser_navigate` in Windows live-CDP mode still failed with daemon bind `10013`, and retries could feel stalled for too long.
+- Root findings:
+- `agent-browser --cdp 9222` reproduced bind `10013` on host.
+- `agent-browser --session <name> --cdp 9222` succeeded on host.
+- In Windows CDP mode, setting `AGENT_BROWSER_SOCKET_DIR` reproduced the bind failure; omitting it avoided the failure mode.
+- Code evidence:
+- `tools/browser_tool.py`:
+- Windows CDP mode now includes explicit `--session <session_name>` alongside `--cdp <url>` for daemon startup stability.
+- Windows CDP mode now skips `AGENT_BROWSER_SOCKET_DIR` override (uses agent-browser default socket dir).
+- Existing bind-10013 recovery path retained and expanded (pid-file kill + taskkill fallback + retry).
+- Retry attempts in bind-recovery path now use short timeout caps (`min(timeout, 10)`) to avoid minute-plus stalls.
+- `browser_navigate()` command timeout reduced from `60s` to `30s` to keep UI responsiveness.
+- Added regression tests:
+- `tests/tools/test_browser_windows_stream_port.py`
+- new coverage for Windows CDP session-arg behavior.
+- new coverage that Windows CDP path does not set `AGENT_BROWSER_SOCKET_DIR`.
+- Validation notes:
+- `python -m py_compile tools/browser_tool.py` passed.
+- `pytest -q -o addopts='' tests/tools/test_browser_windows_stream_port.py` -> `5 passed`.
+
+### WF-025 - Graceful shutdown when browser cleanup is interrupted
+- Status: `done`
+- Problem:
+- Exiting Hermes on Windows could show a full traceback when `Ctrl+C` hit during browser cleanup, because shutdown cleanup only caught `Exception` and `KeyboardInterrupt` escaped.
+- Code evidence:
+- `tools/browser_tool.py`:
+- `_emergency_cleanup_all_sessions()` now catches `BaseException` and logs at debug level.
+- `cleanup_browser()` close path now catches `BaseException` and uses shorter close timeout (`4s`) to reduce shutdown stalls.
+- `cli.py`:
+- `_run_cleanup()` now catches `BaseException` around terminal/browser/MCP shutdown steps to avoid noisy tracebacks during forced exit.
+- Added regression test:
+- `tests/tools/test_browser_windows_stream_port.py`
+- `test_cleanup_browser_handles_keyboard_interrupt_during_close`
+- Validation notes:
+- `python -m py_compile tools/browser_tool.py cli.py tests/tools/test_browser_windows_stream_port.py` passed.
+- `pytest -q -o addopts='' tests/tools/test_browser_windows_stream_port.py` -> `6 passed`.
+
+### WF-026 - Terminal `hermes` navigation stall root-cause fix (import shadow + Windows capture deadlock)
+- Status: `done`
+- Problem:
+- `hermes` in terminal kept repeating legacy behavior and browser navigation stalled/hung despite code patches in repo.
+- Root cause:
+- Launching from `C:\Users\btgil\.hermes` allowed local shadow modules (`cli.py`, `hermes_cli/`, `tools/`, etc.) to override package imports.
+- Browser command execution on Windows used `capture_output=True`; with agent-browser daemon descendants, pipe handles could remain open and stall `subprocess.run(...).communicate(...)`.
+- Additional compatibility issue:
+- local CDP targets passed as `--cdp ws://localhost:9222` were less reliable than plain port form with current agent-browser behavior.
+- Code evidence:
+- `cli.py` + `run_agent.py`:
+- added `_ensure_project_root_precedence()` so project root is forced to `sys.path[0]` before local imports.
+- `tools/browser_tool.py`:
+- added `_normalize_agent_browser_cdp_arg()` to convert localhost ws/wss CDP URLs to bare port (e.g., `9222`) for CLI invocation.
+- replaced direct `subprocess.run(..., capture_output=True)` in browser command path with `_run_agent_browser_subprocess()`:
+- uses file-based stdout/stderr capture on Windows to avoid pipe-EOF deadlocks.
+- preserves parsed stdout/stderr behavior and timeout handling.
+- Environment cleanup performed:
+- moved conflicting shadow modules in `C:\Users\btgil\.hermes` into backup folder:
+- `C:\Users\btgil\.hermes\_shadow_backup_20260316_172529`
+- moved: `cli.py`, `agent/`, `cron/`, `gateway/`, `hermes_cli/`, `tools/`, `tests/`
+- Added regression tests:
+- `tests/tools/test_browser_windows_stream_port.py`
+- `test_cdp_arg_normalization_localhost_ws_url_to_port`
+- `test_cdp_arg_normalization_keeps_non_localhost_url`
+- updated existing browser runner tests to mock new subprocess wrapper.
+- Validation notes:
+- `python -m py_compile tools/browser_tool.py tests/tools/test_browser_windows_stream_port.py run_agent.py cli.py` passed.
+- `pytest -q -o addopts='' tests/tools/test_browser_windows_stream_port.py` -> `8 passed`.
+- Live repro check (uv tool runtime, cwd `C:\Users\btgil\.hermes`) now succeeds:
+- `_run_browser_command(... open https://github.com ...)` returned success in ~`1.16s`.
+
 ## Open Follow-ups
 - Re-run targeted pytest in your preferred Windows environment after current merge work settles to confirm no hidden cross-fixture assumptions remain.
 - Keep this ledger as source-of-truth for Windows stability fixes; append entries instead of rewriting history.

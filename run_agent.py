@@ -45,6 +45,27 @@ import fire
 from datetime import datetime
 from pathlib import Path
 
+
+def _ensure_project_root_precedence() -> None:
+    """Put this project root first on sys.path to avoid cwd shadowing."""
+    project_root = Path(__file__).resolve().parent
+    target = os.path.normcase(os.path.normpath(str(project_root)))
+    cleaned = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        try:
+            norm = os.path.normcase(os.path.normpath(entry))
+        except Exception:
+            norm = entry
+        if norm == target:
+            continue
+        cleaned.append(entry)
+    sys.path[:] = [str(project_root), *cleaned]
+
+
+_ensure_project_root_precedence()
+
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.env_loader import load_hermes_dotenv
