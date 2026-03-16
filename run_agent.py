@@ -1927,6 +1927,65 @@ class AIAgent:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
 
         return "\n\n".join(prompt_parts)
+
+    def _build_environment_hint(self) -> str:
+        """
+        Build a per-call environment hint describing the local shell/OS.
+
+        This is injected via the ephemeral system prompt so shell switching
+        (for example `HERMES_WINDOWS_SHELL=cmd` vs `powershell` vs `wsl`)
+        takes effect on the very next turn without requiring a new session.
+        """
+        # Only add explicit hints for Windows hosts; POSIX shells are usually
+        # unambiguous from command behavior.
+        if os.name != "nt":
+            return ""
+
+        from tools.environments.shell_utils import (
+            get_local_shell_mode,
+            resolve_windows_shell_override,
+        )
+
+        mode = get_local_shell_mode()
+        override = resolve_windows_shell_override()
+
+        if mode == "powershell":
+            return (
+                "Environment: You are running on a Windows host with a PowerShell local terminal "
+                f"(HERMES_WINDOWS_SHELL={override}). For commands that run in the local terminal, "
+                "use PowerShell syntax and Windows-style paths. Prefer `Get-ChildItem` over `ls`, "
+                "`Select-String` over `grep`, and `New-Item -ItemType Directory -Force` over "
+                "`mkdir -p`. Do not assume POSIX command behavior unless a tool explicitly targets "
+                "a Unix/containerized environment. "
+                "When the user gives a direct terminal action, do that action first before memory "
+                "or worldview file reads."
+            )
+        if mode == "wsl":
+            return (
+                "Environment: You are on a Windows host but the local terminal is WSL (Linux) "
+                f"(HERMES_WINDOWS_SHELL={override}). Commands run in a POSIX shell with tools like "
+                "`ls`, `grep`, and `mkdir -p` available. Use POSIX paths inside WSL (for example "
+                "`/mnt/c/Users/...`) instead of raw `C:\\` paths. "
+                "When the user gives a direct terminal action, do that action first before memory "
+                "or worldview file reads."
+            )
+        if mode == "cmd":
+            return (
+                "Environment: You are running on Windows with a cmd.exe local terminal "
+                f"(HERMES_WINDOWS_SHELL={override}). Run commands directly in cmd: use `dir`, "
+                "`type`, `cd`, `mkdir`, and `%VAR%` env-var expansion with Windows `C:\\` paths. "
+                "Do NOT use PowerShell syntax and do NOT assume POSIX commands like `pwd`, `uname`, "
+                "`ls`, or `grep`. "
+                "When the user gives a direct terminal action, do that action first before memory "
+                "or worldview file reads."
+            )
+
+        return (
+            f"Environment: You are running on Windows with local shell mode '{mode}' "
+            f"(HERMES_WINDOWS_SHELL={override}). Choose syntax for this shell and do not assume "
+            "Unix/POSIX command behavior. When the user gives a direct terminal action, do that "
+            "action first before memory or worldview file reads."
+        )
     
     def _repair_tool_call(self, tool_name: str) -> str | None:
         """Attempt to repair a mismatched tool name before aborting.
@@ -4435,8 +4494,14 @@ class AIAgent:
                 api_messages.append(api_msg)
 
             effective_system = self._cached_system_prompt or ""
+            extra_ephemeral = []
             if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+                extra_ephemeral.append(self.ephemeral_system_prompt)
+            env_hint = self._build_environment_hint()
+            if env_hint:
+                extra_ephemeral.append(env_hint)
+            if extra_ephemeral:
+                effective_system = (effective_system + "\n\n" + "\n\n".join(extra_ephemeral)).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
             if self.prefill_messages:
@@ -4871,8 +4936,14 @@ class AIAgent:
             # Honcho later-turn recall is intentionally kept OUT of the system prompt
             # so the stable cache prefix remains unchanged.
             effective_system = active_system_prompt or ""
+            extra_ephemeral = []
             if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+                extra_ephemeral.append(self.ephemeral_system_prompt)
+            env_hint = self._build_environment_hint()
+            if env_hint:
+                extra_ephemeral.append(env_hint)
+            if extra_ephemeral:
+                effective_system = (effective_system + "\n\n" + "\n\n".join(extra_ephemeral)).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
 

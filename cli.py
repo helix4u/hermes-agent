@@ -2409,7 +2409,7 @@ class HermesCLI:
         if self.agent and self.conversation_history:
             try:
                 self.agent.flush_memories(self.conversation_history)
-            except Exception:
+            except BaseException:
                 pass
 
         old_session_id = self.session_id
@@ -3545,6 +3545,7 @@ class HermesCLI:
         """
         import shutil
         import subprocess as _sp
+        import tempfile
 
         candidates = []
         if system == "Darwin":
@@ -3557,6 +3558,21 @@ class HermesCLI:
             ):
                 if os.path.isfile(app):
                     candidates.append(app)
+        elif system == "Windows":
+            # Prefer fully-qualified executable paths for reliability.
+            for app in (
+                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Microsoft", "Edge", "Application", "msedge.exe"),
+                os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Microsoft", "Edge", "Application", "msedge.exe"),
+            ):
+                if app and os.path.isfile(app):
+                    candidates.append(app)
+            for name in ("chrome", "chrome.exe", "msedge", "msedge.exe"):
+                path = shutil.which(name)
+                if path:
+                    candidates.append(path)
         else:
             # Linux: try common binary names
             for name in ("google-chrome", "google-chrome-stable", "chromium-browser",
@@ -3569,13 +3585,26 @@ class HermesCLI:
             return False
 
         chrome = candidates[0]
+        profile_dir = os.path.join(tempfile.gettempdir(), "chrome-cdp-hermes")
         try:
-            _sp.Popen(
-                [chrome, f"--remote-debugging-port={port}"],
-                stdout=_sp.DEVNULL,
-                stderr=_sp.DEVNULL,
-                start_new_session=True,  # detach from terminal
-            )
+            launch_cmd = [
+                chrome,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={profile_dir}",
+            ]
+            popen_kwargs = {
+                "stdout": _sp.DEVNULL,
+                "stderr": _sp.DEVNULL,
+            }
+            if system == "Windows":
+                flags = 0
+                flags |= getattr(_sp, "DETACHED_PROCESS", 0x00000008)
+                flags |= getattr(_sp, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                popen_kwargs["creationflags"] = flags
+            else:
+                popen_kwargs["start_new_session"] = True  # detach from terminal
+
+            _sp.Popen(launch_cmd, **popen_kwargs)
             return True
         except Exception:
             return False
@@ -3655,12 +3684,25 @@ class HermesCLI:
                     if sys_name == "Darwin":
                         chrome_cmd = 'open -a "Google Chrome" --args --remote-debugging-port=9222'
                     elif sys_name == "Windows":
-                        chrome_cmd = 'chrome.exe --remote-debugging-port=9222'
+                        chrome_cmd = (
+                            '"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" '
+                            '--remote-debugging-port=9222 --user-data-dir="%TEMP%\\chrome-cdp-hermes"'
+                        )
                     else:
                         chrome_cmd = "google-chrome --remote-debugging-port=9222"
                     print(f"     Launch Chrome manually: {chrome_cmd}")
             else:
                 print(f"   ⚠ Port {_port} is not reachable at {cdp_url}")
+
+            # Do not mark connected when localhost CDP is unreachable.
+            _is_local_cdp = "localhost" in cdp_url or "127.0.0.1" in cdp_url
+            if _is_local_cdp and not _already_open:
+                print()
+                print("⚠ Browser not connected (CDP endpoint is unreachable).")
+                print(f"   Expected endpoint: {cdp_url}")
+                print("   Start Chrome with remote debugging, then run /browser connect again.")
+                print()
+                return
 
             os.environ["BROWSER_CDP_URL"] = cdp_url
             print()
@@ -4410,7 +4452,7 @@ class HermesCLI:
             self._voice_tts_done.set()
 
     def _handle_voice_command(self, command: str):
-        """Handle /voice [on|off|tts|status] command."""
+        """Handle /voice [on|off|tts|status|install] command."""
         parts = command.strip().split(maxsplit=1)
         subcommand = parts[1].lower().strip() if len(parts) > 1 else ""
 
@@ -4422,6 +4464,8 @@ class HermesCLI:
             self._toggle_voice_tts()
         elif subcommand == "status":
             self._show_voice_status()
+        elif subcommand == "install":
+            self._install_voice_dependencies()
         elif subcommand == "":
             # Toggle
             if self._voice_mode:
@@ -4430,7 +4474,7 @@ class HermesCLI:
                 self._enable_voice_mode()
         else:
             _cprint(f"Unknown voice subcommand: {subcommand}")
-            _cprint("Usage: /voice [on|off|tts|status]")
+            _cprint("Usage: /voice [on|off|tts|status|install]")
 
     def _enable_voice_mode(self):
         """Enable voice mode after checking requirements."""
@@ -4487,6 +4531,78 @@ class HermesCLI:
         _cprint(f"  {_DIM}{_ptt_display} to start/stop recording{_RST}")
         _cprint(f"  {_DIM}/voice tts  to toggle speech output{_RST}")
         _cprint(f"  {_DIM}/voice off  to disable voice mode{_RST}")
+
+    def _install_voice_dependencies(self):
+        """Install voice-mode dependencies into the active Hermes runtime."""
+        import subprocess as _sp
+
+        py_exe = sys.executable
+        uv_path = shutil.which("uv")
+
+        _cprint(f"\n{_GOLD}Installing voice dependencies...{_RST}")
+        _cprint(f"  {_DIM}Runtime: {py_exe}{_RST}")
+
+        install_attempts = []
+        if uv_path:
+            install_attempts.append(
+                [uv_path, "pip", "install", "--python", py_exe, "sounddevice", "numpy"]
+            )
+        install_attempts.append([py_exe, "-m", "pip", "install", "sounddevice", "numpy"])
+
+        def _run_cmd(parts: list[str], timeout: int = 300) -> tuple[bool, str]:
+            try:
+                proc = _sp.run(
+                    parts,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except Exception as e:
+                return False, str(e)
+
+            combined = "\n".join(
+                p.strip() for p in (proc.stdout or "", proc.stderr or "") if p and p.strip()
+            )
+            return proc.returncode == 0, combined
+
+        last_error = ""
+        pip_missing = False
+        for cmd in install_attempts:
+            ok, output = _run_cmd(cmd)
+            if ok:
+                _cprint(f"{_GOLD}Voice dependencies installed successfully.{_RST}")
+                self._enable_voice_mode()
+                return
+
+            last_error = output or "Install command failed."
+            lowered = last_error.lower()
+            if "no module named pip" in lowered or "pip.__main__" in lowered:
+                pip_missing = True
+
+        if pip_missing:
+            _cprint(f"{_DIM}pip missing in runtime; attempting ensurepip...{_RST}")
+            ok, output = _run_cmd([py_exe, "-m", "ensurepip", "--upgrade"])
+            if ok:
+                ok2, output2 = _run_cmd(
+                    [py_exe, "-m", "pip", "install", "sounddevice", "numpy"]
+                )
+                if ok2:
+                    _cprint(f"{_GOLD}Voice dependencies installed successfully.{_RST}")
+                    self._enable_voice_mode()
+                    return
+                last_error = output2 or output or "Install failed after ensurepip."
+            else:
+                last_error = output or "ensurepip failed."
+
+        _cprint(f"{_GOLD}Voice dependency install failed.{_RST}")
+        if last_error:
+            for line in str(last_error).splitlines()[-6:]:
+                _cprint(f"  {_DIM}{line}{_RST}")
+        _cprint(f"\n  {_BOLD}Manual fallback:{_RST}")
+        if uv_path:
+            _cprint(f"  {_DIM}{uv_path} pip install --python \"{py_exe}\" sounddevice numpy{_RST}")
+        _cprint(f"  {_DIM}{py_exe} -m pip install sounddevice numpy{_RST}")
 
     def _disable_voice_mode(self):
         """Disable voice mode, cancel any active recording, and stop TTS."""
@@ -6399,7 +6515,7 @@ class HermesCLI:
             if self.agent and self.conversation_history:
                 try:
                     self.agent.flush_memories(self.conversation_history)
-                except Exception:
+                except BaseException:
                     pass
             # Shut down voice recorder (release persistent audio stream)
             if hasattr(self, '_voice_recorder') and self._voice_recorder:

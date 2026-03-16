@@ -808,6 +808,7 @@ class TestHandleVoiceCommandReal:
         cli._disable_voice_mode = MagicMock()
         cli._toggle_voice_tts = MagicMock()
         cli._show_voice_status = MagicMock()
+        cli._install_voice_dependencies = MagicMock()
         return cli
 
     @patch("cli._cprint")
@@ -833,6 +834,12 @@ class TestHandleVoiceCommandReal:
         cli = self._cli()
         cli._handle_voice_command("/voice status")
         cli._show_voice_status.assert_called_once()
+
+    @patch("cli._cprint")
+    def test_install_calls_installer(self, _cp):
+        cli = self._cli()
+        cli._handle_voice_command("/voice install")
+        cli._install_voice_dependencies.assert_called_once()
 
     @patch("cli._cprint")
     def test_toggle_off_when_enabled(self, _cp):

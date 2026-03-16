@@ -447,6 +447,131 @@ This ledger tracks private integration work by **code comparison and runtime val
 - Validation:
 - `python -m py_compile gateway/run.py gateway/browser_bridge.py hermes_cli/gateway.py` passed.
 
+### PRI-024 - CLI browser-connect Windows launch reliability + exit flush crash containment
+- Status: `done`
+- Integrated slices:
+- Hardened Windows `/browser connect` launch path in `cli.py`:
+- Added explicit Windows Chrome/Edge executable discovery (Program Files, Program Files x86, LOCALAPPDATA, PATH).
+- Launch now includes deterministic remote-debug args and isolated debug profile dir (`--user-data-dir=%TEMP%\\chrome-cdp-hermes`).
+- Windows launch now uses detached process flags for cleaner CLI behavior.
+- Improved manual fallback command text on Windows:
+- now prints fully-qualified executable invocation instead of relying on `chrome.exe` being on PATH.
+- Added localhost CDP reachability guard:
+- `/browser connect` no longer declares connected when endpoint is unreachable.
+- Hardened CLI memory flush on session rollover/exit:
+- `new_session()` and CLI shutdown finalizer now catch `BaseException` around `flush_memories(...)` to prevent exit-time crash traces.
+- File refs:
+- `cli.py`
+- Validation:
+- `python -m py_compile cli.py` passed.
+
+### PRI-025 - Browser tool daemon bind failure (`agent-browser` Windows 10013)
+- Status: `done`
+- Integrated slices:
+- Added deterministic Windows bind-failure handling in `tools/browser_tool.py`:
+- if unset, force `AGENT_BROWSER_STREAM_PORT=0` for `agent-browser` invocations.
+- detect daemon bind signature (`Failed to bind TCP` + WinError `10013`/permissions text).
+- auto-retry the browser command with a safe stream-port override.
+- Added regression tests:
+- `tests/tools/test_browser_windows_stream_port.py`
+- Validation:
+- Repro before patch (host command):
+- `agent-browser --session hermes_bindprobe --json open https://example.com` -> daemon bind `10013`.
+- Repro with override:
+- `set AGENT_BROWSER_STREAM_PORT=0 && agent-browser --session hermes_bindprobe2 --json open https://example.com` -> success.
+- Targeted tests:
+- `pytest -q tests/tools/test_browser_windows_stream_port.py`
+
+### PRI-026 - Voice install command + sidecar explicit browser-action execution priority
+- Status: `done`
+- Integrated slices:
+- Added in-product voice dependency bootstrap in `cli.py`:
+- `/voice install` subcommand routing in `_handle_voice_command()`.
+- new `_install_voice_dependencies()` helper installs `sounddevice`/`numpy` into the active Hermes runtime with resilient flow (`uv pip --python`, pip fallback, ensurepip recovery).
+- successful install auto-enables voice mode (`_enable_voice_mode()`).
+- Improved browser sidecar action priority in injected context:
+- `gateway/browser_bridge.py` now detects explicit live-action phrases in user note (`open`, `navigate`, `click`, etc.).
+- injected instructions now explicitly direct the model to execute requested browser actions first and not preempt with memory/worldview file reads.
+- Reinforced base memory guidance:
+- `agent/prompt_builder.py` now states memory upkeep must not preempt explicit direct user actions.
+- Added regression tests:
+- `tests/gateway/test_browser_bridge_context.py` (explicit-live-action vs reference-only context behavior).
+- `tests/tools/test_voice_cli_integration.py` (`/voice install` command routing).
+- File refs:
+- `cli.py`
+- `gateway/browser_bridge.py`
+- `agent/prompt_builder.py`
+- `tests/gateway/test_browser_bridge_context.py`
+- `tests/tools/test_voice_cli_integration.py`
+- Validation:
+- Runtime install performed in active Hermes tool runtime:
+- `uv pip install --python C:\Users\btgil\AppData\Roaming\uv\tools\hermes-agent\Scripts\python.exe sounddevice numpy` -> installed `sounddevice`.
+- Runtime check in Hermes tool interpreter:
+- `detect_audio_environment().available == True`
+- `check_voice_requirements().available == True`
+- `missing_packages == []`
+- `python -m py_compile` passed for updated files.
+- Targeted pytest passed:
+- `3 passed` for browser-context + `/voice install` slices.
+
+### PRI-027 - OS-helper system prompt injection parity for terminal sessions
+- Status: `done`
+- Integrated slices:
+- Ported shell-aware environment hint behavior into `run_agent.py`:
+- Added `AIAgent._build_environment_hint()` with explicit branches for `cmd`, `powershell`, and `wsl`.
+- Hint text now includes shell/path semantics and explicit direct-action priority to reduce “read memory/worldview first” drift in terminal tasks.
+- Wired environment hint into per-call ephemeral prompt path:
+- main conversation API message assembly.
+- max-iteration summary fallback API message assembly.
+- Added helper module from personal repo:
+- `tools/environments/shell_utils.py` for shell-mode detection helpers and `HERMES_WINDOWS_SHELL` awareness.
+- Added regression coverage:
+- `tests/test_run_agent.py` includes `TestBuildEnvironmentHint` with cmd/PowerShell/WSL + non-Windows cases.
+- File refs:
+- `run_agent.py`
+- `tools/environments/shell_utils.py`
+- `tests/test_run_agent.py`
+- Validation:
+- `python -m py_compile run_agent.py tools/environments/shell_utils.py tests/test_run_agent.py` passed.
+- `pytest -q tests/test_run_agent.py -k BuildEnvironmentHint` passed (`4 passed`).
+
+### PRI-028 - Shell override source parity (env + config.yaml)
+- Status: `done`
+- Integrated slices:
+- Extended shell override resolution in `tools/environments/shell_utils.py`:
+- Added `resolve_windows_shell_override()` with precedence:
+- `HERMES_WINDOWS_SHELL` from process env
+- fallback to `~/.hermes/config.yaml` (`HERMES_WINDOWS_SHELL`, plus terminal shell aliases)
+- normalization for `cmd.exe`/`pwsh` aliases.
+- `get_local_shell_mode()` now uses the shared resolver and logs selected override source (`env`, `config`, `default`).
+- Updated environment hint path in `run_agent.py`:
+- `_build_environment_hint()` now uses resolved override value from shell utils, avoiding stale direct-env display mismatch.
+- Added tests in `tests/test_run_agent.py` for:
+- env precedence over config
+- config fallback when env is missing
+- hint text using resolved override path
+- File refs:
+- `tools/environments/shell_utils.py`
+- `run_agent.py`
+- `tests/test_run_agent.py`
+
+### PRI-029 - Local terminal execution dispatch parity (shell_utils integration)
+- Status: `done`
+- Integrated slices:
+- Ported shell-aware one-shot dispatch behavior into `tools/environments/local.py`:
+- replaced bash-only one-shot invocation with `build_local_subprocess_invocation(...)`.
+- shell fences remain enabled only for `posix`/`wsl` modes to keep startup noise filtering behavior.
+- reused platform-aware termination helper (`terminate_process_tree`) in interrupt/timeout handling.
+- preserved `PersistentShellMixin` path and local persistent shell support.
+- Added regression tests:
+- `tests/tools/test_local_windows_shell_dispatch.py` for cmd vs wsl dispatch behavior.
+- File refs:
+- `tools/environments/local.py`
+- `tests/tools/test_local_windows_shell_dispatch.py`
+- Validation:
+- `python -m py_compile tools/environments/local.py tests/tools/test_local_windows_shell_dispatch.py` passed.
+- `pytest -q -o addopts='' tests/tools/test_local_windows_shell_dispatch.py` passed (`2 passed`).
+
 ## Merge Safety Rules
 - Keep upstream `main` behavior as baseline.
 - Port integrations in small slices with compile/smoke validation per slice.

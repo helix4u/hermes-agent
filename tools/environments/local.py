@@ -12,6 +12,10 @@ import time
 _IS_WINDOWS = platform.system() == "Windows"
 
 from tools.environments.base import BaseEnvironment
+from tools.environments.shell_utils import (
+    build_local_subprocess_invocation,
+    terminate_process_tree,
+)
 from tools.environments.persistent_shell import PersistentShellMixin
 from tools.interrupt import is_interrupted
 
@@ -366,27 +370,32 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
         else:
             effective_stdin = stdin_data
 
-        user_shell = _find_bash()
-        fenced_cmd = (
-            f"printf '{_OUTPUT_FENCE}';"
-            f" {exec_command};"
-            f" __hermes_rc=$?;"
-            f" printf '{_OUTPUT_FENCE}';"
-            f" exit $__hermes_rc"
+        shell_command = exec_command
+        popen_args, popen_platform_kwargs, shell_mode = build_local_subprocess_invocation(
+            shell_command, work_dir
         )
-        run_env = _make_run_env(self.env)
+        if shell_mode in {"posix", "wsl"}:
+            shell_command = (
+                f"printf '{_OUTPUT_FENCE}';"
+                f" {exec_command};"
+                f" __hermes_rc=$?;"
+                f" printf '{_OUTPUT_FENCE}';"
+                f" exit $__hermes_rc"
+            )
+            popen_args, popen_platform_kwargs, shell_mode = build_local_subprocess_invocation(
+                shell_command, work_dir
+            )
 
         proc = subprocess.Popen(
-            [user_shell, "-lic", fenced_cmd],
+            popen_args,
             text=True,
-            cwd=work_dir,
-            env=run_env,
+            env=_sanitize_subprocess_env(os.environ, self.env),
             encoding="utf-8",
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if effective_stdin is not None else subprocess.DEVNULL,
-            preexec_fn=None if _IS_WINDOWS else os.setsid,
+            **popen_platform_kwargs,
         )
 
         if effective_stdin is not None:
@@ -418,31 +427,22 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
 
         while proc.poll() is None:
             if is_interrupted():
+                terminate_process_tree(proc, force=False)
                 try:
-                    if _IS_WINDOWS:
-                        proc.terminate()
-                    else:
-                        pgid = os.getpgid(proc.pid)
-                        os.killpg(pgid, signal.SIGTERM)
-                        try:
-                            proc.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(pgid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    proc.kill()
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    terminate_process_tree(proc, force=True)
                 reader.join(timeout=2)
                 return {
                     "output": "".join(_output_chunks) + "\n[Command interrupted — user sent a new message]",
                     "returncode": 130,
                 }
             if time.monotonic() > deadline:
+                terminate_process_tree(proc, force=False)
                 try:
-                    if _IS_WINDOWS:
-                        proc.terminate()
-                    else:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    proc.kill()
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    terminate_process_tree(proc, force=True)
                 reader.join(timeout=2)
                 return self._timeout_result(effective_timeout)
             time.sleep(0.2)

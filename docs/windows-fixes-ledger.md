@@ -301,6 +301,146 @@ Scope: `hermes-agent` Windows install/startup/runtime reliability fixes validate
 - Validation notes:
 - `python -m py_compile gateway/run.py gateway/browser_bridge.py hermes_cli/gateway.py` passed after patch.
 
+### WF-018 - CLI exit crash guard + Windows Chrome launch command hardening
+- Status: `done`
+- Problem:
+- Exiting interactive `hermes` could print a full traceback and abort when memory flush hit provider/bootstrap errors (for example SSL provider init failures).
+- `/browser connect` on Windows could fail to auto-launch robustly and manual fallback text was too weak (`chrome.exe ...`) for non-PATH contexts.
+- Code evidence:
+- Hardened exit/new-session memory flush guards in `cli.py`:
+- `flush_memories(...)` calls in both `new_session()` and CLI shutdown finalizer now catch `BaseException` to prevent shutdown-time crashes.
+- Hardened `/browser connect` launcher in `cli.py`:
+- `_try_launch_chrome_debug()` now includes Windows executable discovery (Program Files/LOCALAPPDATA + PATH fallbacks), detached launch flags, and explicit `--user-data-dir`.
+- Manual fallback command now prints a fully-qualified Chrome path + remote debugging args for Windows.
+- Added connection truthfulness guard:
+- `/browser connect` no longer marks connected when localhost CDP endpoint is still unreachable.
+- File refs:
+- `cli.py`
+- Validation notes:
+- `python -m py_compile cli.py` passed.
+
+### WF-019 - `agent-browser` daemon TCP bind failure on Windows (`os error 10013`)
+- Status: `done`
+- Problem:
+- Browser tool commands (`open`, `snapshot`, local and CDP modes) fail before navigation with:
+- `Daemon process exited during startup`
+- `Failed to bind TCP ... (os error 10013)`
+- Code evidence:
+- Added Windows daemon stream-port hardening in `tools/browser_tool.py`:
+- default `AGENT_BROWSER_STREAM_PORT=0` when unset on Windows.
+- detects bind error signature (`Failed to bind TCP` + `10013`/permissions text) and retries command with safe stream-port override.
+- retry uses `"0"` if caller had an explicit conflicting port; otherwise allocates a free local port.
+- Added regression tests:
+- `tests/tools/test_browser_windows_stream_port.py`
+- Validation notes:
+- Direct host reproduction before fix:
+- `agent-browser --session hermes_bindprobe --json open https://example.com` -> bind `10013`.
+- Direct host validation with stream-port override:
+- `set AGENT_BROWSER_STREAM_PORT=0 && agent-browser --session hermes_bindprobe2 --json open https://example.com` -> success.
+- Targeted tests passed:
+- `pytest -q tests/tools/test_browser_windows_stream_port.py`
+
+### WF-020 - Voice bootstrap self-heal + browser sidecar explicit-action priority
+- Status: `done`
+- Problem:
+- `/voice` reported missing audio libs in active Windows runtime (`sounddevice` absent) with no built-in in-product remediation path.
+- Browser sidecar turns could over-prioritize memory/worldview/file maintenance instead of executing explicit live browser action requests first.
+- Code evidence:
+- Added `/voice install` support in `cli.py`:
+- `_handle_voice_command()` now accepts `install`.
+- New `_install_voice_dependencies()` installer flow:
+- prefers `uv pip install --python <current interpreter> sounddevice numpy` when `uv` exists.
+- falls back to `<python> -m pip install sounddevice numpy`.
+- includes `ensurepip --upgrade` recovery when pip launcher is missing.
+- auto-runs `_enable_voice_mode()` after successful install.
+- Added browser-sidecar intent override in injected context:
+- `gateway/browser_bridge.py` now detects explicit live-action verbs in browser note text and emits instruction to execute requested browser actions first.
+- Added guardrail that explicit live browser action should not be preempted by memory/worldview file work.
+- Reinforced global memory guidance:
+- `agent/prompt_builder.py` now explicitly says memory maintenance must not preempt explicit user action requests.
+- Added tests:
+- `tests/gateway/test_browser_bridge_context.py`
+- `tests/tools/test_voice_cli_integration.py` (`/voice install` routing)
+- File refs:
+- `cli.py`
+- `gateway/browser_bridge.py`
+- `agent/prompt_builder.py`
+- `tests/gateway/test_browser_bridge_context.py`
+- `tests/tools/test_voice_cli_integration.py`
+- Validation notes:
+- Runtime install executed in active Hermes tool env:
+- `uv pip install --python C:\Users\btgil\AppData\Roaming\uv\tools\hermes-agent\Scripts\python.exe sounddevice numpy` -> installed `sounddevice`.
+- Post-install requirement check in active Hermes runtime returned:
+- `env_available=True`, `req_available=True`, `missing=[]`.
+- `python -m py_compile` passed for changed files (pre-existing warning in `cli.py` unchanged).
+- Targeted tests passed:
+- `3 passed` across browser-context + voice install routing tests.
+
+### WF-021 - Terminal shell-awareness prompt injection (cmd/PowerShell/WSL)
+- Status: `done`
+- Problem:
+- In native Windows terminal sessions, the model could misclassify shell context and take irrelevant file-memory actions instead of executing direct terminal requests using correct shell/path semantics.
+- Code evidence:
+- Added Windows shell environment helper to agent runtime:
+- `AIAgent._build_environment_hint()` now emits shell-specific guidance for:
+- `cmd` (cmd.exe commands + `%VAR%` + `C:\\` paths)
+- `powershell` (PowerShell-native commands/path semantics)
+- `wsl` (POSIX commands + `/mnt/<drive>/...` paths)
+- Includes explicit action-priority guidance: direct terminal asks should be executed before memory/worldview file reads.
+- Added per-call prompt injection wiring:
+- `_handle_max_iterations()` now appends environment hint into ephemeral system additions.
+- Main conversation API message assembly now appends environment hint into ephemeral system additions for every turn.
+- Ported helper module from personal repo:
+- `tools/environments/shell_utils.py` added for shell-mode detection (`HERMES_WINDOWS_SHELL`, auto mode, wsl/pwsh/cmd helpers).
+- Added regression tests:
+- `tests/test_run_agent.py` new `TestBuildEnvironmentHint` coverage for non-Windows, cmd, PowerShell, and WSL branches.
+- File refs:
+- `run_agent.py`
+- `tools/environments/shell_utils.py`
+- `tests/test_run_agent.py`
+- Validation notes:
+- `python -m py_compile run_agent.py tools/environments/shell_utils.py tests/test_run_agent.py` passed.
+- Targeted tests passed:
+- `pytest -q tests/test_run_agent.py -k BuildEnvironmentHint` -> `4 passed`.
+
+### WF-022 - Windows shell override config fallback (env + config parity)
+- Status: `done`
+- Problem:
+- Shell selection could still resolve to `wsl` when `HERMES_WINDOWS_SHELL=cmd` existed in `~/.hermes/config.yaml` but was not present in the live process environment.
+- Code evidence:
+- Added normalized Windows shell override resolver in `tools/environments/shell_utils.py`:
+- `resolve_windows_shell_override()` now checks:
+- process env (`HERMES_WINDOWS_SHELL`) first
+- then `~/.hermes/config.yaml` keys (`HERMES_WINDOWS_SHELL`, `terminal.windows_shell`, `terminal.shell_mode`, `terminal.shell`)
+- `get_local_shell_mode()` now consumes this resolver and logs source (`env`/`config`/`default`).
+- Updated `run_agent.py` environment hint injection to use resolved override value (not raw env read).
+- Added regression tests in `tests/test_run_agent.py`:
+- env precedence over config
+- config fallback when env missing
+- hint uses resolved override path
+- File refs:
+- `tools/environments/shell_utils.py`
+- `run_agent.py`
+- `tests/test_run_agent.py`
+
+### WF-023 - Local terminal backend now honors shell mode (cmd/PowerShell/WSL)
+- Status: `done`
+- Problem:
+- `terminal` local backend one-shot execution was hardwired to bash via `tools/environments/local.py` (`_find_bash` + `bash -lic`), which could ignore Windows shell-mode intent and produce WSL/bash behavior.
+- Code evidence:
+- Updated `tools/environments/local.py` one-shot execution path:
+- now uses `build_local_subprocess_invocation(...)` from `tools/environments/shell_utils.py`.
+- keeps fence wrapping only for `posix`/`wsl` shell modes.
+- uses sanitized subprocess env + platform-aware process tree termination (`terminate_process_tree`) for interrupt/timeout handling.
+- preserved persistent-shell support (`PersistentShellMixin`) for existing behavior and tests.
+- Added regression tests:
+- `tests/tools/test_local_windows_shell_dispatch.py`
+- covers cmd-mode dispatch without fence wrapping.
+- covers wsl-mode dispatch with fence wrapping.
+- Validation notes:
+- `python -m py_compile tools/environments/local.py tests/tools/test_local_windows_shell_dispatch.py` passed.
+- `pytest -q -o addopts='' tests/tools/test_local_windows_shell_dispatch.py` -> `2 passed`.
+
 ## Open Follow-ups
 - Re-run targeted pytest in your preferred Windows environment after current merge work settles to confirm no hidden cross-fixture assumptions remain.
 - Keep this ledger as source-of-truth for Windows stability fixes; append entries instead of rewriting history.

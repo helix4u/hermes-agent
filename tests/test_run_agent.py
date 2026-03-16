@@ -570,6 +570,75 @@ class TestBuildSystemPrompt:
         assert "Conversation started:" in prompt
 
 
+class TestBuildEnvironmentHint:
+    def test_returns_empty_on_non_windows_host(self, agent):
+        with patch.object(run_agent.os, "name", "posix"):
+            assert agent._build_environment_hint() == ""
+
+    def test_cmd_mode_hint(self, agent):
+        with (
+            patch.object(run_agent.os, "name", "nt"),
+            patch("tools.environments.shell_utils.get_local_shell_mode", return_value="cmd"),
+            patch.dict("os.environ", {"HERMES_WINDOWS_SHELL": "cmd"}, clear=False),
+        ):
+            hint = agent._build_environment_hint()
+        assert "cmd.exe local terminal" in hint
+        assert "Do NOT use PowerShell syntax" in hint
+        assert "do that action first before memory or worldview file reads" in hint
+
+    def test_powershell_mode_hint(self, agent):
+        with (
+            patch.object(run_agent.os, "name", "nt"),
+            patch("tools.environments.shell_utils.get_local_shell_mode", return_value="powershell"),
+            patch.dict("os.environ", {"HERMES_WINDOWS_SHELL": "powershell"}, clear=False),
+        ):
+            hint = agent._build_environment_hint()
+        assert "PowerShell local terminal" in hint
+        assert "Get-ChildItem" in hint
+        assert "do that action first before memory or worldview file reads" in hint
+
+    def test_wsl_mode_hint(self, agent):
+        with (
+            patch.object(run_agent.os, "name", "nt"),
+            patch("tools.environments.shell_utils.get_local_shell_mode", return_value="wsl"),
+            patch.dict("os.environ", {"HERMES_WINDOWS_SHELL": "wsl"}, clear=False),
+        ):
+            hint = agent._build_environment_hint()
+        assert "local terminal is WSL" in hint
+        assert "/mnt/c/Users" in hint
+        assert "do that action first before memory or worldview file reads" in hint
+
+    def test_hint_uses_resolved_override_not_direct_env(self, agent):
+        with (
+            patch.object(run_agent.os, "name", "nt"),
+            patch("tools.environments.shell_utils.get_local_shell_mode", return_value="cmd"),
+            patch("tools.environments.shell_utils.resolve_windows_shell_override", return_value="cmd"),
+            patch.dict("os.environ", {}, clear=False),
+        ):
+            hint = agent._build_environment_hint()
+        assert "HERMES_WINDOWS_SHELL=cmd" in hint
+
+
+class TestShellUtilsWindowsOverride:
+    def test_env_override_takes_precedence_over_config(self):
+        from tools.environments import shell_utils
+
+        with (
+            patch.dict("os.environ", {"HERMES_WINDOWS_SHELL": "powershell"}, clear=False),
+            patch("tools.environments.shell_utils._config_windows_shell_override", return_value="cmd"),
+        ):
+            assert shell_utils.resolve_windows_shell_override() == "powershell"
+
+    def test_config_override_used_when_env_missing(self):
+        from tools.environments import shell_utils
+
+        with (
+            patch.dict("os.environ", {}, clear=False),
+            patch("tools.environments.shell_utils._config_windows_shell_override", return_value="cmd"),
+        ):
+            assert shell_utils.resolve_windows_shell_override() == "cmd"
+
+
 class TestInvalidateSystemPrompt:
     def test_clears_cache(self, agent):
         agent._cached_system_prompt = "cached value"

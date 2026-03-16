@@ -57,6 +57,7 @@ import re
 import signal
 import subprocess
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -784,6 +785,25 @@ def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
     return None
 
 
+def _is_agent_browser_bind_10013_error(stderr: str, stdout: str) -> bool:
+    """Return True for the known Windows daemon stream bind failure signature."""
+    combined = f"{stderr or ''}\n{stdout or ''}".lower()
+    if "failed to bind tcp" not in combined:
+        return False
+    return (
+        "10013" in combined
+        or "access permissions" in combined
+        or "forbidden by its access permissions" in combined
+    )
+
+
+def _allocate_free_tcp_port() -> str:
+    """Allocate a free local TCP port and return it as a string."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return str(sock.getsockname()[1])
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -871,6 +891,12 @@ def _run_browser_command(
 
         browser_env["PATH"] = os.pathsep.join(path_parts)
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
+
+        # Windows workaround: agent-browser daemon TCP stream bind can fail with
+        # WinError 10013 under default port selection on some hosts.
+        # Set explicit stream port selection so daemon startup remains reliable.
+        if os.name == "nt" and not browser_env.get("AGENT_BROWSER_STREAM_PORT"):
+            browser_env["AGENT_BROWSER_STREAM_PORT"] = "0"
         
         result = subprocess.run(
             cmd_parts,
@@ -879,6 +905,26 @@ def _run_browser_command(
             timeout=timeout,
             env=browser_env,
         )
+
+        if os.name == "nt" and _is_agent_browser_bind_10013_error(result.stderr, result.stdout):
+            retry_env = {**browser_env}
+            current_port = retry_env.get("AGENT_BROWSER_STREAM_PORT", "").strip()
+            if current_port and current_port != "0":
+                retry_env["AGENT_BROWSER_STREAM_PORT"] = "0"
+            else:
+                retry_env["AGENT_BROWSER_STREAM_PORT"] = _allocate_free_tcp_port()
+            logger.warning(
+                "browser '%s' hit daemon bind 10013; retrying with AGENT_BROWSER_STREAM_PORT=%s",
+                command,
+                retry_env["AGENT_BROWSER_STREAM_PORT"],
+            )
+            result = subprocess.run(
+                cmd_parts,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=retry_env,
+            )
         
         # Log stderr for diagnostics — use warning level on failure so it's visible
         if result.stderr and result.stderr.strip():
