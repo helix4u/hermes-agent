@@ -356,23 +356,6 @@ This ledger tracks private integration work by **code comparison and runtime val
 - Validation:
 - `python -m py_compile tools/transcription_tools.py` passed.
 
-### PRI-020 - Branch safety checkpoint and helix4u main handoff
-- Status: `done`
-- Scope:
-- Created backup branch pointer before taking over ongoing work on `main`:
-- `backup/pre-helix-main-takeover-20260316-1325`
-- Added `helix4u` remote pointing to `https://github.com/helix4u/hermes-agent.git`.
-- Set local `main` upstream to `helix4u/main`.
-- Set default push remote to `helix4u` (`remote.pushDefault=helix4u`).
-- Current state note:
-- `main` handoff finalized and pushed to `helix4u/main`.
-- Baseline commits pushed:
-- `dfb3b0fe` - checkpoint snapshot of current integration/Windows merge state
-- `b089ef03` - cleanup commit removing accidental generated `build/` artifacts
-- Validation:
-- Verified upstream ref resolves to `helix4u/main`.
-- Verified backup branch exists and points to pre-handoff commit.
-
 ## Merge Safety Rules
 - Keep upstream `main` behavior as baseline.
 - Port integrations in small slices with compile/smoke validation per slice.
