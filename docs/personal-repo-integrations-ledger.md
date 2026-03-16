@@ -414,6 +414,21 @@ This ledger tracks private integration work by **code comparison and runtime val
 - Targeted regression suite passed:
 - `11 passed, 294 deselected` across previously failing CI slices.
 
+### PRI-022 - Deploy workflow Pages-preflight + fork-safe CNAME handling
+- Status: `done`
+- Integrated slices:
+- Hardened `.github/workflows/deploy-site.yml` to avoid hard failure when GitHub Pages is not enabled in fork repos.
+- Added preflight step that checks `GET /repos/{owner}/{repo}/pages` using `github.token`.
+- Deploy steps now run only when Pages is enabled; otherwise the job exits cleanly with a notice.
+- Made CNAME emission fork-safe:
+- `hermes-agent.nousresearch.com` CNAME is now written only for upstream repo `NousResearch/hermes-agent`.
+- Result:
+- `Deploy Site` no longer fails with `404 Failed to create deployment` just because Pages is disabled on a fork.
+- File refs:
+- `.github/workflows/deploy-site.yml`
+- Validation:
+- Workflow syntax inspected after patch; step gating and skip-note behavior are explicit.
+
 ## Merge Safety Rules
 - Keep upstream `main` behavior as baseline.
 - Port integrations in small slices with compile/smoke validation per slice.

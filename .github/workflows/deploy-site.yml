@@ -25,37 +25,71 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
+      - name: Check GitHub Pages availability
+        id: pages_check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          status=$(curl -sS -o /tmp/pages.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pages")
+          set -e
+          if [ "$status" = "200" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "GitHub Pages is enabled."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "GitHub Pages is not enabled (status: $status). Skipping deploy."
+            echo "Enable Pages at: https://github.com/${{ github.repository }}/settings/pages"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.pages_check.outputs.enabled == 'true'
 
       - uses: actions/setup-node@v4
+        if: steps.pages_check.outputs.enabled == 'true'
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: website/package-lock.json
 
       - name: Install dependencies
+        if: steps.pages_check.outputs.enabled == 'true'
         run: npm ci
         working-directory: website
 
       - name: Build Docusaurus
+        if: steps.pages_check.outputs.enabled == 'true'
         run: npm run build
         working-directory: website
 
       - name: Stage deployment
+        if: steps.pages_check.outputs.enabled == 'true'
         run: |
           mkdir -p _site/docs
           # Landing page at root
           cp -r landingpage/* _site/
           # Docusaurus at /docs/
           cp -r website/build/* _site/docs/
-          # CNAME so GitHub Pages keeps the custom domain between deploys
-          echo "hermes-agent.nousresearch.com" > _site/CNAME
+          # CNAME is only valid for upstream's custom domain.
+          if [ "${{ github.repository }}" = "NousResearch/hermes-agent" ]; then
+            echo "hermes-agent.nousresearch.com" > _site/CNAME
+          fi
 
       - name: Upload artifact
+        if: steps.pages_check.outputs.enabled == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: _site
 
       - name: Deploy to GitHub Pages
+        if: steps.pages_check.outputs.enabled == 'true'
         id: deploy
         uses: actions/deploy-pages@v4
+
+      - name: Skip note (Pages disabled)
+        if: steps.pages_check.outputs.enabled != 'true'
+        run: |
+          echo "::notice title=Deploy Skipped::GitHub Pages is disabled for ${{ github.repository }}."
