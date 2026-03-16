@@ -281,6 +281,26 @@ Scope: `hermes-agent` Windows install/startup/runtime reliability fixes validate
 - Direct runtime probe passed:
 - `.venv\Scripts\python -c "import tools.browser_tool as b, subprocess; p=b._find_agent_browser(); print(p); print(subprocess.run(p+['--version'], capture_output=True, text=True, timeout=20).returncode)"` -> resolved `npx.CMD` path and returned `0`.
 
+### WF-017 - Sidecar turn crash containment (prevent gateway "poof" on fatal turn errors)
+- Status: `done`
+- Problem:
+- During browser-sidecar image turns, fatal exceptions in the turn pipeline could bubble as cancellation/fatal errors and terminate the gateway process instead of failing only the turn.
+- Code evidence:
+- Hardened sidecar turn execution in `gateway/run.py`:
+- `_handle_browser_bridge_send()` now treats `CancelledError` as an interrupted turn state and records progress cleanly.
+- Added `BaseException` guard in sidecar turn runner so fatal tool/runtime exceptions are captured as turn failure instead of process-killing errors.
+- Hardened top-level message handling in `gateway/run.py`:
+- Added `BaseException` guard in `_handle_message()` so fatal worker errors are returned as turn errors while keeping gateway alive.
+- Added cancellation-resume guard in `start_gateway()`:
+- if cancellation hits while sidecar turns are active and no shutdown was requested, gateway uncancels/resumes wait instead of immediately stopping.
+- Hardened browser bridge HTTP handling in `gateway/browser_bridge.py`:
+- `do_POST()` now catches `BaseException` and returns a controlled 500 error response rather than allowing request-thread fatal exits.
+- File refs:
+- `gateway/run.py`
+- `gateway/browser_bridge.py`
+- Validation notes:
+- `python -m py_compile gateway/run.py gateway/browser_bridge.py hermes_cli/gateway.py` passed after patch.
+
 ## Open Follow-ups
 - Re-run targeted pytest in your preferred Windows environment after current merge work settles to confirm no hidden cross-fixture assumptions remain.
 - Keep this ledger as source-of-truth for Windows stability fixes; append entries instead of rewriting history.

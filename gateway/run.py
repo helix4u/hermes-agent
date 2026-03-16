@@ -1584,6 +1584,19 @@ class GatewayRunner:
                         "Interrupted." if interrupted else "Turn finished.",
                     ),
                 )
+            except asyncio.CancelledError:
+                self._browser_bridge_pending_interrupts.discard(session_key)
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=False,
+                    detail="Interrupted.",
+                    interrupt_requested=False,
+                    recent_events=self._append_browser_bridge_progress_event(
+                        session_key,
+                        "Interrupted.",
+                    ),
+                )
+                raise
             except Exception as exc:
                 logger.exception("Browser sidecar turn failed")
                 self._browser_bridge_pending_interrupts.discard(session_key)
@@ -1596,6 +1609,23 @@ class GatewayRunner:
                     recent_events=self._append_browser_bridge_progress_event(
                         session_key,
                         f"Error: {exc}",
+                    ),
+                )
+            except BaseException as exc:
+                # Guard against fatal worker exceptions (e.g. SystemExit/
+                # KeyboardInterrupt escaping from tool internals). These should
+                # fail the sidecar turn, not terminate the whole gateway.
+                logger.exception("Browser sidecar turn crashed with fatal error")
+                self._browser_bridge_pending_interrupts.discard(session_key)
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=False,
+                    detail="Sidecar turn failed.",
+                    error=f"{type(exc).__name__}: {exc}",
+                    interrupt_requested=False,
+                    recent_events=self._append_browser_bridge_progress_event(
+                        session_key,
+                        f"Fatal error: {type(exc).__name__}: {exc}",
                     ),
                 )
             finally:
@@ -3046,6 +3076,14 @@ class GatewayRunner:
                 "Sorry, I encountered an unexpected error. "
                 "The details have been logged for debugging. "
                 "Try again or use /reset to start a fresh session."
+            )
+        except BaseException as e:
+            # Keep gateway alive when underlying tools raise fatal exceptions
+            # (KeyboardInterrupt/SystemExit) from worker threads.
+            logger.exception("Fatal agent error in session %s", session_key)
+            return (
+                "Sorry, the turn hit a fatal runtime error and was aborted. "
+                "Hermes is still running; please try again."
             )
         finally:
             # Clear session env
@@ -6286,14 +6324,38 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     
     # Wait for shutdown
     try:
-        await runner.wait_for_shutdown()
-    except asyncio.CancelledError:
-        logger.info("Gateway shutdown wait was cancelled; stopping gracefully.")
-        if getattr(runner, "_running", False):
+        while True:
             try:
-                await runner.stop()
-            except Exception as e:
-                logger.debug("Graceful stop after cancellation failed: %s", e)
+                await runner.wait_for_shutdown()
+                break
+            except asyncio.CancelledError:
+                running = bool(getattr(runner, "_running", False))
+                shutdown_requested = bool(getattr(runner, "_shutdown_event", None) and runner._shutdown_event.is_set())
+                active_sidecar_turns = any(
+                    not task.done()
+                    for task in getattr(runner, "_browser_bridge_tasks", {}).values()
+                )
+                if running and not shutdown_requested and active_sidecar_turns:
+                    logger.error(
+                        "Unexpected cancellation while browser sidecar turn is active; "
+                        "keeping gateway alive and resuming wait."
+                    )
+                    current = asyncio.current_task()
+                    if current and hasattr(current, "uncancel"):
+                        try:
+                            current.uncancel()
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0)
+                    continue
+
+                logger.info("Gateway shutdown wait was cancelled; stopping gracefully.")
+                if running:
+                    try:
+                        await runner.stop()
+                    except Exception as e:
+                        logger.debug("Graceful stop after cancellation failed: %s", e)
+                break
     finally:
         # Stop cron ticker cleanly
         cron_stop.set()

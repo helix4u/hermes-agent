@@ -429,6 +429,24 @@ This ledger tracks private integration work by **code comparison and runtime val
 - Validation:
 - Workflow syntax inspected after patch; step gating and skip-note behavior are explicit.
 
+### PRI-023 - Browser sidecar fatal-failure path hardening (gateway stays up)
+- Status: `done`
+- Integrated slices:
+- Hardened sidecar turn execution in `gateway/run.py`:
+- Added explicit `CancelledError` handling in `_handle_browser_bridge_send()` turn runner to record interrupted state cleanly.
+- Added `BaseException` handling in sidecar turn runner so fatal worker/tool exceptions become turn failures instead of gateway-killing errors.
+- Hardened general message turn safety in `gateway/run.py`:
+- Added `BaseException` guard in `_handle_message()` with a safe user-facing abort response while keeping gateway alive.
+- Hardened shutdown cancellation resilience in `start_gateway()`:
+- cancellation during active sidecar turns is now treated as unexpected and resumed (via task uncancel) unless shutdown was explicitly requested.
+- Hardened bridge HTTP request failure behavior in `gateway/browser_bridge.py`:
+- `do_POST()` now catches `BaseException` and returns controlled 500 responses for fatal request handler crashes.
+- File refs:
+- `gateway/run.py`
+- `gateway/browser_bridge.py`
+- Validation:
+- `python -m py_compile gateway/run.py gateway/browser_bridge.py hermes_cli/gateway.py` passed.
+
 ## Merge Safety Rules
 - Keep upstream `main` behavior as baseline.
 - Port integrations in small slices with compile/smoke validation per slice.

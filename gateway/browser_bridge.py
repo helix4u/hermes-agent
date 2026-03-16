@@ -642,6 +642,10 @@ class BrowserBridgeServer:
                 if not future.done():
                     future.cancel()
                 raise
+            except BaseException:
+                if not future.done():
+                    future.cancel()
+                raise
 
         if isinstance(handler_result, dict):
             return handler_result
@@ -777,6 +781,11 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             logger.exception("Browser bridge handler failed")
             self._json_response(500, {"ok": False, "error": str(exc)})
+            return
+        except BaseException as exc:
+            # Keep request-thread failures from taking down the whole bridge.
+            logger.exception("Browser bridge handler crashed with fatal error")
+            self._json_response(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
             return
 
         self._json_response(200, {"ok": True, **result})

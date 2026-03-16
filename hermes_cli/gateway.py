@@ -1347,18 +1347,24 @@ def windows_start_detached_gateway(*, stream_startup: bool = True) -> None:
         return
 
     command = [*get_windows_hermes_command(), "gateway", "run"]
-    stdout_log, _stderr_log = reset_gateway_logs()
+    stdout_log, stderr_log = reset_gateway_logs()
     flags = 0
     flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
     flags |= getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
 
-    proc = subprocess.Popen(
-        command,
-        cwd=str(PROJECT_ROOT),
-        stdin=subprocess.DEVNULL,
-        close_fds=True,
-        creationflags=flags,
-    )
+    stderr_handle = open(stderr_log, "a", encoding="utf-8", errors="replace")
+    try:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(PROJECT_ROOT),
+            stdin=subprocess.DEVNULL,
+            stderr=stderr_handle,
+            close_fds=True,
+            creationflags=flags,
+        )
+    finally:
+        # Child inherits duplicated handle; parent should close its copy.
+        stderr_handle.close()
 
     time.sleep(1.5)
     gateway_pid = get_running_pid()
