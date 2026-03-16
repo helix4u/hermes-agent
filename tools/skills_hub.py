@@ -181,7 +181,7 @@ class GitHubAuth:
             key_file = Path(key_path)
             if not key_file.exists():
                 return None
-            private_key = key_file.read_text()
+            private_key = key_file.read_text(encoding="utf-8")
 
             now = int(time.time())
             payload = {
@@ -458,7 +458,7 @@ class GitHubSource(SkillSource):
             stat = cache_file.stat()
             if time.time() - stat.st_mtime > INDEX_CACHE_TTL:
                 return None
-            return json.loads(cache_file.read_text())
+            return json.loads(cache_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
 
@@ -467,7 +467,7 @@ class GitHubSource(SkillSource):
         INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         cache_file = INDEX_CACHE_DIR / f"{key}.json"
         try:
-            cache_file.write_text(json.dumps(data, ensure_ascii=False))
+            cache_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         except OSError as e:
             logger.debug("Could not write cache: %s", e)
 
@@ -2055,7 +2055,7 @@ def _read_index_cache(key: str) -> Optional[Any]:
         stat = cache_file.stat()
         if time.time() - stat.st_mtime > INDEX_CACHE_TTL:
             return None
-        return json.loads(cache_file.read_text())
+        return json.loads(cache_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -2065,7 +2065,7 @@ def _write_index_cache(key: str, data: Any) -> None:
     INDEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_file = INDEX_CACHE_DIR / f"{key}.json"
     try:
-        cache_file.write_text(json.dumps(data, ensure_ascii=False, default=str))
+        cache_file.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
     except OSError as e:
         logger.debug("Could not write cache: %s", e)
 
@@ -2099,13 +2099,13 @@ class HubLockFile:
         if not self.path.exists():
             return {"version": 1, "installed": {}}
         try:
-            return json.loads(self.path.read_text())
+            return json.loads(self.path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return {"version": 1, "installed": {}}
 
     def save(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     def record_install(
         self,
@@ -2169,14 +2169,14 @@ class TapsManager:
         if not self.path.exists():
             return []
         try:
-            data = json.loads(self.path.read_text())
+            data = json.loads(self.path.read_text(encoding="utf-8"))
             return data.get("taps", [])
         except (json.JSONDecodeError, OSError):
             return []
 
     def save(self, taps: List[dict]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps({"taps": taps}, indent=2) + "\n")
+        self.path.write_text(json.dumps({"taps": taps}, indent=2) + "\n", encoding="utf-8")
 
     def add(self, repo: str, path: str = "skills/") -> bool:
         """Add a tap. Returns False if already exists."""
@@ -2214,7 +2214,7 @@ def append_audit_log(action: str, skill_name: str, source: str,
         parts.append(extra)
     line = " ".join(parts) + "\n"
     try:
-        with open(AUDIT_LOG, "a") as f:
+        with open(AUDIT_LOG, "a", encoding="utf-8") as f:
             f.write(line)
     except OSError as e:
         logger.debug("Could not write audit log: %s", e)
@@ -2230,11 +2230,11 @@ def ensure_hub_dirs() -> None:
     QUARANTINE_DIR.mkdir(exist_ok=True)
     INDEX_CACHE_DIR.mkdir(exist_ok=True)
     if not LOCK_FILE.exists():
-        LOCK_FILE.write_text('{"version": 1, "installed": {}}\n')
+        LOCK_FILE.write_text('{"version": 1, "installed": {}}\n', encoding="utf-8")
     if not AUDIT_LOG.exists():
         AUDIT_LOG.touch()
     if not TAPS_FILE.exists():
-        TAPS_FILE.write_text('{"taps": []}\n')
+        TAPS_FILE.write_text('{"taps": []}\n', encoding="utf-8")
 
 
 def quarantine_bundle(bundle: SkillBundle) -> Path:

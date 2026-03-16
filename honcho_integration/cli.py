@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 GLOBAL_CONFIG_PATH = Path.home() / ".honcho" / "config.json"
 HOST = "hermes"
+HONCHO_SDK_SPEC = "honcho-ai>=2.0.1"
 
 
 def _read_config() -> dict:
@@ -53,34 +56,88 @@ def _prompt(label: str, default: str | None = None, secret: bool = False) -> str
     return val or (default or "")
 
 
-def _ensure_sdk_installed() -> bool:
-    """Check honcho-ai is importable; offer to install if not. Returns True if ready."""
+def _honcho_sdk_available() -> bool:
     try:
         import honcho  # noqa: F401
         return True
     except ImportError:
-        pass
-
-    print("  honcho-ai is not installed.")
-    answer = _prompt("Install it now? (honcho-ai>=2.0.1)", default="y")
-    if answer.lower() not in ("y", "yes"):
-        print("  Skipping install. Run: pip install 'honcho-ai>=2.0.1'\n")
         return False
 
-    import subprocess
-    print("  Installing honcho-ai...", flush=True)
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "honcho-ai>=2.0.1"],
+
+def _run_install(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
         capture_output=True,
         text=True,
     )
-    if result.returncode == 0:
+
+
+def _install_honcho_sdk() -> tuple[bool, str]:
+    """Install honcho-ai into the interpreter backing this Hermes CLI."""
+    attempts: list[tuple[str, list[str]]] = []
+
+    uv_path = shutil.which("uv")
+    if uv_path:
+        attempts.append(
+            (
+                "uv pip install",
+                [uv_path, "pip", "install", "--python", sys.executable, HONCHO_SDK_SPEC],
+            )
+        )
+
+    pip_install_cmd = [sys.executable, "-m", "pip", "install", HONCHO_SDK_SPEC]
+    attempts.append(("python -m pip install", pip_install_cmd))
+
+    errors: list[str] = []
+    for label, cmd in attempts:
+        result = _run_install(cmd)
+        if result.returncode == 0:
+            return True, ""
+
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        details = stderr or stdout or "Unknown error"
+        errors.append(f"{label} failed: {details}")
+
+        # Some managed interpreters (notably uv tool envs) can be missing pip.__main__.
+        if cmd == pip_install_cmd and ("pip.__main__" in details or "No module named pip" in details):
+            ensurepip = _run_install([sys.executable, "-m", "ensurepip", "--upgrade"])
+            if ensurepip.returncode == 0:
+                retry = _run_install(pip_install_cmd)
+                if retry.returncode == 0:
+                    return True, ""
+                retry_err = (retry.stderr or "").strip() or (retry.stdout or "").strip() or "Unknown error"
+                errors.append(f"python -m pip install (after ensurepip) failed: {retry_err}")
+            else:
+                ep_err = (ensurepip.stderr or "").strip() or (ensurepip.stdout or "").strip() or "Unknown error"
+                errors.append(f"python -m ensurepip --upgrade failed: {ep_err}")
+
+    return False, "\n".join(errors)
+
+
+def _ensure_sdk_installed() -> bool:
+    """Check honcho-ai is importable; offer to install if not. Returns True if ready."""
+    if _honcho_sdk_available():
+        return True
+
+    print("  honcho-ai is not installed.")
+    answer = _prompt(f"Install it now? ({HONCHO_SDK_SPEC})", default="y")
+    if answer.lower() not in ("y", "yes"):
+        print(f"  Skipping install. Run: pip install '{HONCHO_SDK_SPEC}'\n")
+        return False
+
+    print("  Installing honcho-ai...", flush=True)
+    ok, error_text = _install_honcho_sdk()
+    if ok:
         print("  Installed.\n")
         return True
-    else:
-        print(f"  Install failed:\n{result.stderr.strip()}")
-        print("  Run manually: pip install 'honcho-ai>=2.0.1'\n")
-        return False
+
+    print(f"  Install failed:\n{error_text}")
+    print(
+        f"  Run manually: uv pip install --python \"{sys.executable}\" '{HONCHO_SDK_SPEC}'"
+    )
+    print(f"  Or: python -m pip install '{HONCHO_SDK_SPEC}'\n")
+    return False
 
 
 def cmd_setup(args) -> None:

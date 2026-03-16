@@ -19,6 +19,7 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
 _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a"}
 _VOICE_EXTS = {".ogg", ".opus"}
+_DISCORD_EMBED_DESCRIPTION_MAX = 4000
 
 
 SEND_MESSAGE_SCHEMA = {
@@ -392,11 +393,20 @@ async def _send_discord(token, chat_id, message):
     try:
         url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
         headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
-        chunks = [message[i:i+2000] for i in range(0, len(message), 2000)]
+        if not message:
+            return {"error": "Discord send failed: message is empty"}
+        chunks = [
+            message[i:i + _DISCORD_EMBED_DESCRIPTION_MAX]
+            for i in range(0, len(message), _DISCORD_EMBED_DESCRIPTION_MAX)
+        ]
         message_ids = []
         async with aiohttp.ClientSession() as session:
             for chunk in chunks:
-                async with session.post(url, headers=headers, json={"content": chunk}) as resp:
+                payload = {
+                    "embeds": [{"description": chunk}],
+                    "allowed_mentions": {"parse": []},
+                }
+                async with session.post(url, headers=headers, json=payload) as resp:
                     if resp.status not in (200, 201):
                         body = await resp.text()
                         return {"error": f"Discord API error ({resp.status}): {body}"}

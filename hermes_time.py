@@ -51,7 +51,7 @@ def _resolve_timezone_name() -> str:
         hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
         config_path = hermes_home / "config.yaml"
         if config_path.exists():
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
             tz_cfg = cfg.get("timezone", "")
             if isinstance(tz_cfg, str) and tz_cfg.strip():

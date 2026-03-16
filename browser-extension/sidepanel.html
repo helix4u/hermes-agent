@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hermes Sidecar</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="icons/nous-32.png">
+    <link rel="stylesheet" href="sidepanel.css">
+  </head>
+  <body>
+    <main class="app">
+      <header class="hero">
+        <div class="hero-top">
+          <div>
+            <p class="eyebrow">Hermes Agent</p>
+            <h1>Hermes Sidecar</h1>
+          </div>
+          <button id="open-options-button" class="ghost-button" type="button" title="Open sidecar settings">Options</button>
+        </div>
+        <p class="subhead">Chat beside the page and pull it into the turn only when it helps.</p>
+      </header>
+
+      <section class="card chat-card">
+        <div class="section-head">
+          <div>
+            <h2>Conversation</h2>
+            <p class="section-copy">Browse Hermes sessions from the browser, terminal, and connected gateways.</p>
+            <div class="session-picker">
+              <label for="session-history-select">Sessions</label>
+              <select id="session-history-select" class="session-history-select">
+                <option value="">Loading sessions...</option>
+              </select>
+              <button id="refresh-sessions-button" class="ghost-button small-button" type="button" title="Refresh the Hermes session list">Refresh</button>
+            </div>
+          </div>
+          <button id="reset-chat-button" class="ghost-button" type="button" title="Start a fresh sidecar session">New chat</button>
+        </div>
+        <div id="chat-messages" class="chat-messages">
+          <div class="empty-state">Loading Hermes sidecar history...</div>
+        </div>
+        <p id="status-text" class="status-inline">Waiting for input.</p>
+        <div class="domain-access-row">
+          <p id="domain-permission-status" class="domain-permission-status">Domain access: checking...</p>
+          <button id="domain-permission-button" class="ghost-button small-button" type="button">Allow domain</button>
+        </div>
+        <div class="composer">
+          <textarea
+            id="chat-input"
+            class="chat-input"
+            rows="4"
+            placeholder="Ask Hermes something, or leave this empty and just share the page..."
+          ></textarea>
+          <input id="attachment-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" multiple hidden>
+          <div id="attachment-strip" class="attachment-strip" hidden></div>
+          <div class="composer-tools">
+            <div class="tool-row tool-row-top">
+              <div class="tool-row-actions">
+                <label class="checkbox-row compact-row" title="When enabled, Hermes will keep refreshing this page preview automatically.">
+                  <input id="enable-preview-polling" type="checkbox">
+                  <span>Site polling</span>
+                </label>
+                <button id="refresh-button" class="ghost-button compact-action-button" type="button" title="Refresh the current page preview once right now">Refresh now</button>
+                <button id="voice-input-button" class="ghost-button compact-action-button" type="button" title="Record a short voice note and transcribe it into the composer">Voice input</button>
+                <button id="attach-button" class="ghost-button compact-action-button" type="button" title="Attach image files, or paste or drop images here">Attach image</button>
+                <button id="screengrab-button" class="ghost-button compact-action-button" type="button" title="Capture the visible part of the current tab as an image attachment">Screen grab</button>
+                <button id="challenge-mode-button" class="ghost-button chip-button mode-button" type="button" aria-pressed="false" title="Tell Hermes to challenge your assumptions before answering" hidden>Challenge my framing</button>
+                <button id="interrupt-button" class="interrupt-button compact-action-button" type="button" title="Ask Hermes to stop the current response chain" hidden>Interrupt</button>
+                <button id="send-button" class="primary-button inline-send-button compact-action-button" type="button" title="Send your current message to Hermes">Send</button>
+              </div>
+            </div>
+            <span id="quick-prompts-label" class="tool-label" hidden>Quick prompts</span>
+            <div id="preset-strip" class="preset-strip" aria-label="Prompt presets" hidden></div>
+          </div>
+          <div id="voice-recorder-sheet" class="voice-recorder-sheet" hidden>
+            <div class="voice-recorder-sheet-card">
+              <div class="voice-recorder-sheet-head">
+                <div>
+                  <p class="voice-recorder-sheet-eyebrow">Hermes Voice Input</p>
+                  <h3>Recorder ready</h3>
+                </div>
+                <button id="voice-recorder-close-button" class="ghost-button small-button" type="button">Dismiss</button>
+              </div>
+              <p id="voice-recorder-sheet-status" class="voice-recorder-sheet-status">
+                Hermes opened a recorder window. Use it to allow mic access and capture a short voice note.
+              </p>
+            </div>
+          </div>
+          <div class="toggle-cluster">
+            <label class="checkbox-row compact-row">
+              <input id="share-page" type="checkbox">
+              <span>Use current page</span>
+            </label>
+            <label class="checkbox-row compact-row">
+              <input id="include-transcript" type="checkbox">
+              <span id="include-transcript-label">Include transcript once per video</span>
+            </label>
+          </div>
+          <details id="bundle-panel" class="bundle-panel" hidden open>
+            <summary class="bundle-summary" title="Show or hide the page context bundle for this turn">
+              <div class="bundle-head">
+                <div>
+                  <h3>About to send</h3>
+                  <p class="bundle-copy">Trim any chunk for this turn only.</p>
+                </div>
+                <span id="bundle-mode-note" class="bundle-mode-note" hidden>Challenge mode on</span>
+              </div>
+            </summary>
+            <div class="bundle-content">
+              <div id="bundle-list" class="bundle-list"></div>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <details id="page-panel" class="card utility-panel">
+        <summary class="details-summary">
+          <div>
+            <h2>Current page</h2>
+            <p class="section-copy">Tracks the active tab automatically.</p>
+          </div>
+        </summary>
+        <div class="details-body">
+          <div class="section-head compact-head">
+            <div class="summary-chips">
+              <span id="content-kind" class="summary-chip">-</span>
+              <span id="selection-length" class="summary-chip">0 chars selected</span>
+              <span id="page-text-length" class="summary-chip">0 chars page text</span>
+              <span id="pdf-image-status" class="summary-chip" hidden>0 PDF images</span>
+              <span id="transcript-status" class="summary-chip">Checking transcript...</span>
+            </div>
+          </div>
+          <p id="page-title" class="page-title">Loading page context...</p>
+          <p id="page-url" class="page-url"></p>
+        </div>
+      </details>
+
+    </main>
+    <script src="theme.js"></script>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

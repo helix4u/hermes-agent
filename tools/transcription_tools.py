@@ -172,7 +172,29 @@ def _get_provider(stt_config: dict) -> str:
     if not is_stt_enabled(stt_config):
         return "none"
 
-    provider = stt_config.get("provider", DEFAULT_PROVIDER)
+    provider_raw = stt_config.get("provider")
+    provider_is_explicit = provider_raw is not None and str(provider_raw).strip() != ""
+    provider = provider_raw
+    if not provider_is_explicit:
+        # Backward compatibility + safety:
+        # If users set an API model (e.g. whisper-1) but omitted provider, infer
+        # the provider from the model instead of silently defaulting to local STT.
+        model_hint = str(stt_config.get("model") or "").strip()
+        if model_hint in OPENAI_MODELS and _HAS_OPENAI and _resolve_openai_api_key():
+            logger.info(
+                "stt.provider is unset; inferring provider=openai from stt.model=%s",
+                model_hint,
+            )
+            provider = "openai"
+        elif model_hint in GROQ_MODELS and _HAS_OPENAI and os.getenv("GROQ_API_KEY"):
+            logger.info(
+                "stt.provider is unset; inferring provider=groq from stt.model=%s",
+                model_hint,
+            )
+            provider = "groq"
+        else:
+            provider = DEFAULT_PROVIDER
+    provider = str(provider).strip().lower()
 
     if provider == "local":
         if _HAS_FASTER_WHISPER:
@@ -220,6 +242,10 @@ def _get_provider(stt_config: dict) -> str:
 
     if provider == "openai":
         if _HAS_OPENAI and _resolve_openai_api_key():
+            return "openai"
+        if provider_is_explicit:
+            # Honor explicit provider choice so users get a direct config/runtime
+            # error instead of silently falling back to a different backend.
             return "openai"
         # OpenAI requested but no key — fall back
         if _HAS_FASTER_WHISPER:

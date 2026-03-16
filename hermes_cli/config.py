@@ -222,7 +222,7 @@ DEFAULT_CONFIG = {
     
     # Text-to-speech configuration
     "tts": {
-        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai"
+        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "f5"
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
@@ -235,6 +235,12 @@ DEFAULT_CONFIG = {
             "model": "gpt-4o-mini-tts",
             "voice": "alloy",
             # Voices: alloy, echo, fable, onyx, nova, shimmer
+        },
+        "f5": {
+            "base_url": "http://localhost:8081",
+            "voice_profile": "",
+            "token_ttl_minutes": 30,
+            "request_timeout_seconds": 300,
         },
     },
     
@@ -330,7 +336,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 8,
+    "_config_version": 9,
 }
 
 # =============================================================================
@@ -344,6 +350,7 @@ ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
     4: ["VOICE_TOOLS_OPENAI_KEY", "ELEVENLABS_API_KEY"],
     5: ["WHATSAPP_ENABLED", "WHATSAPP_MODE", "WHATSAPP_ALLOWED_USERS",
         "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"],
+    9: ["F5TTS_SECRET_KEY"],
 }
 
 # Required environment variables with metadata for migration prompts.
@@ -529,6 +536,14 @@ OPTIONAL_ENV_VARS = {
         "prompt": "OpenAI API Key (for Whisper STT + TTS)",
         "url": "https://platform.openai.com/api-keys",
         "tools": ["voice_transcription", "openai_tts"],
+        "password": True,
+        "category": "tool",
+    },
+    "F5TTS_SECRET_KEY": {
+        "description": "Secret key used to mint JWTs for a local F5TTS-FASTAPI service (minimum 32 bytes for HS256)",
+        "prompt": "F5 TTS secret key",
+        "url": None,
+        "tools": ["f5_tts"],
         "password": True,
         "category": "tool",
     },
@@ -1223,6 +1238,7 @@ def show_config():
     keys = [
         ("OPENROUTER_API_KEY", "OpenRouter"),
         ("VOICE_TOOLS_OPENAI_KEY", "OpenAI (STT/TTS)"),
+        ("F5TTS_SECRET_KEY", "F5 TTS"),
         ("FIRECRAWL_API_KEY", "Firecrawl"),
         ("BROWSERBASE_API_KEY", "Browserbase"),
         ("FAL_KEY", "FAL"),
@@ -1371,6 +1387,7 @@ def set_config_value(key: str, value: str):
     # Check if it's an API key (goes to .env)
     api_keys = [
         'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
+        'F5TTS_SECRET_KEY',
         'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL', 'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID',
         'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
         'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',

@@ -297,6 +297,7 @@ class AIAgent:
         clarify_callback: callable = None,
         step_callback: callable = None,
         max_tokens: int = None,
+        max_tool_calls_per_run: int = None,
         reasoning_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
@@ -340,6 +341,7 @@ class AIAgent:
             clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
                 Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
             max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
+            max_tool_calls_per_run (int): Soft tool-call budget used for guidance prompts (optional).
             reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
                 If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
             prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
@@ -395,6 +397,12 @@ class AIAgent:
         self.reasoning_callback = reasoning_callback
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
+        self.max_tool_calls_per_run = (
+            max_tool_calls_per_run
+            if isinstance(max_tool_calls_per_run, int) and max_tool_calls_per_run > 0
+            else None
+        )
+        self._tool_calls_executed_total = 0
         self._last_reported_tool = None  # Track for "new tool" mode
         
         # Interrupt mechanism for breaking out of tool loops
@@ -3906,7 +3914,8 @@ class AIAgent:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
         # ── Concurrent execution ─────────────────────────────────────────
-        # Each slot holds (function_name, function_args, function_result, duration, error_flag)
+        # Each slot holds:
+        # (function_name, function_args, function_result, duration, error_flag, status_suffix)
         results = [None] * num_tools
 
         def _run_tool(index, tool_call, function_name, function_args):
@@ -3918,8 +3927,8 @@ class AIAgent:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
-            is_error, _ = _detect_tool_failure(function_name, result)
-            results[index] = (function_name, function_args, result, duration, is_error)
+            is_error, status_suffix = _detect_tool_failure(function_name, result)
+            results[index] = (function_name, function_args, result, duration, is_error, status_suffix)
 
         # Start spinner for CLI mode
         spinner = None
@@ -3952,8 +3961,10 @@ class AIAgent:
                 # Shouldn't happen, but safety fallback
                 function_result = f"Error executing tool '{name}': thread did not return a result"
                 tool_duration = 0.0
+                is_error = True
+                status_suffix = ""
             else:
-                function_name, function_args, function_result, tool_duration, is_error = r
+                function_name, function_args, function_result, tool_duration, is_error, status_suffix = r
 
                 if is_error:
                     result_preview = function_result[:200] if len(function_result) > 200 else function_result
@@ -3962,6 +3973,25 @@ class AIAgent:
                 if self.verbose_logging:
                     logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                     logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+
+            if self.tool_progress_callback:
+                progress_result = function_result
+                if len(progress_result) > 4000:
+                    progress_result = progress_result[:4000] + "\n...[truncated for progress]"
+                try:
+                    self.tool_progress_callback(
+                        "_tool_result",
+                        name,
+                        {
+                            "tool": name,
+                            "duration_seconds": tool_duration,
+                            "is_error": is_error,
+                            "status_suffix": status_suffix.strip(),
+                            "result": progress_result,
+                        },
+                    )
+                except Exception:
+                    logging.debug("Tool progress completion callback failed for %s", name, exc_info=True)
 
             # Print cute message per tool
             if self.quiet_mode:
@@ -3992,6 +4022,7 @@ class AIAgent:
                 "tool_call_id": tc.id,
             }
             messages.append(tool_msg)
+            self._tool_calls_executed_total += 1
 
         # ── Budget pressure injection ────────────────────────────────────
         budget_warning = self._get_budget_warning(api_call_count)
@@ -4216,9 +4247,28 @@ class AIAgent:
 
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
-            _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+            _is_error_result, _status_suffix = _detect_tool_failure(function_name, function_result)
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+
+            if self.tool_progress_callback:
+                progress_result = function_result
+                if len(progress_result) > 4000:
+                    progress_result = progress_result[:4000] + "\n...[truncated for progress]"
+                try:
+                    self.tool_progress_callback(
+                        "_tool_result",
+                        function_name,
+                        {
+                            "tool": function_name,
+                            "duration_seconds": tool_duration,
+                            "is_error": _is_error_result,
+                            "status_suffix": _status_suffix.strip(),
+                            "result": progress_result,
+                        },
+                    )
+                except Exception:
+                    logging.debug("Tool progress completion callback failed for %s", function_name, exc_info=True)
 
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
@@ -4243,6 +4293,7 @@ class AIAgent:
                 "tool_call_id": tool_call.id
             }
             messages.append(tool_msg)
+            self._tool_calls_executed_total += 1
 
             if not self.quiet_mode:
                 if self.verbose_logging:
@@ -4288,6 +4339,48 @@ class AIAgent:
                 remaining = self.max_iterations - api_call_count
                 tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
                 print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
+
+    def _append_tool_budget_guidance(self, api_messages: list, api_call_count: int) -> list:
+        """Attach a transient budget note so the model can pace tool usage.
+
+        This message is request-only and is never written to conversation history.
+        """
+        if not api_messages:
+            return api_messages
+
+        enabled = os.getenv("HERMES_TOOL_BUDGET_GUIDANCE", "true").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            return api_messages
+
+        max_tool_calls = self.max_tool_calls_per_run
+        if max_tool_calls is None:
+            raw_limit = (
+                os.getenv("HERMES_MAX_TOOL_CALLS_PER_RUN")
+                or os.getenv("HERMES_MAX_TOOL_CALLS_PER_RESPONSE")
+                or "0"
+            )
+            try:
+                max_tool_calls = int(str(raw_limit).strip() or "0")
+            except (TypeError, ValueError):
+                max_tool_calls = 0
+            if max_tool_calls <= 0:
+                max_tool_calls = max(self.max_iterations * 4, 8)
+
+        used_tool_calls = int(getattr(self, "_tool_calls_executed_total", 0))
+        remaining_tool_calls = max(max_tool_calls - used_tool_calls, 0)
+        remaining_iterations = max(self.max_iterations - api_call_count, 0)
+
+        guidance = (
+            "[System: Tool budget status for this turn:\n"
+            f"- API iterations remaining after this response: {remaining_iterations}\n"
+            f"- Tool calls used so far this run: {used_tool_calls}\n"
+            f"- Tool calls remaining in soft budget: {remaining_tool_calls} (max {max_tool_calls})\n"
+            "Use tools deliberately, batch where possible, and avoid redundant calls.]"
+        )
+
+        augmented = list(api_messages)
+        augmented.append({"role": "user", "content": guidance})
+        return augmented
 
     def _get_budget_warning(self, api_call_count: int) -> Optional[str]:
         """Return a budget pressure string, or None if not yet needed.
@@ -4512,6 +4605,7 @@ class AIAgent:
         self._turns_since_memory = 0
         self._iters_since_skill = 0
         self.iteration_budget = IterationBudget(self.max_iterations)
+        self._tool_calls_executed_total = 0
         
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
@@ -4798,6 +4892,8 @@ class AIAgent:
             # loading or manual message manipulation.
             if hasattr(self, 'context_compressor') and self.context_compressor:
                 api_messages = self.context_compressor._sanitize_tool_pairs(api_messages)
+
+            api_messages = self._append_tool_budget_guidance(api_messages, api_call_count)
 
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)

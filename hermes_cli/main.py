@@ -74,6 +74,26 @@ from hermes_constants import OPENROUTER_BASE_URL
 logger = logging.getLogger(__name__)
 
 
+def _configure_console_encoding() -> None:
+    """Prevent Unicode output crashes in Windows cmd sessions."""
+    if os.name != "nt":
+        return
+
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            # Prefer UTF-8 for box drawing symbols and check marks in output.
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            # Fall back to replacing unsupported characters in the current code page.
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
 def _relative_time(ts) -> str:
     """Format a timestamp as relative time (e.g., '2h ago', 'yesterday')."""
     if not ts:
@@ -2411,6 +2431,8 @@ def _coalesce_session_name_args(argv: list) -> list:
 
 def main():
     """Main entry point for hermes CLI."""
+    _configure_console_encoding()
+
     parser = argparse.ArgumentParser(
         prog="hermes",
         description="Hermes Agent - AI assistant with tool-calling capabilities",
@@ -2600,6 +2622,11 @@ For more help on a command:
     # gateway start
     gateway_start = gateway_subparsers.add_parser("start", help="Start gateway service")
     gateway_start.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_start.add_argument(
+        "--no-startup-stream",
+        action="store_true",
+        help="On Windows, do not stream initial startup logs in this terminal",
+    )
     
     # gateway stop
     gateway_stop = gateway_subparsers.add_parser("stop", help="Stop gateway service")
@@ -2608,11 +2635,22 @@ For more help on a command:
     # gateway restart
     gateway_restart = gateway_subparsers.add_parser("restart", help="Restart gateway service")
     gateway_restart.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_restart.add_argument(
+        "--no-startup-stream",
+        action="store_true",
+        help="On Windows, do not stream initial startup logs in this terminal",
+    )
     
     # gateway status
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
     gateway_status.add_argument("--deep", action="store_true", help="Deep status check")
     gateway_status.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+
+    # gateway logs
+    gateway_logs = gateway_subparsers.add_parser("logs", help="Show gateway logs")
+    gateway_logs.add_argument("-n", "--lines", type=int, default=30, help="Number of recent lines to show")
+    gateway_logs.add_argument("-f", "--follow", action="store_true", help="Follow new log output")
+    gateway_logs.add_argument("--error", action="store_true", help="Include gateway-error.log alongside gateway.log")
     
     # gateway install
     gateway_install = gateway_subparsers.add_parser("install", help="Install gateway as service")

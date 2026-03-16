@@ -108,6 +108,11 @@ def _ensure_current_event_loop(request):
 @pytest.fixture(autouse=True)
 def _enforce_test_timeout():
     """Kill any individual test that takes longer than 30 seconds."""
+    if not hasattr(signal, "SIGALRM") or not hasattr(signal, "alarm"):
+        # Windows does not provide SIGALRM/alarm; skip per-test alarm enforcement.
+        yield
+        return
+
     old = signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(30)
     yield

@@ -14,20 +14,28 @@ Usage:
 """
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import os
 import re
 import shlex
+import shutil
+import socket
 import sys
 import signal
 import tempfile
 import threading
 import time
+import uuid
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
+from urllib.parse import quote
+from urllib.request import urlopen
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -180,6 +188,19 @@ if _config_path.exists():
                     os.environ[_env_map["base_url"]] = _base_url
                 if _api_key:
                     os.environ[_env_map["api_key"]] = _api_key
+        _browser_cfg = _cfg.get("browser", {})
+        if _browser_cfg and isinstance(_browser_cfg, dict):
+            _browser_env_map = {
+                "backend": "BROWSER_BACKEND",
+                "inactivity_timeout": "BROWSER_INACTIVITY_TIMEOUT",
+                "navigate_timeout": "BROWSER_NAVIGATE_TIMEOUT",
+                "headless": "BROWSER_HEADLESS",
+                "profile_dir": "BROWSER_PROFILE_DIR",
+                "user_agent": "BROWSER_USER_AGENT",
+            }
+            for _cfg_key, _env_var in _browser_env_map.items():
+                if _cfg_key in _browser_cfg:
+                    os.environ[_env_var] = str(_browser_cfg[_cfg_key])
         _agent_cfg = _cfg.get("agent", {})
         if _agent_cfg and isinstance(_agent_cfg, dict):
             if "max_turns" in _agent_cfg:
@@ -227,6 +248,15 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter, DeliveryTarget
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.browser_bridge import (
+    BrowserBridgeConfig,
+    BrowserBridgeServer,
+    build_bridge_chat_id,
+    build_browser_chat_message,
+    build_browser_context_message,
+    fetch_pdf_page_images,
+    fetch_pdf_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +334,299 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     return None
 
 
+def _load_user_config() -> dict:
+    """Load ~/.hermes/config.yaml as a dictionary."""
+    import yaml
+
+    config_path = _hermes_home / "config.yaml"
+    if not config_path.exists():
+        return {}
+    with open(config_path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _save_user_config(config: dict) -> None:
+    """Persist ~/.hermes/config.yaml."""
+    import yaml
+
+    config_path = _hermes_home / "config.yaml"
+    with open(config_path, "w", encoding="utf-8", newline="") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+
+def _get_image_generation_defaults() -> Optional[dict]:
+    """Return persisted image-generation defaults, if any."""
+    try:
+        config = _load_user_config()
+    except Exception:
+        return None
+    image_cfg = config.get("image_generation", {})
+    if not isinstance(image_cfg, dict):
+        return None
+    defaults = image_cfg.get("defaults", {})
+    if not isinstance(defaults, dict):
+        return None
+    model = str(defaults.get("model") or "").strip()
+    if not model:
+        return None
+    raw_aspect_ratio = defaults.get("aspect_ratio")
+    sexagesimal_map = {
+        61: "1:1",
+        243: "4:3",
+        184: "3:4",
+        556: "9:16",
+        969: "16:9",
+    }
+    if isinstance(raw_aspect_ratio, int):
+        defaults["aspect_ratio"] = sexagesimal_map.get(raw_aspect_ratio, str(raw_aspect_ratio))
+    elif raw_aspect_ratio is not None:
+        defaults["aspect_ratio"] = str(raw_aspect_ratio).strip()
+    return defaults
+
+
+def _save_image_generation_defaults(
+    *,
+    model: str,
+    aspect_ratio: str,
+    width: int,
+    height: int,
+) -> None:
+    """Persist image-generation defaults into config.yaml."""
+    config = _load_user_config()
+    image_cfg = config.setdefault("image_generation", {})
+    if not isinstance(image_cfg, dict):
+        image_cfg = {}
+        config["image_generation"] = image_cfg
+    defaults = image_cfg.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        defaults = {}
+        image_cfg["defaults"] = defaults
+
+    defaults.update(
+        {
+            "provider": "invokeai-local-api",
+            "model": model,
+            "aspect_ratio": aspect_ratio,
+            "width": int(width),
+            "height": int(height),
+        }
+    )
+    _save_user_config(config)
+
+
+def _format_image_defaults(defaults: dict) -> str:
+    """Human-readable summary of saved image defaults."""
+    model = defaults.get("model", "")
+    aspect_ratio = defaults.get("aspect_ratio", "1:1")
+    width = defaults.get("width")
+    height = defaults.get("height")
+    lines = [
+        "Image defaults",
+        f"- Model: `{model}`",
+        f"- Aspect ratio: `{aspect_ratio}`",
+    ]
+    if width and height:
+        lines.append(f"- Resolution: `{width}x{height}`")
+    return "\n".join(lines)
+
+
+def _get_wiki_source_root() -> Path:
+    """Return the on-disk source root that contains wiki content."""
+    return _hermes_home / "workspace" / "data"
+
+
+def _get_wiki_web_root_base() -> Path:
+    """Return the parent directory used for generated LAN wiki roots.
+
+    Keep this outside workspace so agent file-editing scopes do not treat
+    transient serving artifacts as wiki source content.
+    """
+    return _hermes_home / ".runtime" / "wiki_serve"
+
+
+def _link_or_copy_path(source: Path, dest: Path) -> None:
+    """Create a symlink when possible, otherwise copy the source into place."""
+    try:
+        os.symlink(source, dest, target_is_directory=source.is_dir())
+        return
+    except OSError:
+        pass
+
+    if source.is_dir():
+        shutil.copytree(source, dest)
+    else:
+        shutil.copy2(source, dest)
+
+
+def _build_wiki_web_root() -> Path:
+    """Create an isolated web root that exposes only the wiki landing page and wiki tree."""
+    source_root = _get_wiki_source_root()
+    landing_page = source_root / "knowledge_wiki.html"
+    wiki_root = source_root / "wiki"
+    if not landing_page.exists():
+        raise FileNotFoundError(f"Wiki landing page not found: {landing_page}")
+    if not wiki_root.exists():
+        raise FileNotFoundError(f"Wiki content directory not found: {wiki_root}")
+
+    web_root_base = _get_wiki_web_root_base()
+    web_root_base.mkdir(parents=True, exist_ok=True)
+    web_root = Path(tempfile.mkdtemp(prefix="lan_wiki_", dir=web_root_base))
+
+    _link_or_copy_path(landing_page, web_root / "knowledge_wiki.html")
+    _link_or_copy_path(landing_page, web_root / "index.html")
+    _link_or_copy_path(wiki_root, web_root / "wiki")
+    return web_root
+
+
+def _cleanup_wiki_web_root(web_root: Optional[Path]) -> None:
+    """Remove a generated LAN wiki root without touching the source wiki content."""
+    if not web_root:
+        return
+    try:
+        shutil.rmtree(web_root, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _get_wiki_host_config() -> dict:
+    """Load persisted wiki-hosting configuration."""
+    try:
+        config = _load_user_config()
+    except Exception:
+        return {}
+    wiki_cfg = config.get("wiki_hosting", {})
+    return wiki_cfg if isinstance(wiki_cfg, dict) else {}
+
+
+def _save_wiki_host_config(*, enabled: bool, port: Optional[int]) -> None:
+    """Persist wiki-hosting configuration to config.yaml."""
+    config = _load_user_config()
+    wiki_cfg = config.setdefault("wiki_hosting", {})
+    if not isinstance(wiki_cfg, dict):
+        wiki_cfg = {}
+        config["wiki_hosting"] = wiki_cfg
+    wiki_cfg["enabled"] = bool(enabled)
+    if port is not None:
+        wiki_cfg["port"] = int(port)
+    _save_user_config(config)
+
+
+def _resolve_lan_ip() -> str:
+    """Best-effort LAN IPv4 for URLs shown to the user."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    candidates: List[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET):
+            candidate = info[4][0]
+            if candidate and not candidate.startswith("127.") and candidate not in candidates:
+                candidates.append(candidate)
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if candidate.startswith("192.168.1."):
+            return candidate
+    for candidate in candidates:
+        if candidate.startswith(("192.168.", "10.", "172.")):
+            return candidate
+    return "127.0.0.1"
+
+
+class _QuietWikiRequestHandler(SimpleHTTPRequestHandler):
+    """Simple static-file handler with quieter logging."""
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path in {"/wiki/knowledge_wiki.html", "/wiki/"}:
+            self.send_response(302)
+            self.send_header("Location", "/knowledge_wiki.html")
+            self.end_headers()
+            return
+        super().do_GET()
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A003
+        logger.debug("wiki-host: " + format, *args)
+
+
+class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """HTTP server that requests exclusive port ownership when available."""
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        super().server_bind()
+
+
+class _EncodingSafeStream:
+    """Best-effort wrapper that degrades unencodable writes with replacement."""
+
+    def __init__(self, stream: Any):
+        self._stream = stream
+        self.encoding = getattr(stream, "encoding", None)
+
+    def write(self, data: str) -> Any:
+        try:
+            return self._stream.write(data)
+        except UnicodeEncodeError:
+            encoding = self.encoding or "utf-8"
+            safe = str(data).encode(encoding, errors="replace").decode(encoding, errors="replace")
+            return self._stream.write(safe)
+
+    def flush(self) -> Any:
+        return self._stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def _harden_windows_console_logging() -> None:
+    """Prevent logging UnicodeEncodeError on legacy Windows console codepages."""
+    if os.name != "nt":
+        return
+
+    for handler in logging.getLogger().handlers:
+        if not isinstance(handler, logging.StreamHandler):
+            continue
+        # File handlers have their own encoding handling; only patch live streams.
+        if isinstance(handler, RotatingFileHandler):
+            continue
+
+        stream = getattr(handler, "stream", None)
+        if stream is None:
+            continue
+
+        reconfigured = False
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+                reconfigured = True
+        except Exception:
+            reconfigured = False
+
+        if not reconfigured:
+            try:
+                handler.stream = _EncodingSafeStream(stream)
+            except Exception:
+                pass
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -345,6 +668,17 @@ class GatewayRunner:
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
+        self._wiki_server: Optional[ThreadingHTTPServer] = None
+        self._wiki_server_thread: Optional[threading.Thread] = None
+        self._wiki_host_port: Optional[int] = None
+        self._wiki_web_root: Optional[Path] = None
+        self._update_notification_task: Optional[asyncio.Task] = None
+
+        # Browser extension sidecar bridge state
+        self._browser_bridge: Optional[BrowserBridgeServer] = None
+        self._browser_bridge_tasks: Dict[str, asyncio.Task] = {}
+        self._browser_bridge_progress: Dict[str, Dict[str, Any]] = {}
+        self._browser_bridge_pending_interrupts: set[str] = set()
 
         # Persistent Honcho managers keyed by gateway session key.
         # This preserves write_frequency="session" semantics across short-lived
@@ -439,7 +773,7 @@ class GatewayRunner:
 
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
-            data = json.loads(self._VOICE_MODE_PATH.read_text())
+            data = json.loads(self._VOICE_MODE_PATH.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
 
@@ -457,7 +791,8 @@ class GatewayRunner:
         try:
             self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
             self._VOICE_MODE_PATH.write_text(
-                json.dumps(self._voice_mode, indent=2)
+                json.dumps(self._voice_mode, indent=2),
+                encoding="utf-8",
             )
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
@@ -592,6 +927,695 @@ class GatewayRunner:
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
         )
+
+    @staticmethod
+    def _is_browser_bridge_source(source: Optional[SessionSource]) -> bool:
+        """Return True when the session source came from the browser sidecar bridge."""
+        if not source:
+            return False
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        return source.platform == Platform.LOCAL and chat_id.startswith("browser-bridge:")
+
+    def _build_browser_bridge_source(
+        self,
+        browser_label: str,
+        client_session_id: str = "",
+    ) -> SessionSource:
+        """Build a stable local source for browser sidecar conversations."""
+        label = str(browser_label or "").strip() or "Chrome Extension"
+        chat_id = build_bridge_chat_id(label, str(client_session_id or "").strip())
+        return SessionSource(
+            platform=Platform.LOCAL,
+            chat_id=chat_id,
+            chat_name=label,
+            chat_type="dm",
+            user_id="local-browser",
+            user_name=label,
+        )
+
+    def _resolve_browser_bridge_source(
+        self,
+        payload: Dict[str, Any],
+    ) -> SessionSource:
+        """Resolve sidecar source from payload session key or label/session-id fields."""
+        requested_session_key = str(payload.get("sessionKey") or "").strip()
+        if requested_session_key:
+            try:
+                self.session_store._ensure_loaded()
+                entry = self.session_store._entries.get(requested_session_key)
+                if not entry or not self._is_browser_bridge_source(entry.origin):
+                    raise ValueError("Unknown browser sidecar session.")
+                return entry.origin
+            except Exception as exc:
+                raise ValueError("Unknown browser sidecar session.") from exc
+
+        browser_label = str(payload.get("browserLabel") or "").strip() or "Chrome Extension"
+        client_session_id = str(payload.get("clientSessionId") or "").strip()
+        return self._build_browser_bridge_source(browser_label, client_session_id)
+
+    def _append_browser_bridge_progress_event(
+        self,
+        session_key: str,
+        message: str,
+        *,
+        limit: int = 6,
+    ) -> List[str]:
+        """Append a short progress event and return the bounded event list."""
+        normalized = str(message or "").strip()
+        if not normalized:
+            normalized = "Working..."
+        events = list(self._browser_bridge_progress.get(session_key, {}).get("recent_events") or [])
+        stamp = datetime.now().strftime("%H:%M:%S")
+        events.append(f"[{stamp}] {normalized}")
+        if len(events) > limit:
+            events = events[-limit:]
+        return events
+
+    def _wiki_host_status_message(self) -> str:
+        """Human-readable current wiki hosting state."""
+        if not self._wiki_server or not self._wiki_host_port:
+            return (
+                "Wiki hosting is currently disabled.\n\n"
+                "Use `/wiki-host enable <port>` to expose the local wiki on your LAN."
+            )
+
+        lan_ip = _resolve_lan_ip()
+        url = f"http://{lan_ip}:{self._wiki_host_port}/knowledge_wiki.html"
+        web_root = self._wiki_web_root or _get_wiki_web_root_base()
+        return (
+            "Wiki hosting is enabled.\n"
+            f"- Root: `{web_root}`\n"
+            f"- Port: `{self._wiki_host_port}`\n"
+            f"- URL: {url}"
+        )
+
+    def _start_wiki_host(self, port: int) -> str:
+        """Start or restart the local LAN wiki host."""
+        if self._wiki_server and self._wiki_host_port == port:
+            return self._wiki_host_status_message()
+
+        self._stop_wiki_host()
+        web_root = _build_wiki_web_root()
+
+        handler = lambda *args, **kwargs: _QuietWikiRequestHandler(  # noqa: E731
+            *args,
+            directory=str(web_root),
+            **kwargs,
+        )
+        server = _ExclusiveThreadingHTTPServer(("0.0.0.0", int(port)), handler)
+        server.daemon_threads = True
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name=f"wiki-host-{port}",
+            daemon=True,
+        )
+        thread.start()
+
+        self._wiki_server = server
+        self._wiki_server_thread = thread
+        self._wiki_host_port = int(port)
+        self._wiki_web_root = web_root
+        probe_url = f"http://127.0.0.1:{port}/knowledge_wiki.html"
+        deadline = time.time() + 3
+        last_error: Optional[Exception] = None
+        while time.time() < deadline:
+            try:
+                with urlopen(probe_url, timeout=1) as resp:
+                    if getattr(resp, "status", 200) == 200:
+                        last_error = None
+                        break
+            except Exception as e:
+                last_error = e
+                time.sleep(0.1)
+        if last_error is not None:
+            self._stop_wiki_host()
+            raise RuntimeError(f"Wiki host started but self-probe failed for {probe_url}: {last_error}")
+        _save_wiki_host_config(enabled=True, port=port)
+        return self._wiki_host_status_message()
+
+    def _stop_wiki_host(self) -> None:
+        """Stop the local wiki host if it is running."""
+        server = self._wiki_server
+        thread = self._wiki_server_thread
+        web_root = self._wiki_web_root
+        self._wiki_server = None
+        self._wiki_server_thread = None
+        self._wiki_host_port = None
+        self._wiki_web_root = None
+
+        if server:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        if thread and thread.is_alive():
+            thread.join(timeout=2)
+        _cleanup_wiki_web_root(web_root)
+
+    def _set_browser_bridge_progress(
+        self,
+        session_key: str,
+        *,
+        running: bool,
+        detail: str = "",
+        error: str = "",
+        interrupt_requested: bool = False,
+        recent_events: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Update in-memory sidecar progress state for one session."""
+        state = dict(self._browser_bridge_progress.get(session_key, {}))
+        now = time.time()
+        if running and not state.get("started_at"):
+            state["started_at"] = now
+        if not running:
+            state["finished_at"] = now
+        state["running"] = bool(running)
+        state["detail"] = str(detail or state.get("detail") or "").strip()
+        state["error"] = str(error or "").strip()
+        state["interrupt_requested"] = bool(interrupt_requested)
+        if recent_events is not None:
+            state["recent_events"] = list(recent_events)
+        else:
+            state["recent_events"] = list(state.get("recent_events") or [])
+        if not running and not state["detail"]:
+            state["detail"] = "Reply ready."
+        self._browser_bridge_progress[session_key] = state
+        return state
+
+    def _get_browser_bridge_progress_snapshot(self, session_key: str) -> Dict[str, Any]:
+        """Return serialized progress data for browser sidecar polling."""
+        state = dict(self._browser_bridge_progress.get(session_key, {}))
+        task = self._browser_bridge_tasks.get(session_key)
+        if task and task.done():
+            self._browser_bridge_tasks.pop(session_key, None)
+            if state.get("running"):
+                state["running"] = False
+                state["detail"] = state.get("detail") or "Reply ready."
+                state["finished_at"] = time.time()
+                self._browser_bridge_progress[session_key] = state
+
+        started_at = state.get("started_at")
+        finished_at = state.get("finished_at")
+        elapsed = 0
+        if isinstance(started_at, (int, float)):
+            end = finished_at if isinstance(finished_at, (int, float)) and not state.get("running") else time.time()
+            elapsed = max(0, int(end - started_at))
+
+        return {
+            "running": bool(state.get("running")),
+            "detail": str(state.get("detail") or "").strip(),
+            "error": str(state.get("error") or "").strip(),
+            "interrupt_requested": bool(state.get("interrupt_requested")),
+            "elapsed_seconds": elapsed,
+            "recent_events": list(state.get("recent_events") or []),
+        }
+
+    def _normalize_browser_bridge_public_host(self, host: str) -> str:
+        normalized = str(host or "").strip()
+        if normalized in {"0.0.0.0", "::", "[::]"}:
+            return "127.0.0.1"
+        return normalized or "127.0.0.1"
+
+    def _build_browser_bridge_media_url(self, media_path: str) -> str:
+        bridge = self._browser_bridge
+        if not bridge:
+            return ""
+        try:
+            resolved = Path(media_path).expanduser().resolve()
+        except Exception:
+            return ""
+        if not resolved.exists() or not resolved.is_file():
+            return ""
+        mime_type = mimetypes.guess_type(str(resolved))[0] or ""
+        if not mime_type.startswith("image/"):
+            return ""
+        host = self._normalize_browser_bridge_public_host(bridge.config.host)
+        token = quote(bridge.config.token, safe="")
+        encoded_path = quote(str(resolved), safe="")
+        return f"http://{host}:{bridge.config.port}/media?path={encoded_path}&token={token}"
+
+    @staticmethod
+    def _extract_browser_bridge_content(content: Any) -> str:
+        """Flatten message content from either plain strings or rich content blocks."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                        continue
+                    if "content" in item and isinstance(item["content"], str):
+                        parts.append(item["content"])
+            return "\n".join(part for part in parts if part).strip()
+        if isinstance(content, dict):
+            text = content.get("text") or content.get("content")
+            if isinstance(text, str):
+                return text
+        return str(content or "").strip()
+
+    @staticmethod
+    def _extract_browser_bridge_label(message: str, prefix: str) -> str:
+        for line in str(message or "").splitlines():
+            if line.startswith(prefix):
+                return line[len(prefix):].strip()
+        return ""
+
+    def _serialize_browser_bridge_history(
+        self,
+        history: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Convert transcript messages to sidepanel-friendly message entries."""
+        result: List[Dict[str, Any]] = []
+        for message in history:
+            role = str(message.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = self._extract_browser_bridge_content(message.get("content"))
+            if not content.strip():
+                continue
+
+            media_paths = re.findall(r"MEDIA:(\S+)", content)
+            cleaned_content = re.sub(r"\n?MEDIA:\S+\s*", "\n", content).strip()
+            images = []
+            for raw_path in media_paths:
+                media_url = self._build_browser_bridge_media_url(raw_path.strip().rstrip('",}'))
+                if not media_url:
+                    continue
+                images.append(
+                    {
+                        "source": "local",
+                        "media_url": media_url,
+                        "mime_type": mimetypes.guess_type(raw_path)[0] or "image/png",
+                        "alt_text": Path(raw_path).name,
+                        "local_path": raw_path,
+                    }
+                )
+
+            kind = "chat"
+            page_title = ""
+            page_url = ""
+            display_content = cleaned_content
+            if role == "user" and content.startswith("[Injected browser context from the local Chrome extension]"):
+                kind = "page_context"
+                page_title = self._extract_browser_bridge_label(content, "- Title:")
+                page_url = self._extract_browser_bridge_label(content, "- URL:")
+                if "User request:" in content:
+                    request_chunk = content.split("User request:", 1)[1].strip()
+                    display_content = request_chunk.split("\n\n", 1)[0].strip()
+                if not display_content:
+                    display_content = "Shared browser page context."
+
+            timestamp = message.get("timestamp")
+            if isinstance(timestamp, (int, float)):
+                timestamp_iso = datetime.fromtimestamp(timestamp).isoformat()
+            else:
+                timestamp_iso = str(timestamp or "").strip()
+
+            result.append(
+                {
+                    "role": role,
+                    "kind": kind,
+                    "display_content": display_content,
+                    "content": cleaned_content,
+                    "page_title": page_title,
+                    "page_url": page_url,
+                    "images": images,
+                    "timestamp": timestamp_iso,
+                }
+            )
+        return result
+
+    def _get_browser_bridge_session_snapshot(self, source: SessionSource) -> Dict[str, Any]:
+        """Load current browser sidecar session state for extension polling."""
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+        progress = self._get_browser_bridge_progress_snapshot(session_entry.session_key)
+        return {
+            "session_key": session_entry.session_key,
+            "session_id": session_entry.session_id,
+            "browser_label": source.chat_name or source.user_name or "Chrome Extension",
+            "messages": self._serialize_browser_bridge_history(history),
+            "progress": progress,
+            "can_send": not bool(progress.get("running")),
+        }
+
+    def _list_browser_bridge_sessions(
+        self,
+        *,
+        limit: int = 25,
+        preferred_session_key: str = "",
+    ) -> Dict[str, Any]:
+        """Return sidecar session list for the extension history picker."""
+        self.session_store._ensure_loaded()
+        entries = [
+            entry
+            for entry in self.session_store._entries.values()
+            if self._is_browser_bridge_source(entry.origin)
+        ]
+        entries.sort(key=lambda item: item.updated_at, reverse=True)
+        sessions = []
+        for entry in entries[: max(1, min(limit, 100))]:
+            history = self.session_store.load_transcript(entry.session_id)
+            rich = self._serialize_browser_bridge_history(history)
+            last_message = rich[-1] if rich else {}
+            progress = self._get_browser_bridge_progress_snapshot(entry.session_key)
+            sessions.append(
+                {
+                    "session_key": entry.session_key,
+                    "session_id": entry.session_id,
+                    "browser_label": (entry.origin.chat_name or entry.origin.user_name or "Chrome Extension")
+                    if entry.origin
+                    else "Chrome Extension",
+                    "updated_at": entry.updated_at.isoformat() if entry.updated_at else "",
+                    "created_at": entry.created_at.isoformat() if entry.created_at else "",
+                    "message_count": len(rich),
+                    "last_message_role": last_message.get("role") or "",
+                    "last_message_preview": (last_message.get("display_content") or "")[:140],
+                    "running": bool(progress.get("running")),
+                }
+            )
+
+        active_session_key = str(preferred_session_key or "").strip()
+        if active_session_key and not any(s["session_key"] == active_session_key for s in sessions):
+            active_session_key = ""
+        if not active_session_key and sessions:
+            active_session_key = sessions[0]["session_key"]
+
+        return {
+            "active_session_key": active_session_key,
+            "sessions": sessions,
+        }
+
+    def _extract_browser_bridge_image_attachments(
+        self,
+        payload: Dict[str, Any],
+    ) -> tuple[List[str], List[str]]:
+        """Decode sidepanel image attachments to local files for vision-capable turns."""
+        attachments = payload.get("attachments")
+        if not isinstance(attachments, list):
+            return [], []
+
+        target_dir = _hermes_home / "browser_bridge_uploads"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        for item in attachments:
+            if not isinstance(item, dict):
+                continue
+            data_url = str(item.get("data_url") or "").strip()
+            if not data_url:
+                continue
+            mime_type = str(item.get("mime_type") or "image/png").strip().lower()
+            if not mime_type.startswith("image/"):
+                continue
+            try:
+                if data_url.startswith("data:"):
+                    if "," not in data_url:
+                        continue
+                    _, encoded = data_url.split(",", 1)
+                else:
+                    encoded = data_url
+                raw_bytes = base64.b64decode(encoded, validate=False)
+            except Exception:
+                continue
+            ext = mimetypes.guess_extension(mime_type) or ".png"
+            filename = f"sidecar_{uuid.uuid4().hex[:12]}{ext}"
+            out_path = target_dir / filename
+            try:
+                out_path.write_bytes(raw_bytes)
+            except Exception:
+                continue
+            media_urls.append(str(out_path))
+            media_types.append("photo")
+        return media_urls, media_types
+
+    async def _handle_browser_bridge_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        route = str(payload.get("_bridge_route") or "").strip()
+        if route == "/session":
+            return await self._handle_browser_bridge_session(payload)
+        return await self._handle_browser_bridge_payload(payload)
+
+    async def _handle_browser_bridge_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        source = self._build_browser_bridge_source(
+            str(payload.get("browserLabel") or "").strip() or "Chrome Extension",
+            str(payload.get("clientSessionId") or "").strip(),
+        )
+        message = build_browser_context_message(payload)
+        event = MessageEvent(text=message, source=source, message_type=MessageType.TEXT)
+        await self._handle_message(event)
+        snapshot = self._get_browser_bridge_session_snapshot(source)
+        snapshot["accepted"] = True
+        snapshot["detail"] = "Page context queued."
+        return snapshot
+
+    async def _handle_browser_bridge_session(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        action = str(payload.get("action") or "state").strip().lower()
+
+        if action == "fetch_pdf_text":
+            pdf_url = str(payload.get("url") or "").strip()
+            return {"pdf_text": fetch_pdf_text(pdf_url)}
+
+        if action == "fetch_pdf_preview_info":
+            pdf_url = str(payload.get("url") or "").strip()
+            images = fetch_pdf_page_images(pdf_url, max_pages=2)
+            return {"image_count": len(images)}
+
+        if action == "fetch_transcript":
+            raise ValueError("Unsupported browser bridge action: fetch_transcript")
+
+        if action == "tts":
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                raise ValueError("Text is required for tts.")
+            from tools.tts_tool import text_to_speech_tool
+
+            raw = await asyncio.to_thread(text_to_speech_tool, text)
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else {}
+            except Exception:
+                parsed = {}
+            if not parsed.get("success"):
+                raise ValueError(parsed.get("error") or "TTS generation failed.")
+            file_path = str(parsed.get("file_path") or "").strip()
+            if not file_path:
+                media_tag = str(parsed.get("media_tag") or "")
+                match = re.search(r"MEDIA:(\S+)", media_tag)
+                file_path = match.group(1) if match else ""
+            if not file_path:
+                raise ValueError("TTS output path missing.")
+            audio_path = Path(file_path).expanduser()
+            if not audio_path.exists():
+                raise ValueError("TTS output file is missing.")
+            audio_bytes = audio_path.read_bytes()
+            mime_type = mimetypes.guess_type(str(audio_path))[0] or "audio/mpeg"
+            return {
+                "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                "mime_type": mime_type,
+                "provider": str(parsed.get("provider") or "").strip(),
+            }
+
+        if action == "transcribe_audio":
+            raw_audio = str(payload.get("audio_base64") or "").strip()
+            if not raw_audio:
+                raise ValueError("audio_base64 is required for transcribe_audio.")
+            mime_type = str(payload.get("mime_type") or "audio/webm").strip().lower()
+            if raw_audio.startswith("data:") and "," in raw_audio:
+                _, raw_audio = raw_audio.split(",", 1)
+            try:
+                audio_bytes = base64.b64decode(raw_audio, validate=False)
+            except Exception as exc:
+                raise ValueError("Invalid audio_base64 payload.") from exc
+
+            ext_map = {
+                "audio/webm": ".webm",
+                "audio/ogg": ".ogg",
+                "audio/mpeg": ".mp3",
+                "audio/mp3": ".mp3",
+                "audio/wav": ".wav",
+                "audio/x-wav": ".wav",
+                "audio/mp4": ".m4a",
+            }
+            ext = ext_map.get(mime_type) or mimetypes.guess_extension(mime_type) or ".webm"
+            if ext == ".weba":
+                ext = ".webm"
+            upload_dir = _hermes_home / "browser_bridge_uploads"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            audio_path = upload_dir / f"sidecar_audio_{uuid.uuid4().hex[:12]}{ext}"
+            audio_path.write_bytes(audio_bytes)
+
+            from tools.transcription_tools import transcribe_audio
+
+            result = await asyncio.to_thread(transcribe_audio, str(audio_path))
+            if not result.get("success"):
+                raise ValueError(result.get("error") or "Audio transcription failed.")
+            return {
+                "transcript": str(result.get("transcript") or "").strip(),
+                "provider": str(result.get("provider") or "").strip(),
+            }
+
+        if action == "list":
+            preferred_session_key = str(payload.get("sessionKey") or "").strip()
+            return self._list_browser_bridge_sessions(
+                limit=int(payload.get("limit") or 25),
+                preferred_session_key=preferred_session_key,
+            )
+
+        source = self._resolve_browser_bridge_source(payload)
+        session_entry = self.session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+
+        if action == "state":
+            return self._get_browser_bridge_session_snapshot(source)
+
+        if action == "reset":
+            session_entry = self.session_store.get_or_create_session(source, force_new=True)
+            self._browser_bridge_tasks.pop(session_entry.session_key, None)
+            self._set_browser_bridge_progress(
+                session_entry.session_key,
+                running=False,
+                detail="Started a fresh sidecar session.",
+                recent_events=self._append_browser_bridge_progress_event(
+                    session_entry.session_key,
+                    "Started a fresh sidecar session.",
+                ),
+            )
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            snapshot["detail"] = "Started a fresh sidecar session."
+            return snapshot
+
+        if action == "interrupt":
+            task = self._browser_bridge_tasks.get(session_key)
+            if task and not task.done():
+                self._browser_bridge_pending_interrupts.add(session_key)
+                running_agent = self._running_agents.get(session_key)
+                if running_agent:
+                    running_agent.interrupt("Browser sidecar requested interrupt.")
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=True,
+                    detail="Interrupt requested. Hermes will stop after the current step.",
+                    interrupt_requested=True,
+                    recent_events=self._append_browser_bridge_progress_event(
+                        session_key,
+                        "Interrupt requested.",
+                    ),
+                )
+                snapshot = self._get_browser_bridge_session_snapshot(source)
+                snapshot["interrupt_requested"] = True
+                snapshot["detail"] = "Interrupt requested. Hermes will stop after the current step."
+                return snapshot
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            snapshot["interrupt_requested"] = False
+            snapshot["detail"] = "No active Hermes turn to interrupt."
+            return snapshot
+
+        if action in {"send", "send_async"}:
+            return await self._handle_browser_bridge_send(payload, source, async_mode=(action == "send_async"))
+
+        raise ValueError(f"Unsupported browser bridge action: {action}")
+
+    async def _handle_browser_bridge_send(
+        self,
+        payload: Dict[str, Any],
+        source: SessionSource,
+        *,
+        async_mode: bool,
+    ) -> Dict[str, Any]:
+        session_entry = self.session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+        existing_task = self._browser_bridge_tasks.get(session_key)
+        if existing_task and not existing_task.done():
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            snapshot["accepted"] = False
+            snapshot["busy"] = True
+            snapshot["detail"] = "Hermes is already working on this sidecar session."
+            return snapshot
+
+        page_payload = payload.get("pageContext")
+        if not isinstance(page_payload, dict):
+            page_payload = None
+        user_message = str(payload.get("message") or payload.get("note") or "").strip()
+        media_urls, media_types = self._extract_browser_bridge_image_attachments(payload)
+        if not user_message and not page_payload and media_urls:
+            user_message = "Please analyze the attached image(s)."
+        message = build_browser_chat_message(user_message, page_payload)
+        if not message.strip():
+            raise ValueError("Sidecar message is empty.")
+
+        async def _run_turn() -> None:
+            self._set_browser_bridge_progress(
+                session_key,
+                running=True,
+                detail="Hermes is thinking...",
+                recent_events=self._append_browser_bridge_progress_event(
+                    session_key,
+                    "Turn started.",
+                ),
+            )
+            try:
+                event = MessageEvent(
+                    text=message,
+                    message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
+                    source=source,
+                    media_urls=media_urls,
+                    media_types=media_types,
+                )
+                await self._handle_message(event)
+                interrupted = session_key in self._browser_bridge_pending_interrupts
+                if interrupted:
+                    self._browser_bridge_pending_interrupts.discard(session_key)
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=False,
+                    detail="Interrupted." if interrupted else "Reply ready.",
+                    interrupt_requested=False,
+                    recent_events=self._append_browser_bridge_progress_event(
+                        session_key,
+                        "Interrupted." if interrupted else "Turn finished.",
+                    ),
+                )
+            except Exception as exc:
+                logger.exception("Browser sidecar turn failed")
+                self._browser_bridge_pending_interrupts.discard(session_key)
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=False,
+                    detail="Sidecar turn failed.",
+                    error=str(exc),
+                    interrupt_requested=False,
+                    recent_events=self._append_browser_bridge_progress_event(
+                        session_key,
+                        f"Error: {exc}",
+                    ),
+                )
+            finally:
+                self._browser_bridge_tasks.pop(session_key, None)
+
+        if async_mode:
+            task = asyncio.create_task(_run_turn(), name=f"browser-bridge-{session_key}")
+            self._browser_bridge_tasks[session_key] = task
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            snapshot["accepted"] = True
+            snapshot["busy"] = True
+            snapshot["detail"] = "Turn accepted."
+            return snapshot
+
+        await _run_turn()
+        snapshot = self._get_browser_bridge_session_snapshot(source)
+        snapshot["accepted"] = True
+        snapshot["busy"] = False
+        snapshot["detail"] = snapshot.get("progress", {}).get("detail") or "Reply ready."
+        return snapshot
 
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to a non-retryable adapter failure after startup."""
@@ -864,9 +1888,9 @@ class GatewayRunner:
                     self.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
                     connected_count += 1
-                    logger.info("✓ %s connected", platform.value)
+                    logger.info("%s connected", platform.value)
                 else:
-                    logger.warning("✗ %s failed to connect", platform.value)
+                    logger.warning("%s failed to connect", platform.value)
                     if adapter.has_fatal_error:
                         target = (
                             startup_retryable_errors
@@ -881,7 +1905,7 @@ class GatewayRunner:
                             f"{platform.value}: failed to connect"
                         )
             except Exception as e:
-                logger.error("✗ %s error: %s", platform.value, e)
+                logger.error("%s error: %s", platform.value, e)
                 startup_retryable_errors.append(f"{platform.value}: {e}")
         
         if connected_count == 0:
@@ -916,6 +1940,18 @@ class GatewayRunner:
             write_runtime_status(gateway_state="running", exit_reason=None)
         except Exception:
             pass
+
+        # Start localhost browser sidecar bridge (used by the Chrome extension).
+        try:
+            self._browser_bridge = BrowserBridgeServer(
+                loop=asyncio.get_running_loop(),
+                handle_payload=self._handle_browser_bridge_request,
+                config=BrowserBridgeConfig.from_env(),
+            )
+            self._browser_bridge.start()
+        except Exception as e:
+            logger.warning("Failed to start browser bridge: %s", e)
+            self._browser_bridge = None
         
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
@@ -948,6 +1984,15 @@ class GatewayRunner:
             )
         ):
             self._schedule_update_notification_watch()
+
+        wiki_cfg = _get_wiki_host_config()
+        if wiki_cfg.get("enabled"):
+            try:
+                wiki_port = int(wiki_cfg.get("port") or 8008)
+                logger.info("Restoring wiki host on port %s", wiki_port)
+                self._start_wiki_host(wiki_port)
+            except Exception as e:
+                logger.warning("Failed to restore wiki host: %s", e)
 
         # Start background session expiry watcher for proactive memory flushing
         asyncio.create_task(self._session_expiry_watcher())
@@ -998,6 +2043,20 @@ class GatewayRunner:
         """Stop the gateway and disconnect all adapters."""
         logger.info("Stopping gateway...")
         self._running = False
+        self._stop_wiki_host()
+
+        # Stop browser sidecar work first so no new sidecar requests are accepted.
+        if self._browser_bridge:
+            try:
+                self._browser_bridge.stop()
+            except Exception as e:
+                logger.debug("Failed stopping browser bridge: %s", e)
+            self._browser_bridge = None
+        for session_key, task in list(self._browser_bridge_tasks.items()):
+            if not task.done():
+                task.cancel()
+            self._browser_bridge_tasks.pop(session_key, None)
+        self._browser_bridge_pending_interrupts.clear()
 
         for session_key, agent in list(self._running_agents.items()):
             try:
@@ -1010,12 +2069,12 @@ class GatewayRunner:
             try:
                 await adapter.cancel_background_tasks()
             except Exception as e:
-                logger.debug("✗ %s background-task cancel error: %s", platform.value, e)
+                logger.debug("%s background-task cancel error: %s", platform.value, e)
             try:
                 await adapter.disconnect()
-                logger.info("✓ %s disconnected", platform.value)
+                logger.info("%s disconnected", platform.value)
             except Exception as e:
-                logger.error("✗ %s disconnect error: %s", platform.value, e)
+                logger.error("%s disconnect error: %s", platform.value, e)
 
         self.adapters.clear()
         self._running_agents.clear()
@@ -1115,6 +2174,9 @@ class GatewayRunner:
         # user-initiated messages.  The HASS_TOKEN already authenticates the
         # connection, so HA events are always authorized.
         if source.platform == Platform.HOMEASSISTANT:
+            return True
+        # Browser sidecar and other local-origin messages are trusted on this machine.
+        if source.platform == Platform.LOCAL:
             return True
 
         user_id = source.user_id
@@ -1224,6 +2286,14 @@ class GatewayRunner:
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
+            if event.get_command() in {"terminal", "shell"}:
+                return await self._handle_terminal_command(event)
+            if event.get_command() == "cron":
+                return await self._handle_cron_command(event)
+            if event.get_command() in {"invokeai-defaults", "invokeai_defaults"}:
+                return await self._handle_image_defaults_command(event)
+            if event.get_command() in {"wiki-host", "wiki_host"}:
+                return await self._handle_wiki_host_command(event)
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
@@ -1263,7 +2333,8 @@ class GatewayRunner:
                           "personality", "plan", "retry", "undo", "sethome", "set-home",
                           "compress", "usage", "insights", "reload-mcp", "reload_mcp",
                           "update", "title", "resume", "provider", "rollback",
-                          "background", "reasoning", "voice"}
+                          "background", "reasoning", "voice", "terminal", "shell", "cron",
+                          "invokeai-defaults", "invokeai_defaults", "wiki-host", "wiki_host"}
         if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
                 "platform": source.platform.value if source.platform else "",
@@ -1287,6 +2358,12 @@ class GatewayRunner:
         if command == "model":
             return await self._handle_model_command(event)
 
+        if command in ["invokeai-defaults", "invokeai_defaults"]:
+            return await self._handle_image_defaults_command(event)
+
+        if command in ["wiki-host", "wiki_host"]:
+            return await self._handle_wiki_host_command(event)
+
         if command == "reasoning":
             return await self._handle_reasoning_command(event)
 
@@ -1295,6 +2372,12 @@ class GatewayRunner:
         
         if command == "personality":
             return await self._handle_personality_command(event)
+
+        if command in ["terminal", "shell"]:
+            return await self._handle_terminal_command(event)
+
+        if command == "cron":
+            return await self._handle_cron_command(event)
 
         if command == "plan":
             try:
@@ -2049,6 +3132,8 @@ class GatewayRunner:
             "`/status` — Show session info",
             "`/stop` — Interrupt the running agent",
             "`/model [provider:model]` — Show/change model (or switch provider)",
+            "`/invokeai-defaults [model] [aspect]` — Show or change default InvokeAI image settings",
+            "`/wiki-host [enable|disable|status] [port]` — Toggle LAN hosting for the local wiki",
             "`/provider` — Show available providers and auth status",
             "`/personality [name]` — Set a personality",
             "`/retry` — Retry your last message",
@@ -2063,6 +3148,7 @@ class GatewayRunner:
             "`/rollback [number]` — List or restore filesystem checkpoints",
             "`/background <prompt>` — Run a prompt in a separate background session",
             "`/voice [on|off|tts|status]` — Toggle voice reply mode",
+            "`/cron [list|add|remove|run|pause|resume|status|tick]` — Manage cron jobs",
             "`/reload-mcp` — Reload MCP servers from config",
             "`/update` — Update Hermes Agent to the latest version",
             "`/help` — Show this message",
@@ -2077,6 +3163,156 @@ class GatewayRunner:
         except Exception:
             pass
         return "\n".join(lines)
+
+    async def _handle_cron_command(self, event: MessageEvent) -> str:
+        """Handle /cron command in gateway chats."""
+        from tools.cronjob_tools import cronjob as cronjob_tool
+
+        args = event.get_command_args().strip()
+        if not args:
+            action = "list"
+            tokens: list[str] = []
+        else:
+            try:
+                tokens = shlex.split(args)
+            except ValueError as e:
+                return f"Invalid /cron arguments: {e}"
+            action = (tokens[0].strip().lower() if tokens else "list")
+
+        def _cron_api(**kwargs):
+            try:
+                payload = cronjob_tool(**kwargs)
+                return json.loads(payload)
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+        def _format_job_line(job: dict) -> str:
+            job_id = str(job.get("job_id", "?"))[:8]
+            name = str(job.get("name", "(unnamed)"))
+            schedule = str(job.get("schedule", "?"))
+            state = str(job.get("state", "scheduled"))
+            deliver = str(job.get("deliver", "local"))
+            next_run = str(job.get("next_run_at") or "n/a")
+            return (
+                f"- `{job_id}` **{name}**\n"
+                f"  schedule: `{schedule}` | state: `{state}` | deliver: `{deliver}` | next: `{next_run}`"
+            )
+
+        if action in {"list", "ls"}:
+            include_disabled = any(t in {"--all", "-a"} for t in tokens[1:])
+            result = _cron_api(action="list", include_disabled=include_disabled)
+            if not result.get("success"):
+                return f"Failed to list cron jobs: {result.get('error', 'unknown error')}"
+            jobs = result.get("jobs", [])
+            if not jobs:
+                return (
+                    "No scheduled jobs.\n"
+                    "Create one with `/cron add <schedule> <prompt>`."
+                )
+            lines = [f"⏰ **Scheduled Jobs ({len(jobs)})**"]
+            lines.extend(_format_job_line(job) for job in jobs)
+            return "\n".join(lines)
+
+        if action in {"add", "create"}:
+            if len(tokens) < 3:
+                return (
+                    "Usage: `/cron add <schedule> <prompt>`\n"
+                    "If your schedule has spaces, quote it. Example: "
+                    "`/cron add \"0 9 * * *\" Daily standup summary`"
+                )
+            schedule = tokens[1]
+            prompt = " ".join(tokens[2:]).strip()
+            result = _cron_api(action="create", schedule=schedule, prompt=prompt)
+            if not result.get("success"):
+                return f"Failed to create cron job: {result.get('error', 'unknown error')}"
+            return (
+                f"✅ Created cron job `{result.get('job_id', '?')}`\n"
+                f"name: **{result.get('name', '(unnamed)')}**\n"
+                f"schedule: `{result.get('schedule', schedule)}`\n"
+                f"next: `{result.get('next_run_at', 'n/a')}`"
+            )
+
+        if action in {"remove", "rm", "delete"}:
+            if len(tokens) < 2:
+                return "Usage: `/cron remove <job_id>`"
+            job_id = tokens[1]
+            result = _cron_api(action="remove", job_id=job_id)
+            if not result.get("success"):
+                return f"Failed to remove cron job: {result.get('error', 'unknown error')}"
+            removed = result.get("removed_job", {})
+            return f"🗑️ Removed cron job `{removed.get('id', job_id)}` ({removed.get('name', 'unnamed')})."
+
+        if action in {"run", "run_now", "trigger"}:
+            if len(tokens) < 2:
+                return "Usage: `/cron run <job_id>`"
+            job_id = tokens[1]
+            result = _cron_api(action="run", job_id=job_id)
+            if not result.get("success"):
+                return f"Failed to trigger cron job: {result.get('error', 'unknown error')}"
+            job = result.get("job", {})
+            return (
+                f"▶️ Triggered cron job `{job.get('job_id', job_id)}` ({job.get('name', 'unnamed')}).\n"
+                "It will run on the next scheduler tick."
+            )
+
+        if action == "pause":
+            if len(tokens) < 2:
+                return "Usage: `/cron pause <job_id>`"
+            job_id = tokens[1]
+            reason = " ".join(tokens[2:]).strip() or None
+            result = _cron_api(action="pause", job_id=job_id, reason=reason)
+            if not result.get("success"):
+                return f"Failed to pause cron job: {result.get('error', 'unknown error')}"
+            job = result.get("job", {})
+            return f"⏸️ Paused cron job `{job.get('job_id', job_id)}` ({job.get('name', 'unnamed')})."
+
+        if action == "resume":
+            if len(tokens) < 2:
+                return "Usage: `/cron resume <job_id>`"
+            job_id = tokens[1]
+            result = _cron_api(action="resume", job_id=job_id)
+            if not result.get("success"):
+                return f"Failed to resume cron job: {result.get('error', 'unknown error')}"
+            job = result.get("job", {})
+            return f"✅ Resumed cron job `{job.get('job_id', job_id)}` ({job.get('name', 'unnamed')})."
+
+        if action == "status":
+            try:
+                from hermes_cli.gateway import find_gateway_pids
+                pids = find_gateway_pids()
+            except Exception:
+                pids = []
+            result = _cron_api(action="list", include_disabled=False)
+            if not result.get("success"):
+                return f"Failed to load cron status: {result.get('error', 'unknown error')}"
+            jobs = result.get("jobs", [])
+            if pids:
+                run_state = f"running (PID: {', '.join(map(str, pids))})"
+            else:
+                run_state = "not running"
+            next_runs = [j.get("next_run_at") for j in jobs if j.get("next_run_at")]
+            next_run = min(next_runs) if next_runs else "n/a"
+            return (
+                f"⏱️ **Cron Status**\n"
+                f"gateway: `{run_state}`\n"
+                f"active jobs: `{len(jobs)}`\n"
+                f"next run: `{next_run}`"
+            )
+
+        if action == "tick":
+            try:
+                from cron.scheduler import tick as cron_tick
+                await asyncio.to_thread(cron_tick, False)
+                return "🧪 Ran one cron scheduler tick."
+            except Exception as e:
+                return f"Failed to run cron tick: {e}"
+
+        return (
+            "Unknown `/cron` subcommand.\n"
+            "Use: `/cron list`, `/cron add <schedule> <prompt>`, "
+            "`/cron remove <job_id>`, `/cron run <job_id>`, `/cron pause <job_id>`, "
+            "`/cron resume <job_id>`, `/cron status`, or `/cron tick`."
+        )
     
     async def _handle_model_command(self, event: MessageEvent) -> str:
         """Handle /model command - show or change the current model."""
@@ -2224,6 +3460,147 @@ class GatewayRunner:
             persist_note = "this session only — will revert on restart"
         return f"🤖 Model changed to `{new_model}` ({persist_note}){provider_note}{warning}\n_(takes effect on next message)_"
 
+    async def _handle_image_defaults_command(self, event: MessageEvent) -> str:
+        """Handle /invokeai-defaults command - show or change InvokeAI image defaults."""
+        aspect_presets = {
+            "1:1": (1024, 1024),
+            "16:9": (1344, 768),
+            "9:16": (768, 1344),
+            "4:3": (1152, 896),
+            "3:4": (896, 1152),
+        }
+
+        args = event.get_command_args().strip()
+        current = _get_image_generation_defaults()
+
+        if not args:
+            if current:
+                return (
+                    f"{_format_image_defaults(current)}\n"
+                    "\nTo change these, use `/invokeai-defaults <model> <aspect_ratio>`."
+                )
+            return (
+                "No image defaults saved yet.\n\n"
+                "Use `/invokeai-defaults <model> <aspect_ratio>`.\n"
+                "Supported aspect ratios: `1:1`, `16:9`, `9:16`, `4:3`, `3:4`."
+            )
+
+        try:
+            tokens = shlex.split(args)
+        except ValueError as e:
+            return f"Could not parse image defaults: {e}"
+
+        if len(tokens) > 2:
+            return (
+                "Too many arguments for `/invokeai-defaults`.\n\n"
+                "Usage: `/invokeai-defaults <model> <aspect_ratio>`\n"
+                "Example: `/invokeai-defaults \"Z-Image Turbo (quantized)\" 1:1`"
+            )
+
+        model = current.get("model") if current else None
+        aspect_ratio = current.get("aspect_ratio") if current else None
+
+        if len(tokens) == 1:
+            token = tokens[0]
+            if token in aspect_presets:
+                aspect_ratio = token
+            else:
+                model = token
+        elif len(tokens) == 2:
+            model, aspect_ratio = tokens
+
+        if not model:
+            return (
+                "Please pick a model.\n\n"
+                "The command can update just the aspect ratio if a model is already saved."
+            )
+
+        if not aspect_ratio:
+            aspect_ratio = "1:1"
+
+        if aspect_ratio not in aspect_presets:
+            valid = ", ".join(f"`{key}`" for key in aspect_presets)
+            return (
+                f"Unknown aspect ratio: `{aspect_ratio}`\n\n"
+                f"Valid options: {valid}"
+            )
+
+        width, height = aspect_presets[aspect_ratio]
+
+        try:
+            _save_image_generation_defaults(
+                model=model,
+                aspect_ratio=aspect_ratio,
+                width=width,
+                height=height,
+            )
+        except Exception as e:
+            return f"Failed to save image defaults: {e}"
+
+        os.environ["HERMES_IMAGE_DEFAULT_MODEL"] = model
+        os.environ["HERMES_IMAGE_DEFAULT_ASPECT_RATIO"] = aspect_ratio
+        os.environ["HERMES_IMAGE_DEFAULT_WIDTH"] = str(width)
+        os.environ["HERMES_IMAGE_DEFAULT_HEIGHT"] = str(height)
+
+        saved = {
+            "model": model,
+            "aspect_ratio": aspect_ratio,
+            "width": width,
+            "height": height,
+        }
+        return (
+            "Saved image defaults.\n\n"
+            f"{_format_image_defaults(saved)}\n"
+            "\nThese will be used as the starting image settings after your next message unless you override them."
+        )
+
+    async def _handle_wiki_host_command(self, event: MessageEvent) -> str:
+        """Handle /wiki-host command for LAN wiki hosting."""
+        args = event.get_command_args().strip()
+        if not args:
+            return self._wiki_host_status_message()
+
+        try:
+            tokens = shlex.split(args)
+        except ValueError as e:
+            return f"Could not parse wiki-host command: {e}"
+
+        action = (tokens[0] or "").strip().lower()
+        port_token = tokens[1].strip() if len(tokens) > 1 else ""
+
+        if action in {"status", "show"}:
+            return self._wiki_host_status_message()
+
+        if action in {"disable", "off", "stop"}:
+            self._stop_wiki_host()
+            _save_wiki_host_config(enabled=False, port=None)
+            return "Wiki hosting disabled."
+
+        if action in {"enable", "on", "start"}:
+            port = self._wiki_host_port or int((_get_wiki_host_config().get("port") or 8008))
+            if port_token:
+                try:
+                    port = int(port_token)
+                except ValueError:
+                    return f"Invalid port: `{port_token}`"
+            if not (1 <= int(port) <= 65535):
+                return f"Invalid port: `{port}`"
+
+            try:
+                return self._start_wiki_host(int(port))
+            except OSError as e:
+                return f"Could not start wiki host on port `{port}`: {e}"
+            except Exception as e:
+                return f"Failed to start wiki host: {e}"
+
+        return (
+            f"Unknown wiki-host action: `{action}`\n\n"
+            "Usage:\n"
+            "- `/wiki-host status`\n"
+            "- `/wiki-host enable 8008`\n"
+            "- `/wiki-host disable`"
+        )
+
     async def _handle_provider_command(self, event: MessageEvent) -> str:
         """Handle /provider command - show available providers."""
         import yaml
@@ -2327,7 +3704,7 @@ class GatewayRunner:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
                 config["agent"]["system_prompt"] = ""
-                with open(config_path, "w") as f:
+                with open(config_path, "w", encoding="utf-8") as f:
                     yaml.dump(config, f, default_flow_style=False, sort_keys=False)
             except Exception as e:
                 return f"⚠️ Failed to save personality change: {e}"
@@ -2353,6 +3730,81 @@ class GatewayRunner:
 
         available = "`none`, " + ", ".join(f"`{n}`" for n in personalities.keys())
         return f"Unknown personality: `{args}`\n\nAvailable: {available}"
+
+    async def _handle_terminal_command(self, event: MessageEvent) -> str:
+        """Handle /terminal command - show or change current Windows shell mode."""
+        args = event.get_command_args().strip().lower()
+
+        if os.name != "nt":
+            return (
+                "Terminal mode only applies when the **gateway** runs on Windows. "
+                "Right now the gateway is running on Linux/WSL, so local commands "
+                "always use your default POSIX shell."
+            )
+
+        current = os.getenv("HERMES_WINDOWS_SHELL", "auto")
+        if not args:
+            return (
+                "🖥️ **Current terminal mode:** "
+                f"`{current}`\n\n"
+                "Usage: `/terminal powershell`, `/terminal wsl`, `/terminal auto`, `/terminal cmd`"
+            )
+
+        mode_map = {
+            "windows": "powershell",
+            "pwsh": "powershell",
+            "powershell": "powershell",
+            "wsl": "wsl",
+            "linux": "wsl",
+            "auto": "auto",
+            "cmd": "cmd",
+            "cmd.exe": "cmd",
+        }
+
+        if args not in mode_map:
+            return (
+                f"Unknown terminal mode: `{args}`\n\n"
+                "Valid options: `powershell`, `wsl`, `auto`, `cmd` "
+                "(aliases: `windows`, `pwsh`)."
+            )
+
+        new_value = mode_map[args]
+        os.environ["HERMES_WINDOWS_SHELL"] = new_value
+        logger.info(
+            "Terminal mode switched to %s (HERMES_WINDOWS_SHELL=%s) by user",
+            new_value,
+            new_value,
+        )
+
+        # Persist for gateway restarts.
+        try:
+            import yaml
+
+            config_path = _hermes_home / "config.yaml"
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    persisted = yaml.safe_load(f) or {}
+            else:
+                persisted = {}
+
+            persisted["HERMES_WINDOWS_SHELL"] = new_value
+            with open(config_path, "w", encoding="utf-8", newline="") as f:
+                yaml.dump(persisted, f, default_flow_style=False)
+        except Exception as e:
+            logger.warning("Failed to persist terminal mode to config.yaml: %s", e)
+
+        human_mode = {
+            "powershell": "PowerShell",
+            "wsl": "WSL (Linux shell)",
+            "cmd": "cmd.exe",
+            "auto": "auto (WSL > PowerShell > cmd)",
+        }.get(new_value, new_value)
+
+        return (
+            f"🖥️ Terminal mode set to **{human_mode}** "
+            f"(`HERMES_WINDOWS_SHELL={new_value}`).\n"
+            "Future local commands will use this shell."
+        )
     
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""
@@ -2645,13 +4097,16 @@ class GatewayRunner:
             return
 
         # Show transcript in text channel (after auth, with mention sanitization)
+        # via adapter.send so Discord embed chunking/limits match normal replies.
         try:
-            channel = adapter._client.get_channel(text_ch_id)
-            if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
-        except Exception:
-            pass
+            safe_text = transcript[:4000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+            await adapter.send(
+                chat_id=str(text_ch_id),
+                content=f"**[Voice]** <@{user_id}>: {safe_text}",
+                include_listen_button=False,
+            )
+        except Exception as e:
+            logger.debug("Failed to send voice transcript mirror message: %s", e)
 
         # Build a synthetic MessageEvent and feed through the normal pipeline
         # Use SimpleNamespace as raw_message so _get_guild_id() can extract
@@ -3470,7 +4925,7 @@ class GatewayRunner:
             "user_id": event.source.user_id,
             "timestamp": datetime.now().isoformat(),
         }
-        pending_path.write_text(json.dumps(pending))
+        pending_path.write_text(json.dumps(pending), encoding="utf-8")
         exit_code_path.unlink(missing_ok=True)
 
         # Spawn `hermes update` in a separate cgroup so it survives gateway
@@ -3540,7 +4995,7 @@ class GatewayRunner:
 
         if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
             logger.warning("Update watcher timed out waiting for completion marker")
-            exit_code_path.write_text("124")
+            exit_code_path.write_text("124", encoding="utf-8")
             await self._send_update_notification()
 
     async def _send_update_notification(self) -> bool:
@@ -3572,7 +5027,7 @@ class GatewayRunner:
             elif not claimed_path.exists():
                 return True
 
-            pending = json.loads(claimed_path.read_text())
+            pending = json.loads(claimed_path.read_text(encoding="utf-8"))
             platform_str = pending.get("platform")
             chat_id = pending.get("chat_id")
 
@@ -3583,13 +5038,13 @@ class GatewayRunner:
                 claimed_path.replace(pending_path)
                 return False
 
-            exit_code_raw = exit_code_path.read_text().strip() or "1"
+            exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
             exit_code = int(exit_code_raw)
 
             # Read the captured update output
             output = ""
             if output_path.exists():
-                output = output_path.read_text()
+                output = output_path.read_text(encoding="utf-8", errors="replace")
 
             # Resolve adapter
             platform = Platform(platform_str)
@@ -3913,6 +5368,7 @@ class GatewayRunner:
 
         # Try to load platform_toolsets from config
         platform_toolsets_config = {}
+        browser_sidecar_cfg = {}
         try:
             config_path = _hermes_home / 'config.yaml'
             if config_path.exists():
@@ -3920,8 +5376,20 @@ class GatewayRunner:
                 with open(config_path, 'r', encoding="utf-8") as f:
                     user_config = yaml.safe_load(f) or {}
                 platform_toolsets_config = user_config.get("platform_toolsets", {})
+                browser_sidecar_cfg = user_config.get("browser_sidecar", {})
         except Exception as e:
             logger.debug("Could not load platform_toolsets config: %s", e)
+
+        def _as_bool(val: Any, default: bool = False) -> bool:
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                v = val.strip().lower()
+                if v in {"1", "true", "yes", "on"}:
+                    return True
+                if v in {"0", "false", "no", "off"}:
+                    return False
+            return default
 
         # Map platform enum to config key
         platform_config_key = {
@@ -3935,13 +5403,64 @@ class GatewayRunner:
             Platform.EMAIL: "email",
         }.get(source.platform, "telegram")
         
-        # Use config override if present (list of toolsets), otherwise hardcoded default
-        config_toolsets = platform_toolsets_config.get(platform_config_key)
-        if config_toolsets and isinstance(config_toolsets, list):
-            enabled_toolsets = config_toolsets
+        browser_sidecar_max_iterations = None
+        browser_sidecar_max_tool_calls = None
+
+        # Browser sidecar sessions intentionally avoid browser automation tools.
+        if self._is_browser_bridge_source(source):
+            configured_sidecar_toolsets = browser_sidecar_cfg.get("toolsets")
+            normalized_sidecar_toolsets = []
+            if isinstance(configured_sidecar_toolsets, list):
+                normalized_sidecar_toolsets = [
+                    str(toolset).strip()
+                    for toolset in configured_sidecar_toolsets
+                    if str(toolset).strip()
+                ]
+
+            if normalized_sidecar_toolsets:
+                enabled_toolsets = normalized_sidecar_toolsets
+            else:
+                allow_sidecar_delegation = _as_bool(
+                    browser_sidecar_cfg.get(
+                        "allow_delegation",
+                        os.getenv("HERMES_BROWSER_SIDECAR_ALLOW_DELEGATION", ""),
+                    ),
+                    default=False,
+                )
+                enabled_toolsets = [
+                    "hermes-sidecar-delegating" if allow_sidecar_delegation else "hermes-sidecar"
+                ]
+
+            raw_sidecar_max_turns = browser_sidecar_cfg.get("max_turns")
+            try:
+                parsed_sidecar_max_turns = int(raw_sidecar_max_turns)
+            except (TypeError, ValueError):
+                parsed_sidecar_max_turns = 0
+            if parsed_sidecar_max_turns > 0:
+                browser_sidecar_max_iterations = parsed_sidecar_max_turns
+
+            raw_sidecar_max_tool_calls = browser_sidecar_cfg.get("max_tool_calls")
+            try:
+                parsed_sidecar_max_tool_calls = int(raw_sidecar_max_tool_calls)
+            except (TypeError, ValueError):
+                parsed_sidecar_max_tool_calls = 0
+            if parsed_sidecar_max_tool_calls > 0:
+                browser_sidecar_max_tool_calls = parsed_sidecar_max_tool_calls
+
+            logger.info(
+                "Browser sidecar policy active: toolsets=%s max_turns=%s max_tool_calls=%s",
+                enabled_toolsets,
+                browser_sidecar_max_iterations if browser_sidecar_max_iterations is not None else "default",
+                browser_sidecar_max_tool_calls if browser_sidecar_max_tool_calls is not None else "default",
+            )
         else:
-            default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
-            enabled_toolsets = [default_toolset]
+            # Use config override if present (list of toolsets), otherwise hardcoded default
+            config_toolsets = platform_toolsets_config.get(platform_config_key)
+            if config_toolsets and isinstance(config_toolsets, list):
+                enabled_toolsets = config_toolsets
+            else:
+                default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
+                enabled_toolsets = [default_toolset]
         
         # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
         # Falls back to env vars for backward compatibility
@@ -3960,63 +5479,169 @@ class GatewayRunner:
             or os.getenv("HERMES_TOOL_PROGRESS_MODE")
             or "all"
         )
+        progress_style = (
+            _progress_cfg.get("tool_progress_style")
+            or os.getenv("HERMES_TOOL_PROGRESS_STYLE")
+            or "single"
+        ).strip().lower()
+        if progress_style not in {"feed", "single"}:
+            progress_style = "single"
+
+        try:
+            progress_rolling_entries = int(
+                _progress_cfg.get("tool_progress_rolling_entries")
+                or os.getenv("HERMES_TOOL_PROGRESS_ROLLING_ENTRIES", "4")
+            )
+        except Exception:
+            progress_rolling_entries = 4
+        progress_rolling_entries = max(1, min(progress_rolling_entries, 8))
+
+        try:
+            progress_embed_max_chars = int(
+                os.getenv("HERMES_TOOL_PROGRESS_EMBED_MAX_CHARS", "3800")
+            )
+        except Exception:
+            progress_embed_max_chars = 3800
+        progress_embed_max_chars = max(1200, min(progress_embed_max_chars, 3900))
+
         tool_progress_enabled = progress_mode != "off"
-        
-        # Queue for progress messages (thread-safe)
+
+        # Queue for progress/status ticks (thread-safe).
         progress_queue = queue.Queue() if tool_progress_enabled else None
         last_tool = [None]  # Mutable container for tracking in closure
-        last_progress_msg = [None]  # Track last message for dedup
-        repeat_count = [0]  # How many times the same message repeated
-        
+        progress_state = {
+            "started_at": time.monotonic(),
+            "phase": "thinking",
+            "last_detail": "Queued request...",
+            "tool_calls": 0,
+            "updates": 0,
+            "recent_events": [],
+        }
+
+        def _push_recent_event(detail: str) -> None:
+            text = (detail or "").strip()
+            if not text:
+                return
+            ts = datetime.now().strftime("%H:%M:%S")
+            event_line = f"`{ts}` {text}"
+            recent_events = progress_state.setdefault("recent_events", [])
+            if recent_events and recent_events[-1] == event_line:
+                return
+            recent_events.append(event_line)
+            while len(recent_events) > progress_rolling_entries:
+                recent_events.pop(0)
+
+        def _set_progress_state(*, phase: str | None = None, detail: str | None = None, tool_call: bool = False):
+            if phase:
+                progress_state["phase"] = phase
+            if detail:
+                progress_state["last_detail"] = detail
+                _push_recent_event(detail)
+            if tool_call:
+                progress_state["tool_calls"] += 1
+            progress_state["updates"] += 1
+            if progress_queue:
+                progress_queue.put("__tick__")
+
+        def _build_progress_message() -> str:
+            elapsed = int(max(0, time.monotonic() - progress_state["started_at"]))
+            phase = progress_state.get("phase", "thinking")
+            phase_label = {
+                "starting": "starting",
+                "thinking": "thinking",
+                "tool": "running commands",
+                "finalizing": "finalizing",
+            }.get(phase, "working")
+            phase_emoji = {
+                "starting": "🚀",
+                "thinking": "💡",
+                "tool": "🛠️",
+                "finalizing": "🧾",
+            }.get(phase, "⚙️")
+            header = f"{phase_emoji} Hermes is {phase_label}... ({elapsed}s)"
+            footer = f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
+            events = list(progress_state.get("recent_events") or [])
+            if not events:
+                fallback = (progress_state.get("last_detail") or "Working...").strip()
+                events = [f"`{datetime.now().strftime('%H:%M:%S')}` {fallback}"]
+
+            def _render(lines: list[str]) -> str:
+                body = "\n".join(f"• {line}" for line in lines)
+                return f"{header}\n{body}\n{footer}"
+
+            msg = _render(events[-progress_rolling_entries:])
+            if len(msg) <= progress_embed_max_chars:
+                return msg
+
+            lines = events[-progress_rolling_entries:]
+            while len(lines) > 1:
+                lines = lines[1:]
+                msg = _render(lines)
+                if len(msg) <= progress_embed_max_chars:
+                    return msg
+
+            lone = lines[0] if lines else ""
+            overhead = len(f"{header}\n• \n{footer}")
+            available = max(80, progress_embed_max_chars - overhead)
+            if len(lone) > available:
+                lone = lone[: max(0, available - 24)] + "... [trimmed for embed]"
+            return _render([lone])
+
         def progress_callback(tool_name: str, preview: str = None, args: dict = None):
-            """Callback invoked by agent when a tool is called."""
+            """Callback invoked by agent when tool progress changes."""
             if not progress_queue:
                 return
-            
-            # "new" mode: only report when tool changes
+
+            # Optional completion payloads from newer run_agent variants.
+            if tool_name == "_tool_result":
+                payload = args or {}
+                completed_tool = str(payload.get("tool") or preview or "tool")
+                duration = payload.get("duration_seconds")
+                is_error = bool(payload.get("is_error"))
+                status_emoji = "❌" if is_error else "✅"
+                duration_text = ""
+                if isinstance(duration, (int, float)):
+                    duration_text = f" in {float(duration):.2f}s"
+                detail = f"{status_emoji} {completed_tool} finished{duration_text}"
+                _set_progress_state(phase="tool", detail=detail, tool_call=False)
+                return
+
+            # "new" mode: only report when tool changes.
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-            
-            # Build progress message with primary argument preview
+
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
-            
-            # Verbose mode: show detailed arguments
+
+            if tool_name == "_thinking":
+                _set_progress_state(phase="thinking", detail=f"💡 thinking: {preview or 'working...'}")
+                return
+
+            # Verbose mode: include argument keys/preview.
             if progress_mode == "verbose" and args:
-                import json as _json
-                args_str = _json.dumps(args, ensure_ascii=False, default=str)
+                try:
+                    args_str = json.dumps(args, ensure_ascii=False, default=str)
+                except Exception:
+                    args_str = str(args)
                 if len(args_str) > 200:
                     args_str = args_str[:197] + "..."
-                msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
-                progress_queue.put(msg)
+                detail = f"{emoji} {tool_name}({list(args.keys())}) {args_str}"
+                _set_progress_state(phase="tool", detail=detail, tool_call=True)
                 return
-            
+
             if preview:
-                # Truncate preview to keep messages clean
                 if len(preview) > 80:
                     preview = preview[:77] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+                detail = f"{emoji} {tool_name}: \"{preview}\""
             else:
-                msg = f"{emoji} {tool_name}..."
-            
-            # Dedup: collapse consecutive identical progress messages.
-            # Common with execute_code where models iterate with the same
-            # code (same boilerplate imports → identical previews).
-            if msg == last_progress_msg[0]:
-                repeat_count[0] += 1
-                # Update the last line in progress_lines with a counter
-                # via a special "dedup" queue message.
-                progress_queue.put(("__dedup__", msg, repeat_count[0]))
-                return
-            last_progress_msg[0] = msg
-            repeat_count[0] = 0
-            
-            progress_queue.put(msg)
-        
-        # Background task to send progress messages
-        # Accumulates tool lines into a single message that gets edited
-        _progress_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+                detail = f"{emoji} {tool_name}..."
+            _set_progress_state(phase="tool", detail=detail, tool_call=True)
+
+        # Background task to send progress messages.
+        _progress_metadata = {"tool_progress": True}
+        if source.thread_id:
+            _progress_metadata["thread_id"] = source.thread_id
 
         async def send_progress_messages():
             if not progress_queue:
@@ -4026,75 +5651,71 @@ class GatewayRunner:
             if not adapter:
                 return
 
-            progress_lines = []      # Accumulated tool lines
-            progress_msg_id = None   # ID of the progress message to edit
-            can_edit = True          # False once an edit fails (platform doesn't support it)
+            progress_msg_id = None
+            can_edit = True
+            last_rendered = ""
+            last_emit_at = 0.0
 
             while True:
                 try:
-                    raw = progress_queue.get_nowait()
-                    
-                    # Handle dedup messages: update last line with repeat counter
-                    if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
-                        _, base_msg, count = raw
-                        if progress_lines:
-                            progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                        msg = progress_lines[-1] if progress_lines else base_msg
-                    else:
-                        msg = raw
-                        progress_lines.append(msg)
-
-                    if can_edit and progress_msg_id is not None:
-                        # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
-                        result = await adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=progress_msg_id,
-                            content=full_text,
-                        )
-                        if not result.success:
-                            # Platform doesn't support editing — stop trying,
-                            # send just this new line as a separate message
-                            can_edit = False
-                            await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
-                    else:
-                        if can_edit:
-                            # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
-                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
-                        else:
-                            # Editing unsupported: send just this line
-                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
-                        if result.success and result.message_id:
-                            progress_msg_id = result.message_id
-
-                    # Restore typing indicator
-                    await asyncio.sleep(0.3)
-                    await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
-
-                except queue.Empty:
-                    await asyncio.sleep(0.3)
-                except asyncio.CancelledError:
-                    # Drain remaining queued messages
-                    while not progress_queue.empty():
+                    updated = False
+                    while True:
                         try:
-                            raw = progress_queue.get_nowait()
-                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
-                                _, base_msg, count = raw
-                                if progress_lines:
-                                    progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                            else:
-                                progress_lines.append(raw)
-                        except Exception:
+                            progress_queue.get_nowait()
+                            updated = True
+                        except queue.Empty:
                             break
-                    # Final edit with all remaining tools (only if editing works)
-                    if can_edit and progress_lines and progress_msg_id:
-                        full_text = "\n".join(progress_lines)
+
+                    now = time.monotonic()
+                    heartbeat_due = (now - last_emit_at) >= 1.0
+                    should_emit = updated or (progress_style == "single" and heartbeat_due)
+                    if not should_emit:
+                        await asyncio.sleep(0.25)
+                        continue
+
+                    msg = _build_progress_message()
+                    if progress_style == "single":
+                        if can_edit and progress_msg_id is not None:
+                            result = await adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=progress_msg_id,
+                                content=msg,
+                            )
+                            if not result.success:
+                                can_edit = False
+                                result = await adapter.send(
+                                    chat_id=source.chat_id,
+                                    content=msg,
+                                    metadata=_progress_metadata,
+                                )
+                                if result.success and result.message_id:
+                                    progress_msg_id = result.message_id
+                        else:
+                            result = await adapter.send(
+                                chat_id=source.chat_id,
+                                content=msg,
+                                metadata=_progress_metadata,
+                            )
+                            if result.success and result.message_id:
+                                progress_msg_id = result.message_id
+                    else:
+                        await adapter.send(
+                            chat_id=source.chat_id,
+                            content=msg,
+                            metadata=_progress_metadata,
+                        )
+
+                    last_rendered = msg
+                    last_emit_at = now
+                    await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+                    await asyncio.sleep(0.25)
+                except asyncio.CancelledError:
+                    if can_edit and progress_msg_id and last_rendered:
                         try:
                             await adapter.edit_message(
                                 chat_id=source.chat_id,
                                 message_id=progress_msg_id,
-                                content=full_text,
+                                content=last_rendered,
                             )
                         except Exception:
                             pass
@@ -4134,6 +5755,8 @@ class GatewayRunner:
 
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            if browser_sidecar_max_iterations is not None:
+                max_iterations = browser_sidecar_max_iterations
             
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
@@ -4194,6 +5817,7 @@ class GatewayRunner:
                 honcho_config=honcho_config,
                 session_db=self._session_db,
                 fallback_model=self._fallback_model,
+                max_tool_calls_per_run=browser_sidecar_max_tool_calls,
             )
             
             # Store agent reference for interrupt support
@@ -4521,6 +6145,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    _harden_windows_console_logging()
+
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.
     # The PID file is scoped to HERMES_HOME, so future multi-profile
@@ -4572,7 +6198,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 existing_pid, hermes_home,
             )
             print(
-                f"\n❌ Gateway already running (PID {existing_pid}).\n"
+                f"\nGateway already running (PID {existing_pid}).\n"
                 f"   Use 'hermes gateway restart' to replace it,\n"
                 f"   or 'hermes gateway stop' to kill it first.\n"
                 f"   Or use 'hermes gateway run --replace' to auto-replace.\n"
@@ -4593,6 +6219,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         log_dir / 'gateway.log',
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
+        encoding="utf-8",
+        errors="replace",
     )
     from agent.redact import RedactingFormatter
     file_handler.setFormatter(RedactingFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
@@ -4604,6 +6232,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         log_dir / 'errors.log',
         maxBytes=2 * 1024 * 1024,
         backupCount=2,
+        encoding="utf-8",
+        errors="replace",
     )
     error_handler.setLevel(logging.WARNING)
     error_handler.setFormatter(RedactingFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
@@ -4649,18 +6279,26 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     cron_thread.start()
     
     # Wait for shutdown
-    await runner.wait_for_shutdown()
-    
-    # Stop cron ticker cleanly
-    cron_stop.set()
-    cron_thread.join(timeout=5)
-
-    # Close MCP server connections
     try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
-    except Exception:
-        pass
+        await runner.wait_for_shutdown()
+    except asyncio.CancelledError:
+        logger.info("Gateway shutdown wait was cancelled; stopping gracefully.")
+        if getattr(runner, "_running", False):
+            try:
+                await runner.stop()
+            except Exception as e:
+                logger.debug("Graceful stop after cancellation failed: %s", e)
+    finally:
+        # Stop cron ticker cleanly
+        cron_stop.set()
+        cron_thread.join(timeout=5)
+
+        # Close MCP server connections
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+            shutdown_mcp_servers()
+        except Exception:
+            pass
 
     return True
 

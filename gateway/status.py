@@ -56,12 +56,31 @@ def _get_scope_lock_path(scope: str, identity: str) -> Path:
     return _get_lock_dir() / f"{scope}-{_scope_hash(identity)}.lock"
 
 
+def _is_process_alive(pid: int) -> bool:
+    """Best-effort process existence check across platforms.
+
+    On Windows, ``os.kill(pid, 0)`` can raise platform-specific ``OSError``
+    variants (for example WinError 11 in some mismatched/intermediate states).
+    Treat those as "not alive" so stale PID files never crash startup.
+    """
+    try:
+        os.kill(pid, 0)  # signal 0 = existence probe only
+        return True
+    except PermissionError:
+        # Process exists but current user lacks signaling rights.
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+
+
 def _get_process_start_time(pid: int) -> Optional[int]:
     """Return the kernel start time for a process when available."""
     stat_path = Path(f"/proc/{pid}/stat")
     try:
         # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
-        return int(stat_path.read_text().split()[21])
+        return int(stat_path.read_text(encoding="utf-8").split()[21])
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
         return None
 
@@ -135,7 +154,7 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        raw = path.read_text().strip()
+        raw = path.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     if not raw:
@@ -149,7 +168,7 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
 
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload))
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _read_pid_record() -> Optional[dict]:
@@ -157,7 +176,7 @@ def _read_pid_record() -> Optional[dict]:
     if not pid_path.exists():
         return None
 
-    raw = pid_path.read_text().strip()
+    raw = pid_path.read_text(encoding="utf-8").strip()
     if not raw:
         return None
 
@@ -260,9 +279,7 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
 
         stale = existing_pid is None
         if not stale:
-            try:
-                os.kill(existing_pid, 0)
-            except (ProcessLookupError, PermissionError):
+            if not _is_process_alive(existing_pid):
                 stale = True
             else:
                 current_start = _get_process_start_time(existing_pid)
@@ -329,9 +346,7 @@ def get_running_pid() -> Optional[int]:
         remove_pid_file()
         return None
 
-    try:
-        os.kill(pid, 0)  # signal 0 = existence check, no actual signal sent
-    except (ProcessLookupError, PermissionError):
+    if pid <= 0 or not _is_process_alive(pid):
         remove_pid_file()
         return None
 

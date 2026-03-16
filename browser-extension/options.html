@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hermes Sidecar Options</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="icons/nous-32.png">
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main class="app">
+      <header class="hero">
+        <p class="eyebrow">Hermes Agent</p>
+        <h1>Sidecar settings</h1>
+        <p class="subhead">Configure bridge, defaults, and polished extension theming here. Chat stays clean in the side panel.</p>
+      </header>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Bridge</h2>
+            <p class="section-copy">How this extension reaches your local Hermes gateway.</p>
+          </div>
+          <div class="section-head-actions">
+            <button id="health-button" class="ghost-button" type="button">Check bridge</button>
+            <p id="bridge-status-text" class="bridge-status-text">Not checked yet.</p>
+          </div>
+        </div>
+        <label class="field">
+          <span class="field-label">Bridge URL</span>
+          <input id="bridge-url" type="url" spellcheck="false">
+        </label>
+        <label class="field">
+          <span class="field-label">Bridge token</span>
+          <input id="bridge-token" type="password" spellcheck="false" placeholder="Paste ~/.hermes/browser_bridge_token">
+        </label>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Defaults</h2>
+            <p class="section-copy">Default checkboxes for new turns in the sidecar.</p>
+          </div>
+        </div>
+        <label class="checkbox-row">
+          <input id="share-page-by-default" type="checkbox">
+          <span>Use the current page by default</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="include-transcript" type="checkbox">
+          <span>Include YouTube transcript by default</span>
+        </label>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Voice input</h2>
+            <p class="section-copy">Grant microphone access once here so the sidecar can record without opening a recorder popup each time.</p>
+          </div>
+        </div>
+        <button id="enable-microphone-button" class="ghost-button" type="button">Enable microphone</button>
+        <p id="microphone-status-text" class="section-copy">Not enabled yet.</p>
+        <label class="field">
+          <span class="field-label">Audio input device</span>
+          <select id="audio-input-device-select">
+            <option value="">System default microphone</option>
+          </select>
+        </label>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Appearance</h2>
+            <p class="section-copy">Choose from monochrome, sepia, restored classics, and retro-gamer palettes for the popup, sidecar, and options page.</p>
+          </div>
+        </div>
+        <label class="field">
+          <span class="field-label">Theme</span>
+          <select id="theme-select"></select>
+        </label>
+        <p id="theme-description" class="theme-note">Loading theme library...</p>
+        <div class="editor-block">
+          <div class="editor-head">
+            <div>
+              <h3>Custom themes</h3>
+              <p class="section-copy">Add named themes and tune their light or dark primary and secondary colors.</p>
+            </div>
+            <button id="add-theme-button" class="ghost-button" type="button">Add theme</button>
+          </div>
+          <div id="custom-theme-list" class="prompt-list"></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Sidecar tools</h2>
+            <p class="section-copy">Choose which helper controls show up in the side panel, and edit the reusable prompts they send.</p>
+          </div>
+        </div>
+        <label class="checkbox-row">
+          <input id="show-quick-prompts" type="checkbox">
+          <span>Show quick prompt buttons in the sidecar</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="show-challenge-mode" type="checkbox">
+          <span>Show the challenge mode toggle in the sidecar</span>
+        </label>
+
+        <div class="editor-block">
+          <div class="editor-head">
+            <div>
+              <h3>Challenge mode</h3>
+              <p class="section-copy">Rename the toggle and control the instruction Hermes appends when it is on.</p>
+            </div>
+          </div>
+          <label class="field">
+            <span class="field-label">Button name</span>
+            <input id="challenge-mode-label" type="text" maxlength="60" spellcheck="false">
+          </label>
+          <label class="field">
+            <span class="field-label">Instruction prompt</span>
+            <textarea id="challenge-mode-prompt" rows="4" spellcheck="true"></textarea>
+          </label>
+        </div>
+
+        <div class="editor-block">
+          <div class="editor-head">
+            <div>
+              <h3>Quick prompts</h3>
+              <p class="section-copy">Add, rename, remove, and reorder the prompt buttons that can send instantly from the sidecar.</p>
+            </div>
+            <button id="add-quick-prompt-button" class="ghost-button" type="button">Add prompt</button>
+          </div>
+          <div id="quick-prompt-list" class="prompt-list"></div>
+        </div>
+      </section>
+
+      <section class="card actions-card">
+        <button id="save-settings-button" class="primary-button" type="button">Save settings</button>
+        <p id="status-text" class="status-text">Waiting for input.</p>
+      </section>
+    </main>
+    <script src="theme.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>
