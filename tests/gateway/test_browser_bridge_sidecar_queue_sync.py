@@ -1,10 +1,12 @@
 """Regression tests for sidecar queued-turn sync on slash-command turns."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -82,3 +84,32 @@ async def test_sidecar_slash_turn_skips_manual_persist_when_handler_already_upda
 
     runner.session_store.append_to_transcript.assert_not_called()
 
+
+@pytest.mark.asyncio
+async def test_sidecar_sync_turn_timeout_cleans_progress_and_task(monkeypatch):
+    runner = _make_runner()
+
+    async def _slow_handle(_event):
+        await asyncio.sleep(0.2)
+        return "done"
+
+    runner._handle_message = AsyncMock(side_effect=_slow_handle)
+    runner.session_store.get_or_create_session.return_value = SimpleNamespace(
+        session_key="browser-bridge:test",
+        session_id="session-3",
+    )
+    runner.session_store.load_transcript.return_value = []
+    monkeypatch.setattr(gateway_run, "_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(TimeoutError, match="Sidecar turn exceeded 0 seconds|Sidecar turn exceeded 0.01|Sidecar turn exceeded"):
+        await runner._handle_browser_bridge_send(
+            payload={"message": "analyze this page"},
+            source=_make_source(),
+            async_mode=False,
+        )
+
+    progress = runner._browser_bridge_progress["browser-bridge:test"]
+    assert progress["running"] is False
+    assert progress["detail"] == "Sidecar turn timed out."
+    assert "cancelled" in progress["error"]
+    assert "browser-bridge:test" not in runner._browser_bridge_tasks

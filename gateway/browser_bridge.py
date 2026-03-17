@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
 TOKEN_ENV_VAR = "HERMES_BROWSER_BRIDGE_TOKEN"
 HOST_ENV_VAR = "HERMES_BROWSER_BRIDGE_HOST"
 PORT_ENV_VAR = "HERMES_BROWSER_BRIDGE_PORT"
@@ -45,12 +46,19 @@ _LIVE_BROWSER_ACTION_PATTERN = re.compile(
 )
 
 
+class BrowserBridgeRequestTimeout(RuntimeError):
+    """Raised when a browser bridge request exceeds its sync wait budget."""
+
+    pass
+
+
 @dataclass
 class BrowserBridgeConfig:
     host: str
     port: int
     token: str
     enabled: bool = True
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
 
     @classmethod
     def from_env(cls) -> "BrowserBridgeConfig":
@@ -69,9 +77,29 @@ class BrowserBridgeConfig:
 
         enabled_raw = os.getenv(ENABLED_ENV_VAR, "true").strip().lower()
         enabled = enabled_raw not in {"0", "false", "no", "off"}
+        raw_timeout = (os.getenv("HERMES_BROWSER_BRIDGE_REQUEST_TIMEOUT_SECONDS") or "").strip()
+        try:
+            request_timeout_seconds = (
+                float(raw_timeout) if raw_timeout else DEFAULT_REQUEST_TIMEOUT_SECONDS
+            )
+        except ValueError:
+            logger.warning(
+                "Invalid HERMES_BROWSER_BRIDGE_REQUEST_TIMEOUT_SECONDS=%r. Falling back to %.1f.",
+                raw_timeout,
+                DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            )
+            request_timeout_seconds = DEFAULT_REQUEST_TIMEOUT_SECONDS
+        if request_timeout_seconds <= 0:
+            request_timeout_seconds = DEFAULT_REQUEST_TIMEOUT_SECONDS
 
         token = _resolve_token()
-        return cls(host=host, port=port, token=token, enabled=enabled)
+        return cls(
+            host=host,
+            port=port,
+            token=token,
+            enabled=enabled,
+            request_timeout_seconds=request_timeout_seconds,
+        )
 
 
 def _resolve_token() -> str:
@@ -661,7 +689,13 @@ class BrowserBridgeServer:
                 raise
 
             try:
-                return future.result(timeout=180)
+                return future.result(timeout=self.config.request_timeout_seconds)
+            except TimeoutError as exc:
+                if not future.done():
+                    future.cancel()
+                raise BrowserBridgeRequestTimeout(
+                    f"Browser bridge request exceeded {self.config.request_timeout_seconds:.0f}s."
+                ) from exc
             except Exception:
                 if not future.done():
                     future.cancel()
@@ -798,6 +832,10 @@ class _BridgeHandler(BaseHTTPRequestHandler):
 
         try:
             result = bridge.run_payload(payload)
+        except BrowserBridgeRequestTimeout as exc:
+            logger.warning("Browser bridge request timed out: %s", exc)
+            self._json_response(504, {"ok": False, "error": str(exc)})
+            return
         except RuntimeError as exc:
             logger.info("Browser bridge request rejected: %s", exc)
             self._json_response(503, {"ok": False, "error": str(exc)})

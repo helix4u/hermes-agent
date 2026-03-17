@@ -15,6 +15,7 @@ Usage:
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import mimetypes
@@ -85,6 +86,30 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+_DEFAULT_SIDECAR_SYNC_TIMEOUT_SECONDS = 300.0
+
+
+def _load_sidecar_sync_timeout_seconds() -> float:
+    raw = (os.getenv("HERMES_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return _DEFAULT_SIDECAR_SYNC_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "Invalid HERMES_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS=%r. Falling back to %.1f.",
+            raw,
+            _DEFAULT_SIDECAR_SYNC_TIMEOUT_SECONDS,
+        )
+        return _DEFAULT_SIDECAR_SYNC_TIMEOUT_SECONDS
+    return value if value > 0 else _DEFAULT_SIDECAR_SYNC_TIMEOUT_SECONDS
+
+
+_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS = _load_sidecar_sync_timeout_seconds()
+
+
+def _format_timeout_seconds(value: float) -> str:
+    return f"{int(value)}" if float(value).is_integer() else f"{value:g}"
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -1671,16 +1696,44 @@ class GatewayRunner:
             finally:
                 self._browser_bridge_tasks.pop(session_key, None)
 
+        task = asyncio.create_task(_run_turn(), name=f"browser-bridge-{session_key}")
+        self._browser_bridge_tasks[session_key] = task
+
         if async_mode:
-            task = asyncio.create_task(_run_turn(), name=f"browser-bridge-{session_key}")
-            self._browser_bridge_tasks[session_key] = task
             snapshot = self._get_browser_bridge_session_snapshot(source)
             snapshot["accepted"] = True
             snapshot["busy"] = True
             snapshot["detail"] = "Turn accepted."
             return snapshot
 
-        await _run_turn()
+        try:
+            await asyncio.wait_for(task, timeout=_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+            self._browser_bridge_pending_interrupts.discard(session_key)
+            self._set_browser_bridge_progress(
+                session_key,
+                running=False,
+                detail="Sidecar turn timed out.",
+                error=(
+                    "Sidecar turn exceeded "
+                    f"{_format_timeout_seconds(_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS)} seconds and was cancelled."
+                ),
+                interrupt_requested=False,
+                recent_events=self._append_browser_bridge_progress_event(
+                    session_key,
+                    (
+                        "Timed out after "
+                        f"{_format_timeout_seconds(_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS)} seconds."
+                    ),
+                ),
+            )
+            raise TimeoutError(
+                f"Sidecar turn exceeded {_format_timeout_seconds(_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS)} seconds."
+            )
         snapshot = self._get_browser_bridge_session_snapshot(source)
         snapshot["accepted"] = True
         snapshot["busy"] = False

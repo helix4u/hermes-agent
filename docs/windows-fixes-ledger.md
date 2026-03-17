@@ -891,3 +891,41 @@ Scope: `hermes-agent` Windows install/startup/runtime reliability fixes validate
 - Validation:
 - `python -m py_compile tools/browser_tool.py tests/tools/test_browser_windows_stream_port.py` passed.
 - `python -m pytest tests/tools/test_browser_windows_stream_port.py -q` -> `15 passed`.
+
+### WF-043 - Sidecar browser timeout containment + Windows-safe heartbeat Bird execution
+- Status: `done`
+- Problem:
+- A stalled browser-sidecar request could sit behind the browser bridge until the outer HTTP wait expired, leaving the request looking hung and keeping the session timer running without a clean timeout state.
+- The heartbeat timeline flow in the shared Windows workspace still allowed Linux-style `/mnt/c/.../cli.js` Bird paths and had no hard timeout, so a missing or wedged Bird fetch could stall the job.
+- Changes made:
+- `gateway/run.py`
+- added an internal sync sidecar timeout via `HERMES_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS` (default `150s`).
+- sync sidecar turns now run in a tracked task even in non-async mode, so timeout cleanup cancels the task, clears busy state, and records a terminal timeout error in sidecar progress instead of leaving the turn wedged.
+- `gateway/browser_bridge.py`
+- added `HERMES_BROWSER_BRIDGE_REQUEST_TIMEOUT_SECONDS` parsing and `BrowserBridgeRequestTimeout`.
+- bridge request timeouts now return a controlled `504` response instead of a generic `500` after the outer wait expires.
+- shared heartbeat workspace instructions/files
+- updated `HEARTBEAT.md` to require Windows-safe Bird resolution and a hard 120-second fetch timeout.
+- updated `TMP/run-heartbeat-once.ps1` to resolve Bird from `PATH` first, fall back to `npx -y @steipete/bird`, and forcibly stop the fetch after 120 seconds.
+- updated `TMP/heartbeat_timeline.py` to use Windows-safe home/cron path resolution plus a 120-second subprocess timeout instead of hardcoded `/mnt/c/.../cli.js`.
+- Added regression coverage:
+- `tests/gateway/test_browser_bridge_sidecar_queue_sync.py`
+- added sync-timeout cleanup coverage for sidecar turns.
+- `tests/gateway/test_browser_bridge_timeout.py`
+- added bridge-level timeout coverage for stalled async request handlers.
+- Validation:
+- targeted py_compile and pytest coverage were run after patch.
+
+### WF-044 - Increase default sidecar/bridge timeout budget to 5 minutes
+- Status: `done`
+- Problem:
+- The browser sidecar can legitimately take longer than three minutes on heavier turns, and the previous default sync/bridge timeout budget was too aggressive for those cases.
+- Changes made:
+- `gateway/browser_bridge.py`
+- increased `DEFAULT_REQUEST_TIMEOUT_SECONDS` from `180.0` to `300.0`.
+- `gateway/run.py`
+- increased `_DEFAULT_SIDECAR_SYNC_TIMEOUT_SECONDS` from `150.0` to `300.0`.
+- Effect:
+- default browser bridge request timeout and sync sidecar turn timeout are now both 5 minutes unless overridden by:
+- `HERMES_BROWSER_BRIDGE_REQUEST_TIMEOUT_SECONDS`
+- `HERMES_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS`
