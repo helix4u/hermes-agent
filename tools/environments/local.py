@@ -1,6 +1,7 @@
 """Local execution environment with interrupt support and non-blocking I/O."""
 
 import glob
+import logging
 import os
 import platform
 import shutil
@@ -10,6 +11,7 @@ import threading
 import time
 
 _IS_WINDOWS = platform.system() == "Windows"
+logger = logging.getLogger(__name__)
 
 from tools.environments.base import BaseEnvironment
 from tools.environments.shell_utils import (
@@ -310,6 +312,11 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
                  persistent: bool = False):
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
         self.persistent = persistent
+        if self.persistent and _IS_WINDOWS:
+            logger.info(
+                "Persistent local shell requested on Windows; falling back to one-shot execution"
+            )
+            self.persistent = False
         if self.persistent:
             self._init_persistent_shell()
 

@@ -1,6 +1,7 @@
 """Tests for the local persistent shell backend."""
 
 import glob as glob_mod
+import os
 
 import pytest
 
@@ -23,6 +24,16 @@ class TestLocalConfig:
         monkeypatch.setenv("TERMINAL_LOCAL_PERSISTENT", "yes")
         from tools.terminal_tool import _get_env_config
         assert _get_env_config()["local_persistent"] is True
+
+    def test_local_persistent_forces_oneshot_on_windows(self, monkeypatch):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        env = local_mod.LocalEnvironment(persistent=True)
+        try:
+            assert env.persistent is False
+        finally:
+            env.cleanup()
 
 
 class TestMergeOutput:
@@ -57,6 +68,8 @@ class TestLocalOneShotRegression:
         env.cleanup()
 
     def test_state_does_not_persist(self):
+        if os.name == "nt":
+            pytest.skip("Windows local shell syntax varies by configured shell mode")
         env = LocalEnvironment(persistent=False)
         env.execute("export HERMES_ONESHOT_LOCAL=yes")
         r = env.execute("echo $HERMES_ONESHOT_LOCAL")
@@ -64,6 +77,7 @@ class TestLocalOneShotRegression:
         env.cleanup()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows local persistent shell intentionally falls back to one-shot mode")
 class TestLocalPersistent:
     @pytest.fixture
     def env(self):

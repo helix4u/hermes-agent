@@ -5275,6 +5275,28 @@ class GatewayRunner:
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
                 )
+            elif os.name == "nt":
+                python_runner = (
+                    "import pathlib, subprocess, sys; "
+                    "hermes = sys.argv[1:-2]; "
+                    "output_path = pathlib.Path(sys.argv[-2]); "
+                    "exit_code_path = pathlib.Path(sys.argv[-1]); "
+                    "output_path.parent.mkdir(parents=True, exist_ok=True); "
+                    "with open(output_path, 'w', encoding='utf-8', errors='replace') as out: "
+                    "    rc = subprocess.run(hermes + ['update'], stdout=out, stderr=subprocess.STDOUT).returncode; "
+                    "exit_code_path.write_text(str(rc), encoding='utf-8')"
+                )
+                creationflags = 0
+                for flag_name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+                    creationflags |= getattr(subprocess, flag_name, 0)
+                subprocess.Popen(
+                    [sys.executable, "-c", python_runner, *hermes_cmd, str(output_path), str(exit_code_path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    creationflags=creationflags,
+                )
             else:
                 # Fallback: best-effort detach with start_new_session
                 subprocess.Popen(

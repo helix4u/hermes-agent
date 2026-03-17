@@ -814,3 +814,80 @@ Scope: `hermes-agent` Windows install/startup/runtime reliability fixes validate
 ## Open Follow-ups
 - Re-run targeted pytest in your preferred Windows environment after current merge work settles to confirm no hidden cross-fixture assumptions remain.
 - Keep this ledger as source-of-truth for Windows stability fixes; append entries instead of rewriting history.
+
+### WF-040 - Windows local background/process lifecycle + transfer path compatibility sweep
+- Status: `done`
+- Problem:
+- Several remaining Windows-local code paths still assumed POSIX shells or POSIX paths even after foreground terminal/file fixes landed:
+- `terminal(background=true)` still forced bash/Git Bash via `process_registry`.
+- local persistent shell could be enabled even though its IPC protocol is POSIX-only.
+- `ToolContext.upload_file()` / `download_file()` still used `mkdir -p`, `printf`, `base64 -d`, and `/tmp`.
+- checkpoint PID probing could raise `OSError [WinError 87]` on Windows when probing stale PIDs.
+- Changes made:
+- `tools/process_registry.py`
+- local background spawn now uses `build_local_subprocess_invocation(...)` instead of `_find_shell()` / `bash -lic`.
+- PTY local spawn now routes through the same shell-dispatch builder and falls back cleanly when argv-style dispatch is unavailable.
+- local process kill path now uses shared `terminate_process_tree(...)` instead of bespoke Windows/POSIX branching.
+- checkpoint recovery now treats Windows `OSError` from `os.kill(pid, 0)` as a dead PID instead of crashing recovery.
+- `tools/environments/local.py`
+- local persistent shell now self-disables on Windows and falls back to one-shot execution with an info log instead of attempting POSIX-only persistent IPC.
+- `environments/tool_context.py`
+- added `_is_windows_local_backend()`.
+- Windows local `upload_file()` now performs direct host-side binary copy with parent directory creation.
+- Windows local `download_file()` now performs direct host-side binary read/write and returns a clear missing-file error when the remote path does not exist.
+- Added regression coverage:
+- `tests/tools/test_process_registry.py`
+- updated background spawn sanitization coverage to assert shell-dispatch goes through `build_local_subprocess_invocation(...)`.
+- added kill-path regression coverage for shared process-tree termination.
+- `tests/tools/test_local_persistent.py`
+- added explicit Windows fallback coverage for `LocalEnvironment(persistent=True)`.
+- marked POSIX-specific persistent-shell behavior tests as skipped on Windows, since Windows local mode now intentionally falls back to one-shot execution.
+- `tests/tools/test_tool_context_windows.py`
+- added Windows-local upload/download regression tests for direct binary transfer behavior.
+- Validation:
+- `python -m pytest tests/tools/test_process_registry.py tests/tools/test_local_persistent.py tests/tools/test_tool_context_windows.py -q` -> `44 passed, 15 skipped`.
+
+### WF-041 - Gateway detached update fallback works on Windows without bash/nohup
+- Status: `done`
+- Problem:
+- Gateway `/update` fallback still used `bash -c "nohup ..."` when `systemd-run` was unavailable.
+- That works on Linux, but on Windows local installs it requires an incompatible POSIX shell and prevents detached self-update from running reliably.
+- Changes made:
+- `gateway/run.py`
+- added a Windows-specific detached fallback for `_handle_update_command(...)`.
+- when `systemd-run` is unavailable and `os.name == "nt"`, gateway now launches a detached Python runner via `sys.executable -c ...` instead of `bash`/`nohup`.
+- the runner executes `hermes update`, writes stdout/stderr to `.update_output.txt`, and persists the exit code to `.update_exit_code` using UTF-8-safe file writes.
+- existing Linux/macOS fallback behavior remains unchanged.
+- Added regression coverage:
+- `tests/gateway/test_update_command.py`
+- existing no-`systemd-run` fallback test now asserts platform-appropriate behavior on Windows vs POSIX.
+- added `test_windows_fallback_uses_detached_python_runner`.
+- normalized update notification fixture writes to explicit `encoding="utf-8"` so Unicode output assertions are stable on Windows.
+- Validation:
+- `python -m py_compile gateway/run.py tools/process_registry.py tools/environments/local.py environments/tool_context.py` passed.
+- `python -m pytest tests/tools/test_process_registry.py tests/tools/test_local_persistent.py tests/tools/test_tool_context_windows.py tests/gateway/test_update_command.py -q` -> `70 passed, 15 skipped`.
+
+### WF-042 - Windows sidecar browser daemon bind recovery now handles `10048` as well as `10013`
+- Status: `done`
+- Problem:
+- In sidecar/live-CDP sessions on Windows, browser actions like `browser_get_images` and `browser_scroll` were failing before command execution with:
+- `Daemon process exited during startup`
+- `Failed to bind TCP ... (os error 10013)` or `(os error 10048)`
+- Existing recovery logic in `tools/browser_tool.py` only recognized the `10013` bind signature, so `10048` ("address already in use") bypassed retry/cleanup and failed outright.
+- Changes made:
+- `tools/browser_tool.py`
+- replaced the narrow `10013`-only detector with `_is_agent_browser_windows_bind_error(...)`.
+- Windows bind detection now treats both classes as retryable daemon startup failures:
+- `10013` / access-permissions bind failures
+- `10048` / address-already-in-use bind failures
+- existing Windows recovery flow now applies to both:
+- retry with safe `AGENT_BROWSER_STREAM_PORT`
+- if still failing, stale-daemon cleanup + `taskkill` + fresh stream port retry
+- updated warning logs to describe generic Windows daemon bind recovery instead of only the `10013` case.
+- Added regression coverage:
+- `tests/tools/test_browser_windows_stream_port.py`
+- added retry coverage for `10048`
+- added stale-daemon-cleanup recovery coverage for persistent `10048`
+- Validation:
+- `python -m py_compile tools/browser_tool.py tests/tools/test_browser_windows_stream_port.py` passed.
+- `python -m pytest tests/tools/test_browser_windows_stream_port.py -q` -> `15 passed`.

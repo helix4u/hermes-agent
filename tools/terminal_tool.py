@@ -374,10 +374,35 @@ from tools.environments.singularity import SingularityEnvironment as _Singularit
 from tools.environments.ssh import SSHEnvironment as _SSHEnvironment
 from tools.environments.docker import DockerEnvironment as _DockerEnvironment
 from tools.environments.modal import ModalEnvironment as _ModalEnvironment
+from tools.environments.shell_utils import get_local_shell_mode
 
 
 # Tool description for LLM
-TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem persists between calls.
+def _build_terminal_tool_description() -> str:
+    windows_note = ""
+    if os.name == "nt":
+        mode = get_local_shell_mode()
+        if mode == "wsl":
+            windows_note = (
+                "Windows note: with terminal.backend=local, commands run in WSL bash. "
+                "Use Linux syntax and WSL paths (e.g. /mnt/c/Users/... or /mnt/d/...).\n\n"
+            )
+        elif mode == "powershell":
+            windows_note = (
+                "Windows note: with terminal.backend=local, commands run in PowerShell. "
+                "Use PowerShell syntax and Windows paths (e.g. C:\\Users\\... or D:\\...). "
+                "To detect shell: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell "
+                "(prints CMD or PowerShell).\n\n"
+            )
+        else:
+            windows_note = (
+                "Windows note: with terminal.backend=local, commands run in cmd.exe. "
+                "Use cmd syntax and Windows paths (e.g. C:\\Users\\... or D:\\...). "
+                "To detect shell: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell "
+                "(prints CMD or PowerShell).\n\n"
+            )
+
+    return windows_note + """Execute shell commands in the configured terminal backend. Filesystem persists between calls.
 
 Do NOT use cat/head/tail to read files — use read_file instead.
 Do NOT use grep/rg/find to search — use search_files instead.
@@ -394,6 +419,9 @@ PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REP
 
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
 """
+
+
+TERMINAL_TOOL_DESCRIPTION = _build_terminal_tool_description()
 
 # Global state for environment lifecycle management
 _active_environments: Dict[str, Any] = {}

@@ -114,6 +114,60 @@ def test_windows_retries_bind_10013_with_safe_stream_port():
     assert observed_envs[1].get("AGENT_BROWSER_STREAM_PORT") == "0"
 
 
+def test_windows_retries_bind_10048_with_safe_stream_port():
+    from tools import browser_tool
+
+    bind_failure = subprocess.CompletedProcess(
+        args=["agent-browser"],
+        returncode=1,
+        stdout=json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "Daemon process exited during startup:\n"
+                    "Daemon error: Failed to bind TCP: "
+                    "Only one usage of each socket address "
+                    "(protocol/network address/port) is normally permitted. "
+                    "(os error 10048)"
+                ),
+            }
+        ),
+        stderr="",
+    )
+    success = _success_result()
+
+    observed_envs = []
+
+    def _fake_run(*, cmd_parts, timeout, env):
+        observed_envs.append(dict(env))
+        if len(observed_envs) == 1:
+            return bind_failure
+        return success
+
+    with (
+        patch("tools.browser_tool._find_agent_browser", return_value=["agent-browser"]),
+        patch("tools.browser_tool._get_session_info", return_value={"session_name": "win_retry_10048"}),
+        patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
+        patch("tools.browser_tool.os.name", "nt"),
+        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch.dict(
+            "tools.browser_tool.os.environ",
+            {
+                "PATH": "C:\\Windows\\System32",
+                "HERMES_HOME": "C:\\Users\\btgil\\.hermes",
+                "AGENT_BROWSER_STREAM_PORT": "9223",
+            },
+            clear=True,
+        ),
+    ):
+        result = browser_tool._run_browser_command("task-10048", "scroll", ["down"])
+
+    assert result.get("success") is True
+    assert len(observed_envs) == 2
+    assert observed_envs[0].get("AGENT_BROWSER_STREAM_PORT") == "9223"
+    assert observed_envs[1].get("AGENT_BROWSER_STREAM_PORT") == "0"
+
+
 def test_windows_retries_after_stale_daemon_cleanup_when_bind_persists():
     from tools import browser_tool
 
@@ -162,6 +216,65 @@ def test_windows_retries_after_stale_daemon_cleanup_when_bind_persists():
         ),
     ):
         result = browser_tool._run_browser_command("task-3", "open", ["https://example.com"])
+
+    assert result.get("success") is True
+    assert len(observed_envs) == 3
+    assert observed_envs[0].get("AGENT_BROWSER_STREAM_PORT") == "9223"
+    assert observed_envs[1].get("AGENT_BROWSER_STREAM_PORT") == "0"
+    assert observed_envs[2].get("AGENT_BROWSER_STREAM_PORT") not in ("", "0", None)
+    kill_pid.assert_called_once()
+    kill_taskkill.assert_called_once()
+
+
+def test_windows_retries_cleanup_after_persistent_bind_10048():
+    from tools import browser_tool
+
+    bind_failure = subprocess.CompletedProcess(
+        args=["agent-browser"],
+        returncode=1,
+        stdout=json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "Daemon process exited during startup:\n"
+                    "Daemon error: Failed to bind TCP: "
+                    "Only one usage of each socket address "
+                    "(protocol/network address/port) is normally permitted. "
+                    "(os error 10048)"
+                ),
+            }
+        ),
+        stderr="",
+    )
+    success = _success_result()
+
+    observed_envs = []
+
+    def _fake_run(*, cmd_parts, timeout, env):
+        observed_envs.append(dict(env))
+        if len(observed_envs) < 3:
+            return bind_failure
+        return success
+
+    with (
+        patch("tools.browser_tool._find_agent_browser", return_value=["agent-browser"]),
+        patch("tools.browser_tool._get_session_info", return_value={"session_name": "win_retry_cleanup_10048"}),
+        patch("tools.browser_tool._kill_daemon_pid_from_socket_dir", return_value=True) as kill_pid,
+        patch("tools.browser_tool._kill_windows_agent_browser_processes", return_value=1) as kill_taskkill,
+        patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
+        patch("tools.browser_tool.os.name", "nt"),
+        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch.dict(
+            "tools.browser_tool.os.environ",
+            {
+                "PATH": "C:\\Windows\\System32",
+                "HERMES_HOME": "C:\\Users\\btgil\\.hermes",
+                "AGENT_BROWSER_STREAM_PORT": "9223",
+            },
+            clear=True,
+        ),
+    ):
+        result = browser_tool._run_browser_command("task-10048-cleanup", "scroll", ["down"])
 
     assert result.get("success") is True
     assert len(observed_envs) == 3

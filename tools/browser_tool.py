@@ -943,15 +943,17 @@ def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
     return None
 
 
-def _is_agent_browser_bind_10013_error(stderr: str, stdout: str) -> bool:
-    """Return True for the known Windows daemon stream bind failure signature."""
+def _is_agent_browser_windows_bind_error(stderr: str, stdout: str) -> bool:
+    """Return True for known Windows daemon TCP bind failure signatures."""
     combined = f"{stderr or ''}\n{stdout or ''}".lower()
     if "failed to bind tcp" not in combined:
         return False
     return (
         "10013" in combined
+        or "10048" in combined
         or "access permissions" in combined
         or "forbidden by its access permissions" in combined
+        or "only one usage of each socket address" in combined
     )
 
 
@@ -1202,7 +1204,7 @@ def _run_browser_command(
 
         retry_timeout = min(timeout, 10)
 
-        if os.name == "nt" and _is_agent_browser_bind_10013_error(result.stderr, result.stdout):
+        if os.name == "nt" and _is_agent_browser_windows_bind_error(result.stderr, result.stdout):
             retry_env = {**browser_env}
             current_port = retry_env.get("AGENT_BROWSER_STREAM_PORT", "").strip()
             if current_port and current_port != "0":
@@ -1210,7 +1212,7 @@ def _run_browser_command(
             else:
                 retry_env["AGENT_BROWSER_STREAM_PORT"] = _allocate_free_tcp_port()
             logger.warning(
-                "browser '%s' hit daemon bind 10013; retrying with AGENT_BROWSER_STREAM_PORT=%s",
+                "browser '%s' hit Windows daemon bind error; retrying with AGENT_BROWSER_STREAM_PORT=%s",
                 command,
                 retry_env["AGENT_BROWSER_STREAM_PORT"],
             )
@@ -1220,7 +1222,7 @@ def _run_browser_command(
                 env=retry_env,
             )
 
-        if os.name == "nt" and _is_agent_browser_bind_10013_error(result.stderr, result.stdout):
+        if os.name == "nt" and _is_agent_browser_windows_bind_error(result.stderr, result.stdout):
             killed_from_pid = False
             if use_custom_socket_dir:
                 killed_from_pid = _kill_daemon_pid_from_socket_dir(
@@ -1237,7 +1239,7 @@ def _run_browser_command(
                 recovery_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
             recovery_env["AGENT_BROWSER_STREAM_PORT"] = _allocate_free_tcp_port()
             logger.warning(
-                "browser '%s' still hit bind 10013; retrying after stale-daemon cleanup "
+                "browser '%s' still hit Windows daemon bind error; retrying after stale-daemon cleanup "
                 "(pid_file_killed=%s, taskkill_images=%d) with AGENT_BROWSER_STREAM_PORT=%s",
                 command,
                 killed_from_pid,
@@ -1800,15 +1802,16 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
     """
     effective_task_id = task_id or "default"
     
-    # Use eval to run JavaScript that extracts images
-    js_code = """JSON.stringify(
-        [...document.images].map(img => ({
-            src: img.src,
-            alt: img.alt || '',
-            width: img.naturalWidth,
-            height: img.naturalHeight
-        })).filter(img => img.src && !img.src.startsWith('data:'))
-    )"""
+    # Keep the payload to a compact single expression to avoid CLI/eval
+    # transport quirks with multiline snippets.
+    js_code = (
+        'JSON.stringify(Array.from(document.images, img => ({'
+        'src: img.src, '
+        'alt: img.alt || "", '
+        'width: img.naturalWidth, '
+        'height: img.naturalHeight'
+        '})).filter(img => img.src && !img.src.startsWith("data:")))'
+    )
     
     result = _run_browser_command(effective_task_id, "eval", [js_code])
     
