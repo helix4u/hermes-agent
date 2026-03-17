@@ -1,4 +1,4 @@
-from gateway.browser_bridge import build_browser_context_message
+from gateway.browser_bridge import build_browser_chat_message, build_browser_context_message
 
 
 def test_context_message_enables_live_browser_actions_for_explicit_requests():
@@ -25,3 +25,14 @@ def test_context_message_keeps_no_live_recheck_default_for_reference_turns():
     assert "Do not call browser navigation/snapshot/vision tools" in message
     assert "explicitly asking for a live browser action" not in message
 
+
+def test_slash_command_passthrough_ignores_page_context_wrapper():
+    message = build_browser_chat_message(
+        "/status",
+        {
+            "url": "https://example.com",
+            "title": "Example",
+            "note": "stale note should be ignored for slash mode",
+        },
+    )
+    assert message == "/status"

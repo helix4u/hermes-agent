@@ -107,6 +107,60 @@ def _get_extraction_model() -> Optional[str]:
     return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
 
 
+def _get_shared_cdp_state_path() -> Path:
+    """Path for cross-process CDP runtime state shared between CLI and gateway."""
+    hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    return hermes_home / "runtime" / "browser_cdp_state.json"
+
+
+def read_shared_cdp_state() -> Dict[str, Any]:
+    """Read persisted cross-process CDP runtime state."""
+    state_path = _get_shared_cdp_state_path()
+    if not state_path.exists():
+        return {}
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def persist_shared_cdp_state(cdp_url: str, browser: str = "") -> bool:
+    """Persist CDP runtime state so gateway/CLI processes can share it."""
+    cdp = str(cdp_url or "").strip()
+    if not cdp:
+        return False
+    state_path = _get_shared_cdp_state_path()
+    payload = {
+        "cdp_url": cdp,
+        "browser": str(browser or "").strip(),
+        "updated_at_unix": time.time(),
+    }
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def clear_shared_cdp_state() -> None:
+    """Clear persisted cross-process CDP runtime state."""
+    state_path = _get_shared_cdp_state_path()
+    try:
+        state_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _read_shared_cdp_url() -> str:
+    """Read persisted CDP URL from runtime state file."""
+    raw = read_shared_cdp_state()
+    return str(raw.get("cdp_url") or "").strip()
+
+
 def _get_cdp_override() -> str:
     """Return a user-supplied CDP URL override, or empty string.
 
@@ -114,7 +168,10 @@ def _get_cdp_override() -> str:
     both Browserbase and the local headless launcher and connect directly to
     the supplied Chrome DevTools Protocol endpoint.
     """
-    return os.environ.get("BROWSER_CDP_URL", "").strip()
+    direct = os.environ.get("BROWSER_CDP_URL", "").strip()
+    if direct:
+        return direct
+    return _read_shared_cdp_url()
 
 
 def _normalize_agent_browser_cdp_arg(cdp_url: str) -> str:
@@ -152,6 +209,70 @@ def _is_local_mode() -> bool:
     if _get_cdp_override():
         return False  # CDP override takes priority
     return not (os.environ.get("BROWSERBASE_API_KEY") and os.environ.get("BROWSERBASE_PROJECT_ID"))
+
+
+def _is_enabled(value: str, default: bool = False) -> bool:
+    raw = str(value if value is not None else "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _is_sidecar_task(task_id: Optional[str]) -> bool:
+    value = str(task_id or "").strip().lower()
+    if not value:
+        return False
+    return (
+        value.startswith("sidecar_")
+        or "browser-bridge" in value
+        or "hermes-sidecar" in value
+    )
+
+
+def _sidecar_live_action_guard_error(task_id: str, command: str, session_info: Dict[str, Any]) -> str:
+    """Return an actionable guard error when sidecar command is not truly live.
+
+    Sidecar users expect browser actions (open/click/type/...) to operate on the
+    visible tab that hosts the side panel. Running those commands in a hidden
+    local headless browser leads to false "success" outcomes.
+    """
+    if not _is_sidecar_task(task_id):
+        return ""
+
+    if _is_enabled(
+        os.environ.get("HERMES_SIDECAR_ALLOW_HEADLESS_BROWSER_ACTIONS", "false"),
+        default=False,
+    ):
+        return ""
+
+    if session_info.get("cdp_url"):
+        return ""
+
+    blocked_live_commands = {
+        "open",
+        "click",
+        "fill",
+        "scroll",
+        "back",
+        "press",
+        "snapshot",
+        "images",
+        "vision",
+        "console",
+    }
+    if command not in blocked_live_commands:
+        return ""
+
+    return (
+        "Sidecar live browser action blocked: no live CDP browser is connected for this sidecar session. "
+        "Hermes would otherwise run this command in a hidden local headless browser, which does not control "
+        "the visible sidecar tab. Connect CDP first (for CLI: `/browser connect`, or set `browser.cdp_url` in "
+        "config.yaml), then retry."
+    )
 
 
 def _socket_safe_tmpdir() -> str:
@@ -703,8 +824,15 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     
     # Create session outside the lock (network call in cloud mode)
     cdp_override = _get_cdp_override()
+    force_local_for_sidecar = _is_enabled(
+        os.environ.get("HERMES_SIDECAR_FORCE_LOCAL_BROWSER", "true"),
+        default=True,
+    )
     if cdp_override:
         session_info = _create_cdp_session(task_id, cdp_override)
+    elif force_local_for_sidecar and _is_sidecar_task(task_id):
+        session_info = _create_local_session(task_id)
+        session_info.setdefault("features", {})["sidecar_force_local"] = True
     elif _is_local_mode():
         session_info = _create_local_session(task_id)
     else:
@@ -957,14 +1085,7 @@ def _run_browser_command(
         Parsed JSON response from agent-browser
     """
     args = args or []
-    
-    # Build the command
-    try:
-        browser_cmd_parts = _find_agent_browser()
-    except FileNotFoundError as e:
-        logger.warning("agent-browser CLI not found: %s", e)
-        return {"success": False, "error": str(e)}
-    
+
     from tools.interrupt import is_interrupted
     if is_interrupted():
         return {"success": False, "error": "Interrupted"}
@@ -975,6 +1096,26 @@ def _run_browser_command(
     except Exception as e:
         logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
         return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
+
+    guard_error = _sidecar_live_action_guard_error(task_id, command, session_info)
+    if guard_error:
+        logger.warning(
+            "Blocked sidecar browser command '%s' for task=%s without live CDP connection",
+            command,
+            task_id,
+        )
+        return {
+            "success": False,
+            "error": guard_error,
+            "requires_live_cdp": True,
+        }
+
+    # Build the command
+    try:
+        browser_cmd_parts = _find_agent_browser()
+    except FileNotFoundError as e:
+        logger.warning("agent-browser CLI not found: %s", e)
+        return {"success": False, "error": str(e)}
     
     # Build the command with the appropriate backend flag.
     # Cloud/live-CDP mode: --cdp <endpoint> connects to an existing browser.

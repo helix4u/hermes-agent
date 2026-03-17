@@ -76,7 +76,7 @@ _HERMES_BROWSER_TOOLS = [
 _HERMES_SIDECAR_TOOLS = [
     tool
     for tool in _HERMES_CORE_TOOLS
-    if tool not in _HERMES_BROWSER_TOOLS and tool != "delegate_task"
+    if tool != "delegate_task"
 ]
 
 _HERMES_SIDECAR_DELEGATING_TOOLS = [
@@ -269,7 +269,7 @@ TOOLSETS = {
     },
 
     "hermes-sidecar": {
-        "description": "Browser sidecar toolset - Hermes core tools without browser automation or delegated subagents",
+        "description": "Browser sidecar toolset - Hermes core tools with browser automation, without delegated subagents",
         "tools": _HERMES_SIDECAR_TOOLS,
         "includes": []
     },

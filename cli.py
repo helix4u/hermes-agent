@@ -27,6 +27,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -386,11 +387,20 @@ def load_cli_config() -> Dict[str, Any]:
     browser_config = defaults.get("browser", {})
     browser_env_mappings = {
         "inactivity_timeout": "BROWSER_INACTIVITY_TIMEOUT",
+        "cdp_url": "BROWSER_CDP_URL",
+        "cdp_browser": "BROWSER_CDP_BROWSER",
+        "cdp_port": "BROWSER_CDP_PORT",
+        "cdp_user_data_dir": "BROWSER_CDP_USER_DATA_DIR",
     }
     
     for config_key, env_var in browser_env_mappings.items():
         if config_key in browser_config:
-            os.environ[env_var] = str(browser_config[config_key])
+            value = browser_config[config_key]
+            if isinstance(value, str):
+                if value.strip():
+                    os.environ[env_var] = value.strip()
+            elif value is not None:
+                os.environ[env_var] = str(value)
     
     # Apply compression config to environment variables
     compression_config = defaults.get("compression", {})
@@ -3565,59 +3575,247 @@ class HermesCLI:
         thread.start()
 
     @staticmethod
-    def _try_launch_chrome_debug(port: int, system: str) -> bool:
-        """Try to launch Chrome/Chromium with remote debugging enabled.
+    def _normalize_cdp_browser_name(raw: str) -> str:
+        """Normalize browser aliases used by /browser connect."""
+        normalized = (raw or "").strip().lower()
+        alias_map = {
+            "": "auto",
+            "auto": "auto",
+            "chrome": "chrome",
+            "google-chrome": "chrome",
+            "edge": "edge",
+            "msedge": "edge",
+            "microsoft-edge": "edge",
+            "brave": "brave",
+            "brave-browser": "brave",
+            "chromium": "chromium",
+            "comet": "comet",
+        }
+        return alias_map.get(normalized, normalized)
 
-        Returns True if a launch command was executed (doesn't guarantee success).
-        """
+    @staticmethod
+    def _default_cdp_port_for_browser(browser: str) -> int:
+        """Return deterministic per-browser localhost CDP defaults."""
+        mapping = {
+            "auto": 9222,
+            "chrome": 9222,
+            "edge": 9223,
+            "brave": 9224,
+            "chromium": 9225,
+            "comet": 9226,
+        }
+        return mapping.get(HermesCLI._normalize_cdp_browser_name(browser), 9222)
+
+    @staticmethod
+    def _is_likely_cdp_endpoint(raw: str) -> bool:
+        token = (raw or "").strip()
+        if not token:
+            return False
+        if token.startswith(("ws://", "wss://", "http://", "https://")):
+            return True
+        if token.isdigit():
+            return True
+        if " " in token:
+            return False
+        host, sep, port = token.rpartition(":")
+        return bool(sep and host and port.isdigit())
+
+    @staticmethod
+    def _resolve_browser_connect_target(raw_arg: str, default_port: int, default_browser: str, default_cdp_url: str):
+        """Resolve /browser connect arg into (cdp_url, browser_choice, error)."""
+        arg = (raw_arg or "").strip()
+        browser_choice = HermesCLI._normalize_cdp_browser_name(default_browser)
+        if not arg:
+            cdp_url = (default_cdp_url or "").strip() or f"ws://localhost:{default_port}"
+            return cdp_url, browser_choice, ""
+
+        if HermesCLI._is_likely_cdp_endpoint(arg):
+            endpoint = arg
+            if endpoint.isdigit():
+                endpoint = f"ws://localhost:{endpoint}"
+            elif "://" not in endpoint:
+                endpoint = f"ws://{endpoint}"
+            return endpoint, browser_choice, ""
+
+        candidate = HermesCLI._normalize_cdp_browser_name(arg)
+        supported = {"auto", "chrome", "edge", "brave", "chromium", "comet"}
+        if candidate in supported:
+            cdp_port = HermesCLI._default_cdp_port_for_browser(candidate)
+            return f"ws://localhost:{cdp_port}", candidate, ""
+
+        err = (
+            f"Unknown browser target '{arg}'. "
+            "Use one of: auto, chrome, edge, brave, chromium, comet, or pass a CDP endpoint "
+            "(example: ws://localhost:9222)."
+        )
+        return "", "", err
+
+    @staticmethod
+    def _extract_cdp_port(cdp_url: str, fallback_port: int) -> int:
+        """Extract TCP port from a CDP endpoint string."""
+        try:
+            parsed = urlparse((cdp_url or "").strip())
+            if parsed.port:
+                return int(parsed.port)
+        except Exception:
+            pass
+        try:
+            return int(str(cdp_url).rsplit(":", 1)[-1].split("/")[0])
+        except (ValueError, IndexError):
+            return fallback_port
+
+    @staticmethod
+    def _manual_browser_launch_command(system: str, browser: str, port: int, profile_dir: str) -> str:
+        """Return a one-line manual browser launch command for the current OS."""
+        choice = HermesCLI._normalize_cdp_browser_name(browser)
+        if system == "Darwin":
+            app_name_map = {
+                "chrome": "Google Chrome",
+                "edge": "Microsoft Edge",
+                "brave": "Brave Browser",
+                "chromium": "Chromium",
+                "comet": "Comet",
+            }
+            app_name = app_name_map.get(choice, "Google Chrome")
+            return (
+                f'open -a "{app_name}" --args '
+                f"--remote-debugging-port={port} --user-data-dir=\"{profile_dir}\""
+            )
+        if system == "Windows":
+            binary_map = {
+                "edge": "msedge.exe",
+                "brave": "brave.exe",
+                "chromium": "chrome.exe",
+                "comet": "comet.exe",
+            }
+            binary = binary_map.get(choice, "chrome.exe")
+            return (
+                f'"{binary}" --remote-debugging-port={port} '
+                f'--user-data-dir="{profile_dir}"'
+            )
+        binary_map = {
+            "edge": "microsoft-edge",
+            "brave": "brave-browser",
+            "chromium": "chromium",
+            "comet": "comet",
+        }
+        binary = binary_map.get(choice, "google-chrome")
+        return (
+            f"{binary} --remote-debugging-port={port} "
+            f"--user-data-dir=\"{profile_dir}\""
+        )
+
+    @staticmethod
+    def _try_launch_chrome_debug(
+        port: int,
+        system: str,
+        browser: str = "auto",
+        profile_dir: Optional[str] = None,
+    ) -> bool:
+        """Try to launch a selected Chromium-family browser with remote debugging."""
         import shutil
         import subprocess as _sp
         import tempfile
 
-        candidates = []
-        if system == "Darwin":
-            # macOS: try common app bundle locations
-            for app in (
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                "/Applications/Chromium.app/Contents/MacOS/Chromium",
-                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-            ):
-                if os.path.isfile(app):
-                    candidates.append(app)
-        elif system == "Windows":
-            # Prefer fully-qualified executable paths for reliability.
-            for app in (
-                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Google", "Chrome", "Application", "chrome.exe"),
-                os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Google", "Chrome", "Application", "chrome.exe"),
-                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
-                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Microsoft", "Edge", "Application", "msedge.exe"),
-                os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Microsoft", "Edge", "Application", "msedge.exe"),
-            ):
-                if app and os.path.isfile(app):
-                    candidates.append(app)
-            for name in ("chrome", "chrome.exe", "msedge", "msedge.exe"):
-                path = shutil.which(name)
-                if path:
-                    candidates.append(path)
-        else:
-            # Linux: try common binary names
-            for name in ("google-chrome", "google-chrome-stable", "chromium-browser",
-                         "chromium", "brave-browser", "microsoft-edge"):
-                path = shutil.which(name)
-                if path:
-                    candidates.append(path)
+        choice = HermesCLI._normalize_cdp_browser_name(browser)
+        search_order = ("chrome", "edge", "brave", "chromium", "comet") if choice == "auto" else (choice,)
 
-        if not candidates:
+        candidates: List[str] = []
+        if system == "Darwin":
+            app_map = {
+                "chrome": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+                "edge": ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"],
+                "brave": ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"],
+                "chromium": ["/Applications/Chromium.app/Contents/MacOS/Chromium"],
+                "comet": ["/Applications/Comet.app/Contents/MacOS/Comet"],
+            }
+            for key in search_order:
+                for app in app_map.get(key, []):
+                    if os.path.isfile(app):
+                        candidates.append(app)
+        elif system == "Windows":
+            pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+            pfx86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+            local = os.environ.get("LOCALAPPDATA", "")
+            path_map = {
+                "chrome": [
+                    os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+                    os.path.join(pfx86, "Google", "Chrome", "Application", "chrome.exe"),
+                    os.path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+                ],
+                "edge": [
+                    os.path.join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+                    os.path.join(pfx86, "Microsoft", "Edge", "Application", "msedge.exe"),
+                    os.path.join(local, "Microsoft", "Edge", "Application", "msedge.exe"),
+                ],
+                "brave": [
+                    os.path.join(pf, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                    os.path.join(pfx86, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                    os.path.join(local, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                ],
+                "chromium": [
+                    os.path.join(pf, "Chromium", "Application", "chrome.exe"),
+                    os.path.join(pfx86, "Chromium", "Application", "chrome.exe"),
+                    os.path.join(local, "Chromium", "Application", "chrome.exe"),
+                ],
+                "comet": [
+                    os.path.join(pf, "Comet", "Application", "comet.exe"),
+                    os.path.join(pfx86, "Comet", "Application", "comet.exe"),
+                    os.path.join(local, "Comet", "Application", "comet.exe"),
+                    os.path.join(local, "Perplexity", "Comet", "Application", "comet.exe"),
+                ],
+            }
+            bin_map = {
+                "chrome": ("chrome.exe", "chrome"),
+                "edge": ("msedge.exe", "msedge"),
+                "brave": ("brave.exe", "brave"),
+                "chromium": ("chromium.exe", "chromium"),
+                "comet": ("comet.exe", "comet"),
+            }
+            for key in search_order:
+                for app in path_map.get(key, []):
+                    if app and os.path.isfile(app):
+                        candidates.append(app)
+                for binary in bin_map.get(key, ()):
+                    path = shutil.which(binary)
+                    if path:
+                        candidates.append(path)
+        else:
+            bin_map = {
+                "chrome": ("google-chrome", "google-chrome-stable"),
+                "edge": ("microsoft-edge",),
+                "brave": ("brave-browser",),
+                "chromium": ("chromium-browser", "chromium"),
+                "comet": ("comet",),
+            }
+            for key in search_order:
+                for name in bin_map.get(key, ()):
+                    path = shutil.which(name)
+                    if path:
+                        candidates.append(path)
+
+        deduped_candidates: List[str] = []
+        seen = set()
+        for candidate in candidates:
+            normalized = os.path.normcase(os.path.normpath(candidate))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped_candidates.append(candidate)
+
+        if not deduped_candidates:
             return False
 
-        chrome = candidates[0]
-        profile_dir = os.path.join(tempfile.gettempdir(), "chrome-cdp-hermes")
+        executable = deduped_candidates[0]
+        profile = (profile_dir or "").strip()
+        if not profile:
+            profile_suffix = choice if choice != "auto" else "chrome"
+            profile = os.path.join(tempfile.gettempdir(), f"{profile_suffix}-cdp-hermes")
         try:
             launch_cmd = [
-                chrome,
+                executable,
                 f"--remote-debugging-port={port}",
-                f"--user-data-dir={profile_dir}",
+                f"--user-data-dir={profile}",
             ]
             popen_kwargs = {
                 "stdout": _sp.DEVNULL,
@@ -3629,7 +3827,7 @@ class HermesCLI:
                 flags |= getattr(_sp, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
                 popen_kwargs["creationflags"] = flags
             else:
-                popen_kwargs["start_new_session"] = True  # detach from terminal
+                popen_kwargs["start_new_session"] = True
 
             _sp.Popen(launch_cmd, **popen_kwargs)
             return True
@@ -3639,18 +3837,48 @@ class HermesCLI:
     def _handle_browser_command(self, cmd: str):
         """Handle /browser connect|disconnect|status — manage live Chrome CDP connection."""
         import platform as _plat
-        import subprocess as _sp
+        try:
+            from tools.browser_tool import (
+                read_shared_cdp_state as _read_shared_cdp_state,
+                persist_shared_cdp_state as _persist_shared_cdp_state,
+                clear_shared_cdp_state as _clear_shared_cdp_state,
+            )
+        except Exception:
+            _read_shared_cdp_state = lambda: {}
+            _persist_shared_cdp_state = lambda cdp_url, browser="": False
+            _clear_shared_cdp_state = lambda: None
 
         parts = cmd.strip().split(None, 1)
         sub = parts[1].lower().strip() if len(parts) > 1 else "status"
 
-        _DEFAULT_CDP = "ws://localhost:9222"
-        current = os.environ.get("BROWSER_CDP_URL", "").strip()
+        default_browser = self._normalize_cdp_browser_name(os.environ.get("BROWSER_CDP_BROWSER", "auto"))
+        try:
+            default_port = int(str(os.environ.get("BROWSER_CDP_PORT", "9222")).strip())
+        except ValueError:
+            default_port = 9222
+        shared_state = _read_shared_cdp_state()
+        shared_cdp = str(shared_state.get("cdp_url") or "").strip()
+        current_env = os.environ.get("BROWSER_CDP_URL", "").strip()
+        _DEFAULT_CDP = current_env or shared_cdp or f"ws://localhost:{default_port}"
+        current = current_env or shared_cdp
 
         if sub.startswith("connect"):
-            # Optionally accept a custom CDP URL: /browser connect ws://host:port
-            connect_parts = cmd.strip().split(None, 2)  # ["/browser", "connect", "ws://..."]
-            cdp_url = connect_parts[2].strip() if len(connect_parts) > 2 else _DEFAULT_CDP
+            # /browser connect [target]
+            # target can be a browser alias (chrome/edge/brave/chromium/comet)
+            # or a CDP endpoint (ws://host:port, host:port, or just a port).
+            connect_parts = cmd.strip().split(None, 2)
+            connect_arg = connect_parts[2].strip() if len(connect_parts) > 2 else ""
+            cdp_url, browser_choice, resolve_err = self._resolve_browser_connect_target(
+                raw_arg=connect_arg,
+                default_port=default_port,
+                default_browser=default_browser,
+                default_cdp_url=_DEFAULT_CDP,
+            )
+            if resolve_err:
+                print()
+                print(f"⚠ {resolve_err}")
+                print()
+                return
 
             # Clear any existing browser sessions so the next tool call uses the new backend
             try:
@@ -3662,13 +3890,9 @@ class HermesCLI:
             print()
 
             # Extract port for connectivity checks
-            _port = 9222
-            try:
-                _port = int(cdp_url.rsplit(":", 1)[-1].split("/")[0])
-            except (ValueError, IndexError):
-                pass
+            _port = self._extract_cdp_port(cdp_url, default_port)
 
-            # Check if Chrome is already listening on the debug port
+            # Check if a CDP listener is already reachable on the target port.
             import socket
             _already_open = False
             try:
@@ -3681,11 +3905,23 @@ class HermesCLI:
                 pass
 
             if _already_open:
-                print(f"   ✓ Chrome is already listening on port {_port}")
-            elif cdp_url == _DEFAULT_CDP:
-                # Try to auto-launch Chrome with remote debugging
-                print("   Chrome isn't running with remote debugging — attempting to launch...")
-                _launched = self._try_launch_chrome_debug(_port, _plat.system())
+                print(f"   ✓ CDP endpoint is already listening on port {_port}")
+            else:
+                _parsed = urlparse(cdp_url)
+                _host = (_parsed.hostname or "").strip().lower()
+                _is_localhost = _host in ("localhost", "127.0.0.1")
+                if _is_localhost:
+                    chosen_label = browser_choice if browser_choice != "auto" else "browser"
+                    print(f"   {chosen_label} isn't running with remote debugging — attempting to launch...")
+                    _launched = self._try_launch_chrome_debug(
+                        _port,
+                        _plat.system(),
+                        browser=browser_choice,
+                        profile_dir=os.environ.get("BROWSER_CDP_USER_DATA_DIR", "").strip() or None,
+                    )
+                else:
+                    _launched = False
+
                 if _launched:
                     # Wait for the port to come up
                     import time as _time
@@ -3700,41 +3936,51 @@ class HermesCLI:
                         except (OSError, socket.timeout):
                             _time.sleep(0.5)
                     if _already_open:
-                        print(f"   ✓ Chrome launched and listening on port {_port}")
+                        print(f"   ✓ Browser launched and listening on port {_port}")
                     else:
-                        print(f"   ⚠ Chrome launched but port {_port} isn't responding yet")
-                        print("     You may need to close existing Chrome windows first and retry")
-                else:
-                    print(f"   ⚠ Could not auto-launch Chrome")
-                    # Show manual instructions as fallback
+                        print(f"   ⚠ Browser launched but port {_port} isn't responding yet")
+                        print("     You may need to close existing browser windows first and retry")
+                elif _is_localhost:
+                    print(f"   ⚠ Could not auto-launch selected browser")
                     sys_name = _plat.system()
-                    if sys_name == "Darwin":
-                        chrome_cmd = 'open -a "Google Chrome" --args --remote-debugging-port=9222'
-                    elif sys_name == "Windows":
-                        chrome_cmd = (
-                            '"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" '
-                            '--remote-debugging-port=9222 --user-data-dir="%TEMP%\\chrome-cdp-hermes"'
+                    profile_dir = (
+                        os.environ.get("BROWSER_CDP_USER_DATA_DIR", "").strip()
+                        or os.path.join(
+                            tempfile.gettempdir(),
+                            f"{(browser_choice if browser_choice != 'auto' else 'browser')}-cdp-hermes",
                         )
-                    else:
-                        chrome_cmd = "google-chrome --remote-debugging-port=9222"
-                    print(f"     Launch Chrome manually: {chrome_cmd}")
-            else:
-                print(f"   ⚠ Port {_port} is not reachable at {cdp_url}")
+                    )
+                    chrome_cmd = self._manual_browser_launch_command(
+                        system=sys_name,
+                        browser=browser_choice,
+                        port=_port,
+                        profile_dir=profile_dir,
+                    )
+                    print(f"     Launch manually: {chrome_cmd}")
+                else:
+                    print(f"   ⚠ Port {_port} is not reachable at {cdp_url}")
 
             # Do not mark connected when localhost CDP is unreachable.
-            _is_local_cdp = "localhost" in cdp_url or "127.0.0.1" in cdp_url
+            _parsed = urlparse(cdp_url)
+            _host = (_parsed.hostname or "").strip().lower()
+            _is_local_cdp = _host in ("localhost", "127.0.0.1")
             if _is_local_cdp and not _already_open:
                 print()
                 print("⚠ Browser not connected (CDP endpoint is unreachable).")
                 print(f"   Expected endpoint: {cdp_url}")
-                print("   Start Chrome with remote debugging, then run /browser connect again.")
+                print("   Start your selected browser with remote debugging, then run /browser connect again.")
                 print()
                 return
 
             os.environ["BROWSER_CDP_URL"] = cdp_url
+            os.environ["BROWSER_CDP_BROWSER"] = browser_choice
+            persisted = _persist_shared_cdp_state(cdp_url, browser_choice)
             print()
             print("🌐 Browser connected to live Chrome via CDP")
             print(f"   Endpoint: {cdp_url}")
+            print(f"   Target: {browser_choice}")
+            if not persisted:
+                print("   ⚠ Could not persist shared runtime CDP state (sidecar may not see this connection).")
             print()
 
             # Inject context message so the model knows
@@ -3752,6 +3998,7 @@ class HermesCLI:
         elif sub == "disconnect":
             if current:
                 os.environ.pop("BROWSER_CDP_URL", None)
+                _clear_shared_cdp_state()
                 try:
                     from tools.browser_tool import cleanup_all_browsers
                     cleanup_all_browsers()
@@ -3777,12 +4024,10 @@ class HermesCLI:
             if current:
                 print(f"🌐 Browser: connected to live Chrome via CDP")
                 print(f"   Endpoint: {current}")
+                if not current_env and shared_cdp:
+                    print("   Source: shared runtime state")
 
-                _port = 9222
-                try:
-                    _port = int(current.rsplit(":", 1)[-1].split("/")[0])
-                except (ValueError, IndexError):
-                    pass
+                _port = self._extract_cdp_port(current, default_port)
                 try:
                     import socket
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -3792,12 +4037,15 @@ class HermesCLI:
                     print(f"   Status: ✓ reachable")
                 except (OSError, Exception):
                     print(f"   Status: ⚠ not reachable (Chrome may not be running)")
+                print(f"   Preferred target: {default_browser}")
+                print(f"   Default port: {default_port}")
             elif os.environ.get("BROWSERBASE_API_KEY"):
                 print("🌐 Browser: Browserbase (cloud)")
             else:
                 print("🌐 Browser: local headless Chromium (agent-browser)")
             print()
-            print("   /browser connect      — connect to your live Chrome")
+            print("   /browser connect [target] — connect to live CDP")
+            print("      targets: auto, chrome, edge, brave, chromium, comet, ws://host:port, port")
             print("   /browser disconnect   — revert to default")
             print()
 
@@ -3805,7 +4053,7 @@ class HermesCLI:
             print()
             print("Usage: /browser connect|disconnect|status")
             print()
-            print("   connect      Connect browser tools to your live Chrome session")
+            print("   connect      Connect browser tools to a selected browser or CDP endpoint")
             print("   disconnect   Revert to default browser backend")
             print("   status       Show current browser mode")
             print()

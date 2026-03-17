@@ -201,6 +201,22 @@ browser:
   # Browser backend: "playwright" (local) or "browserbase"
   # backend: "playwright"
 
+  # Optional live CDP endpoint override for browser tools.
+  # When set, browser tools connect to this endpoint instead of headless local mode.
+  # Example: "ws://localhost:9222"
+  # cdp_url: ""
+
+  # Preferred browser target for `/browser connect` auto-launch.
+  # Options: auto, chrome, edge, brave, chromium, comet
+  cdp_browser: "auto"
+
+  # Default localhost CDP port used by `/browser connect` when no endpoint is provided.
+  cdp_port: 9222
+
+  # Optional user-data-dir for CDP browser launch.
+  # Useful to isolate automation from your daily profile.
+  # cdp_user_data_dir: "%TEMP%\\chrome-cdp-hermes"
+
   # Inactivity timeout in seconds - browser sessions are automatically closed
   # after this period of no activity between agent loops (default: 120 = 2 minutes)
   inactivity_timeout: 120

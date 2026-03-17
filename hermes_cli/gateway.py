@@ -1097,13 +1097,32 @@ def run_gateway(verbose: bool = False, replace: bool = False):
     print("└─────────────────────────────────────────────────────────┘")
     print()
     
+    detached_mode = os.getenv("HERMES_GATEWAY_DETACHED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
     # Exit with code 1 if gateway fails to connect any platform,
-    # so systemd Restart=on-failure will retry on transient errors
-    try:
-        success = asyncio.run(start_gateway(replace=replace))
-    except KeyboardInterrupt:
-        print("\nGateway stopped.")
-        return
+    # so systemd Restart=on-failure will retry on transient errors.
+    # In detached mode, treat stray KeyboardInterrupt as recoverable and restart.
+    interrupt_restarts = 0
+    while True:
+        try:
+            success = asyncio.run(start_gateway(replace=replace))
+            break
+        except KeyboardInterrupt:
+            if detached_mode:
+                interrupt_restarts += 1
+                print(f"\n⚠ Detached gateway received unexpected interrupt (attempt {interrupt_restarts}); restarting...")
+                if interrupt_restarts >= 3:
+                    print("✗ Detached gateway kept receiving interrupts; aborting this launch.")
+                    return
+                time.sleep(1.0)
+                continue
+            print("\nGateway stopped.")
+            return
     if not success:
         sys.exit(1)
 
@@ -1354,9 +1373,14 @@ def windows_start_detached_gateway(*, stream_startup: bool = True) -> None:
 
     stderr_handle = open(stderr_log, "a", encoding="utf-8", errors="replace")
     try:
+        child_env = os.environ.copy()
+        # Detached gateway instances should ignore stray task cancellations
+        # (for example unexpected SIGINT delivery) unless shutdown is requested.
+        child_env["HERMES_GATEWAY_DETACHED"] = "1"
         proc = subprocess.Popen(
             command,
             cwd=str(PROJECT_ROOT),
+            env=child_env,
             stdin=subprocess.DEVNULL,
             stderr=stderr_handle,
             close_fds=True,
@@ -1954,8 +1978,7 @@ def gateway_command(args):
             killed = kill_gateway_processes()
             if killed:
                 print(f"✓ Stopped {killed} gateway process(es)")
-            
-            import time
+
             time.sleep(2)
             
             # Start fresh

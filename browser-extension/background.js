@@ -592,22 +592,32 @@ function isYouTubeWatchUrl(rawUrl) {
 }
 
 function isRestrictedPageUrl(rawUrl) {
-  const value = String(rawUrl || "").trim().toLowerCase();
+  const value = String(rawUrl || "").trim();
   if (!value) {
     return true;
   }
-  return (
-    value.startsWith("chrome://") ||
-    value.startsWith("chrome-extension://") ||
-    value.startsWith("edge://") ||
-    value.startsWith("about:") ||
-    value.startsWith("devtools://") ||
-    value.startsWith("view-source:") ||
-    value.startsWith("chrome-search://") ||
-    value.startsWith("brave://") ||
-    value.startsWith("opera://") ||
-    value.startsWith("vivaldi://")
-  );
+  try {
+    const parsed = new URL(value);
+    return !["http:", "https:"].includes(parsed.protocol);
+  } catch (_error) {
+    return true;
+  }
+}
+
+function getUnsupportedPageReason(rawUrl) {
+  const value = String(rawUrl || "").trim();
+  if (!value) {
+    return "Only http/https pages can be shared with Hermes on this tab.";
+  }
+  try {
+    const parsed = new URL(value);
+    if (["http:", "https:"].includes(parsed.protocol)) {
+      return "";
+    }
+    return `Only http/https pages can be shared with Hermes (current protocol: ${parsed.protocol || "unknown"}).`;
+  } catch (_error) {
+    return "Only http/https pages can be shared with Hermes on this tab.";
+  }
 }
 
 async function getTabSnapshot(tabId) {
@@ -1601,6 +1611,7 @@ async function previewPageContext(tabId) {
   const tab = await getTabSnapshot(tabId);
   const tabUrl = String(tab?.url || "");
   if (isRestrictedPageUrl(tab?.url || "")) {
+    const unsupportedReason = getUnsupportedPageReason(tab?.url || "");
     pageContextCache.delete(String(tabId || ""));
     return {
       title: tab?.title || "Internal browser page",
@@ -1612,7 +1623,7 @@ async function previewPageContext(tabId) {
       transcriptAlreadyShared: false,
       transcriptLanguage: "",
       transcriptKey: "",
-      unavailableReason: "This tab is a browser internal page and cannot be shared."
+      unavailableReason: unsupportedReason || "Only http/https pages can be shared with Hermes on this tab."
     };
   }
 
@@ -1680,8 +1691,9 @@ async function buildPageContextPayload(tabId, message, includeTranscript, browse
   const tab = await getTabSnapshot(tabId);
   const tabUrl = String(tab?.url || "");
   if (isRestrictedPageUrl(tab?.url || "")) {
+    const unsupportedReason = getUnsupportedPageReason(tab?.url || "");
     throw new Error(
-      "Cannot use current page context on this browser-internal tab. " +
+      `${unsupportedReason || "Only http/https pages can be shared with Hermes on this tab."} ` +
       "Switch to a normal webpage or turn off \"Use the current page in this turn\"."
     );
   }

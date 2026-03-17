@@ -518,6 +518,7 @@ def build_browser_context_message(payload: dict[str, Any]) -> str:
         sections.extend(
             [
                 "The user appears to be explicitly asking for a live browser action. Execute the requested browser navigation/action first.",
+                "When browser tools are available, use browser_navigate/browser_click/etc. for live web actions instead of launching URLs via terminal shell commands.",
                 "Do not preempt that explicit browser action with memory/worldview file work unless the user asks for it.",
             ]
         )
@@ -554,6 +555,10 @@ def build_bridge_chat_id(browser_label: str, client_session_id: str = "") -> str
 def build_browser_chat_message(message: str, page_payload: Optional[dict[str, Any]] = None) -> str:
     """Build the user message that Hermes should see for a browser chat turn."""
     user_message = (message or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if user_message.startswith("/"):
+        # Slash commands must pass through untouched so the gateway command
+        # router can execute them even when page context sharing is enabled.
+        return user_message
     if page_payload:
         payload = dict(page_payload)
         if user_message:

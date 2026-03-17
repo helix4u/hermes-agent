@@ -904,7 +904,7 @@ function applySidebarSettings(settings, { preserveBusyState = false } = {}) {
   sharePageByDefault = nextSettings.sharePageByDefault !== false;
   previewPollingEnabled = sidebarSettings.enablePreviewPolling === true;
   syncPreviewPollingUi();
-  if (!preserveBusyState || !isBusy) {
+  if ((!preserveBusyState || !isBusy) && !pageContextUnavailable && !sharePageCheckbox.disabled) {
     sharePageCheckbox.checked = sharePageByDefault;
   }
 
@@ -1224,10 +1224,11 @@ function explainBackgroundMismatch(error) {
   if (
     lower.includes("cannot access contents of url") ||
     lower.includes("browser-internal tab") ||
-    lower.includes("internal browser page")
+    lower.includes("internal browser page") ||
+    lower.includes("only http/https pages can be shared")
   ) {
     return (
-      "This tab is a browser internal page and cannot be shared with Hermes. " +
+      "This tab cannot be shared with Hermes (only http/https pages are supported). " +
       "Switch to a normal website tab, or uncheck \"Use the current page in this turn\"."
     );
   }
@@ -1247,6 +1248,22 @@ function explainBackgroundMismatch(error) {
     );
   }
   return message;
+}
+
+function getNonHttpProtocol(rawUrl) {
+  const value = String(rawUrl || "").trim();
+  if (!value) {
+    return "";
+  }
+  try {
+    const parsed = new URL(value);
+    if (["http:", "https:"].includes(parsed.protocol)) {
+      return "";
+    }
+    return parsed.protocol || "unknown";
+  } catch (_error) {
+    return "";
+  }
 }
 
 async function getActiveTab() {
@@ -1655,6 +1672,7 @@ function renderPreview(result) {
   pageContextUnavailable = false;
   const previousUrl = lastPreview?.url || "";
   lastPreview = result || null;
+  const nonHttpProtocol = getNonHttpProtocol(result?.url || "");
   syncBundleSelectionState(result, {
     preserveExisting: Boolean(previousUrl && previousUrl === (result?.url || ""))
   });
@@ -1668,7 +1686,7 @@ function renderPreview(result) {
   if (result.contentKind === "restricted-page") {
     pageContextUnavailable = true;
     sharePageCheckbox.checked = false;
-    sharePageCheckbox.disabled = true;
+    sharePageCheckbox.disabled = false;
     includeTranscript.checked = false;
     includeTranscript.disabled = true;
     includeTranscriptLabel.textContent = "Transcript unavailable on this tab";
@@ -1677,10 +1695,22 @@ function renderPreview(result) {
     return;
   }
 
+  if (nonHttpProtocol) {
+    pageContextUnavailable = true;
+    sharePageCheckbox.checked = false;
+    sharePageCheckbox.disabled = false;
+    includeTranscript.checked = false;
+    includeTranscript.disabled = true;
+    includeTranscriptLabel.textContent = "Transcript unavailable on non-http(s) tabs";
+    transcriptStatus.textContent = `Unavailable on ${nonHttpProtocol} pages`;
+    renderContextBundle();
+    return;
+  }
+
   if (isExtensionsPolicyBlockedMessage(result?.unavailableReason || "")) {
     pageContextUnavailable = true;
     sharePageCheckbox.checked = false;
-    sharePageCheckbox.disabled = true;
+    sharePageCheckbox.disabled = false;
     includeTranscript.checked = false;
     includeTranscript.disabled = true;
     includeTranscriptLabel.textContent = "Transcript unavailable on policy-blocked pages";
@@ -1719,7 +1749,7 @@ function renderUnavailablePreview(message) {
   renderPdfImageStatus(null);
   transcriptStatus.textContent = "No transcript";
   sharePageCheckbox.checked = false;
-  sharePageCheckbox.disabled = true;
+  sharePageCheckbox.disabled = false;
   includeTranscript.checked = false;
   includeTranscript.disabled = true;
   includeTranscriptLabel.textContent = "Transcript unavailable until page context loads";
@@ -2101,7 +2131,11 @@ async function resetChatSession() {
     selectedSessionKey = expectedSessionKey;
     renderMessages(currentMessages, null, null);
     chatInput.value = "";
-    sharePageCheckbox.checked = sharePageByDefault;
+    if (!pageContextUnavailable && !sharePageCheckbox.disabled) {
+      sharePageCheckbox.checked = sharePageByDefault;
+    } else {
+      sharePageCheckbox.checked = false;
+    }
     setStatus("Started a fresh Hermes sidecar session.");
     loadSessionHistory({ quiet: true, preferredSessionKey: expectedSessionKey }).catch(() => {});
   } finally {
@@ -2465,6 +2499,14 @@ if (composer) {
 }
 
 sharePageCheckbox.addEventListener("change", () => {
+  if (pageContextUnavailable && sharePageCheckbox.checked) {
+    sharePageCheckbox.checked = false;
+    setStatus(
+      "Current tab context is unavailable. Switch to a normal webpage tab, or keep page sharing off for this turn."
+    );
+    renderContextBundle();
+    return;
+  }
   renderContextBundle();
 });
 

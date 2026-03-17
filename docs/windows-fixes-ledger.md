@@ -581,6 +581,236 @@ Scope: `hermes-agent` Windows install/startup/runtime reliability fixes validate
 - `Audio capture: OK`
 - `STT provider: OK (OpenAI)` (in this interactive run).
 
+### WF-030 - Detached gateway no longer dies on stray cancel/SIGINT mid-turn
+- Status: `done`
+- Problem:
+- Detached Windows gateway could disappear mid-sidecar turn (`Failed to fetch`) after an unexpected cancellation event; `gateway.log` showed `KeyboardInterrupt` + `CancelledError` chain followed by gateway shutdown.
+- Root evidence:
+- `gateway.log` recorded:
+- `Fatal agent error in session ...`
+- `Gateway shutdown wait was cancelled; stopping gracefully.`
+- Changes made:
+- `hermes_cli/gateway.py`
+- `windows_start_detached_gateway()` now launches child with `HERMES_GATEWAY_DETACHED=1` in env.
+- `gateway/run.py`
+- `start_gateway()` cancellation guard now treats unexpected `CancelledError` as recoverable while running in detached mode (or with active sidecar turn), uncancels current task, and resumes wait loop instead of stopping gateway.
+- `_handle_message()` now handles `asyncio.CancelledError` explicitly:
+- returns an interrupted-turn response when gateway is still running.
+- re-raises during real shutdown.
+- Added regression tests:
+- `tests/gateway/test_detached_gateway_resilience.py`
+- `test_windows_detached_gateway_sets_detached_env_flag`
+- `test_start_gateway_recovers_cancelled_wait_in_detached_mode`
+- Validation:
+- `python -m py_compile gateway/run.py hermes_cli/gateway.py tests/gateway/test_detached_gateway_resilience.py` passed.
+- `pytest -q -o addopts='' tests/gateway/test_detached_gateway_resilience.py` -> `2 passed`.
+
+### WF-031 - Deterministic browser target selection for live CDP (avoid wrong-browser navigation)
+- Status: `done`
+- Problem:
+- `/browser connect` could attach to whichever Chromium target happened to be listening, and sidecar/browser tool navigation could land in an unintended browser instance.
+- Changes made:
+- `cli.py`
+- Added explicit browser-target resolution for `/browser connect [target]`:
+- supports `auto`, `chrome`, `edge`, `brave`, `chromium`, `comet`, `ws://host:port`, `host:port`, or bare port.
+- Added deterministic per-browser localhost CDP defaults:
+- `chrome=9222`, `edge=9223`, `brave=9224`, `chromium=9225`, `comet=9226`.
+- Added browser-specific auto-launch candidate resolution (Windows/macOS/Linux) plus manual fallback command generation per OS.
+- `/browser status` and usage output now surface target/endpoint details.
+- `cli.py` + `gateway/run.py`
+- wired browser CDP config keys into env bridging so gateway and CLI can honor the same selected target:
+- `browser.cdp_url -> BROWSER_CDP_URL`
+- `browser.cdp_browser -> BROWSER_CDP_BROWSER`
+- `browser.cdp_port -> BROWSER_CDP_PORT`
+- `browser.cdp_user_data_dir -> BROWSER_CDP_USER_DATA_DIR`
+- `cli-config.yaml.example`
+- documented `cdp_browser`, `cdp_port`, optional `cdp_url`, and optional `cdp_user_data_dir`.
+- `hermes_cli/commands.py`
+- updated `/browser` help text to reflect target-based usage.
+- Added focused regression test:
+- `tests/test_cli_browser_connect_target.py`
+- `test_resolve_browser_alias_to_deterministic_port`
+- `test_resolve_numeric_port_target`
+- `test_resolve_host_port_target_without_scheme`
+- `test_resolve_unknown_target_returns_error`
+- Validation:
+- `python -m py_compile cli.py gateway/run.py hermes_cli/commands.py tests/test_cli_browser_connect_target.py` passed.
+- `.\.venv\Scripts\python.exe -m pytest -q -o addopts='' tests/test_cli_browser_connect_target.py` passed (`4 passed`) before pausing further pytest runs due extension instability.
+
+### WF-032 - Sidecar live-nav now uses browser tools instead of shell `start` fallback
+- Status: `done`
+- Problem:
+- Browser sidecar turns were issuing URL opens via `terminal` (`start https://...`) instead of browser automation, so Windows routed navigation to the default browser (Comet) rather than the intended CDP-controlled target.
+- Evidence:
+- Sidecar session transcript (`20260316_181220_39207b2e.jsonl`) showed `tool_call=function:terminal` with `start https://github.com` for a nav request.
+- Root cause:
+- `hermes-sidecar` toolset explicitly removed browser automation tools (`browser_navigate`, etc.), leaving terminal as the only viable navigation path.
+- Changes made:
+- `toolsets.py`
+- Updated `_HERMES_SIDECAR_TOOLS` to exclude only `delegate_task`, restoring browser automation tools for sidecar sessions.
+- Updated sidecar toolset description to match new behavior.
+- `gateway/browser_bridge.py`
+- strengthened explicit live-action instruction text to prefer browser tools (`browser_navigate`, `browser_click`, etc.) over shell URL launch commands when browser tools are available.
+- `gateway/run.py`
+- updated policy comment to reflect current sidecar toolset behavior (browser tools included, delegation off by default).
+- Added regression coverage:
+- `tests/test_toolsets.py`
+- `test_sidecar_toolset_includes_browser_tools`
+- `test_sidecar_toolset_still_blocks_delegate_task`
+- Validation:
+- `python -m py_compile toolsets.py gateway/run.py gateway/browser_bridge.py tests/test_toolsets.py` passed.
+- `pytest` intentionally not rerun in this pass to avoid extension instability in this environment.
+
+### WF-033 - Sidecar now hard-forces local/CDP browser mode and rejects non-http(s) page context
+- Status: `done`
+- Problem:
+- Sidecar could still attempt Browserbase (for example quota/minutes exhausted), and page-context toggles could behave poorly on non-`http/https` tabs.
+- Changes made:
+- `gateway/run.py`
+- Sidecar turns now pass a deterministic tool task ID prefix (`sidecar_<session_id>`) so tools can apply sidecar-specific runtime policy.
+- `tools/browser_tool.py`
+- Added sidecar task detection and sidecar-specific browser policy:
+- `HERMES_SIDECAR_FORCE_LOCAL_BROWSER` (default `true`) forces sidecar browser sessions to local mode (or explicit CDP override), never Browserbase.
+- Sidecar-local feature flag added in session info (`sidecar_force_local`) for diagnostics.
+- `browser-extension/background.js`
+- `isRestrictedPageUrl()` now treats any non-`http/https` URL as restricted.
+- Added `getUnsupportedPageReason()` and surfaced protocol-specific reason text.
+- `buildPageContextPayload()` now blocks non-`http/https` with explicit guidance.
+- `browser-extension/sidepanel.js`
+- Added non-`http/https` mismatch handling in UI (`getNonHttpProtocol()` + render guard):
+- force-unchecks/disables `Use current page`
+- disables transcript toggle
+- shows protocol-specific unavailable status.
+- Updated mismatch helper text to explicitly mention http/https requirement.
+- Validation:
+- `python -m py_compile gateway/run.py tools/browser_tool.py` passed.
+- No pytest rerun in this pass (per extension stability constraints).
+
+### WF-034 - Detached gateway spurious-interrupt hardening + stale runtime-state cleanup
+- Status: `done`
+- Problem:
+- Gateway could still "poof" in detached Windows mode when runtime received unexpected interrupt/cancellation signals, and `gateway status` could show stale runtime state (`running`) after abrupt exits.
+- Evidence observed:
+- `gateway.log` showed repeated "Unexpected cancellation ... keeping gateway alive" followed by Discord shard watchdog warning and process disappearance.
+- `gateway-error.log` showed shutdown-thread `KeyboardInterrupt`/`Event loop is closed` cascade during teardown.
+- Changes made:
+- `gateway/run.py`
+- detect detached mode earlier and install process-level `SIGINT` ignore handler in detached runtime to avoid accidental Ctrl+C-style termination.
+- restore prior SIGINT handler in `finally`.
+- ensured final cleanup always clears PID + writes runtime status `stopped` even when shutdown path is abnormal.
+- `hermes_cli/gateway.py`
+- `run_gateway()` now treats detached-mode `KeyboardInterrupt` as recoverable:
+- up to 3 controlled restarts with short backoff instead of immediate process exit.
+- foreground behavior unchanged (`Ctrl+C` still stops gateway when not detached).
+- Validation:
+- `python -m py_compile gateway/run.py hermes_cli/gateway.py` passed.
+- No pytest rerun in this pass (per extension stability constraints).
+
+### WF-035 - Windows `gateway restart` crash hotfix (`UnboundLocalError: time`)
+- Status: `done`
+- Problem:
+- `hermes gateway restart` on Windows crashed with:
+- `UnboundLocalError: cannot access local variable 'time' where it is not associated with a value`
+- Root cause:
+- `gateway_command()` had a function-local `import time` in one branch, which shadowed module-level `time` and made earlier `time.sleep(...)` references fail.
+- Changes made:
+- `hermes_cli/gateway.py`
+- removed function-local `import time` from manual restart branch; uses module-level `import time` consistently.
+- Validation:
+- `python -m py_compile hermes_cli/gateway.py` passed.
+
+### WF-036 - Sidecar live-browser guard (prevent false-success nav in hidden headless session)
+- Status: `done`
+- Problem:
+- Sidecar could report successful browser navigation (for example "GitHub is open") while the visible sidecar tab did not move.
+- Root cause:
+- Sidecar turns without a live CDP connection were still allowed to run `browser_navigate` in hidden local headless mode.
+- Tool response looked successful, but it was not operating on the user-visible browser tab.
+- Changes made:
+- `tools/browser_tool.py`
+- Added `_sidecar_live_action_guard_error(...)` to block sidecar live-action browser commands (`open`, `click`, `fill`, `scroll`, `back`, `press`, `snapshot`, `images`, `vision`, `console`) when no `cdp_url` is active.
+- `_run_browser_command(...)` now returns a hard failure for that case:
+- `success: false`
+- `requires_live_cdp: true`
+- actionable error text explaining how to connect CDP (`/browser connect` or `browser.cdp_url`).
+- Added opt-out env flag for advanced/debug use:
+- `HERMES_SIDECAR_ALLOW_HEADLESS_BROWSER_ACTIONS=true` re-enables prior behavior.
+- Added regression tests:
+- `tests/tools/test_browser_windows_stream_port.py`
+- `test_sidecar_blocks_live_actions_without_cdp_connection`
+- `test_sidecar_can_opt_in_to_headless_live_actions`
+- Validation:
+- `python -m py_compile tools/browser_tool.py tests/tools/test_browser_windows_stream_port.py` passed.
+
+### WF-037 - Sidepanel "Use current page" checkbox no longer gets stuck checked on non-http(s) tabs
+- Status: `done`
+- Problem:
+- On non-`http/https` tabs (for example `chrome://newtab`), the sidepanel could show `Use current page` checked but effectively locked, so users could not reliably unselect it.
+- Root cause:
+- Sidepanel settings refresh / session-reset paths could re-apply `sharePageByDefault` after preview marked page context unavailable.
+- Changes made:
+- `browser-extension/sidepanel.js`
+- `applySidebarSettings(...)` now only reapplies `sharePageByDefault` when page context is available.
+- `resetChatSession()` now respects unavailable-context state and keeps page-sharing unchecked.
+- For unavailable preview states (`restricted-page`, non-`http/https`, policy-blocked, and generic unavailable), `sharePageCheckbox.disabled` is no longer forced true.
+- Added guard in the checkbox `change` handler:
+- if context is unavailable and user tries to check it, the UI immediately unchecks and shows clear status guidance.
+- Validation:
+- `node --check browser-extension/sidepanel.js` passed.
+
+### WF-038 - Cross-process CDP persistence + sidecar slash command passthrough (no more "already connected" loop)
+- Status: `done`
+- Problem:
+- Your workflow (`hermes gateway start` -> `hermes` -> `/browser connect` -> sidecar navigate) could still fail with "no live CDP browser is connected" because CLI-only env changes were not visible to the already-running gateway process.
+- Sidecar messages with page context also wrapped slash commands, preventing command routing in gateway.
+- Changes made:
+- `tools/browser_tool.py`
+- added shared runtime CDP state helpers:
+- `read_shared_cdp_state()`
+- `persist_shared_cdp_state(cdp_url, browser)`
+- `clear_shared_cdp_state()`
+- `_get_cdp_override()` now falls back to shared runtime state file when process env is empty.
+- `cli.py`
+- `/browser connect` now persists shared runtime CDP state in addition to process env.
+- `/browser disconnect` now clears shared runtime CDP state.
+- `/browser status` now reports shared-runtime source when applicable.
+- `gateway/browser_bridge.py`
+- `build_browser_chat_message()` now passes slash commands through unchanged (`/command ...`) even when page context is included, so sidecar can run slash commands directly.
+- `gateway/run.py`
+- added first-class gateway `/browser` command handler:
+- `/browser connect [target]`
+- `/browser status`
+- `/browser disconnect`
+- added `/browser` to command recognition + `/help` output.
+- command uses shared CDP runtime state and enforces localhost reachability checks before claiming connection.
+- Added regression coverage:
+- `tests/gateway/test_browser_bridge_context.py`
+- `tests/gateway/test_browser_command.py`
+- `tests/tools/test_browser_windows_stream_port.py`
+- Validation:
+- `python -m py_compile cli.py gateway/run.py gateway/browser_bridge.py tools/browser_tool.py ...` passed.
+- `pytest -q -o addopts='' tests/gateway/test_browser_bridge_context.py tests/gateway/test_browser_command.py tests/tools/test_browser_windows_stream_port.py` -> `19 passed`.
+
+### WF-039 - Sidecar queued-turn sync fix for slash commands
+- Status: `done`
+- Problem:
+- Sidecar could get stuck showing:
+- `Your turn is still queued. Waiting for queue state to sync...`
+- This happened when slash-command turns (for example `/browser connect` in sidecar) produced a command response but did not create transcript messages, leaving pending optimistic UI state unacknowledged.
+- Changes made:
+- `gateway/run.py`
+- In `_handle_browser_bridge_send()` slash-command turns now:
+- capture transcript length before/after `_handle_message(...)`.
+- when command handler returns text **and** transcript did not grow, persist a minimal user+assistant transcript exchange.
+- This ensures sidepanel polling sees acknowledged messages and clears queued state.
+- Added regression tests:
+- `tests/gateway/test_browser_bridge_sidecar_queue_sync.py`
+- `test_sidecar_slash_turn_persists_transcript_when_handler_does_not`
+- `test_sidecar_slash_turn_skips_manual_persist_when_handler_already_updated`
+- Validation:
+- `python -m py_compile gateway/run.py tests/gateway/test_browser_bridge_sidecar_queue_sync.py` passed.
+- `pytest -q -o addopts='' tests/gateway/test_browser_bridge_context.py tests/gateway/test_browser_command.py tests/gateway/test_browser_bridge_sidecar_queue_sync.py` -> `8 passed`.
+
 ## Open Follow-ups
 - Re-run targeted pytest in your preferred Windows environment after current merge work settles to confirm no hidden cross-fixture assumptions remain.
 - Keep this ledger as source-of-truth for Windows stability fixes; append entries instead of rewriting history.

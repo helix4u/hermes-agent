@@ -34,7 +34,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from urllib.request import urlopen
 
 # ---------------------------------------------------------------------------
@@ -197,10 +197,19 @@ if _config_path.exists():
                 "headless": "BROWSER_HEADLESS",
                 "profile_dir": "BROWSER_PROFILE_DIR",
                 "user_agent": "BROWSER_USER_AGENT",
+                "cdp_url": "BROWSER_CDP_URL",
+                "cdp_browser": "BROWSER_CDP_BROWSER",
+                "cdp_port": "BROWSER_CDP_PORT",
+                "cdp_user_data_dir": "BROWSER_CDP_USER_DATA_DIR",
             }
             for _cfg_key, _env_var in _browser_env_map.items():
                 if _cfg_key in _browser_cfg:
-                    os.environ[_env_var] = str(_browser_cfg[_cfg_key])
+                    _val = _browser_cfg[_cfg_key]
+                    if isinstance(_val, str):
+                        if _val.strip():
+                            os.environ[_env_var] = _val.strip()
+                    elif _val is not None:
+                        os.environ[_env_var] = str(_val)
         _agent_cfg = _cfg.get("agent", {})
         if _agent_cfg and isinstance(_agent_cfg, dict):
             if "max_turns" in _agent_cfg:
@@ -1563,6 +1572,14 @@ class GatewayRunner:
                 ),
             )
             try:
+                is_slash_command_turn = message.strip().startswith("/")
+                history_len_before = 0
+                if is_slash_command_turn:
+                    try:
+                        history_len_before = len(self.session_store.load_transcript(session_entry.session_id))
+                    except Exception:
+                        history_len_before = 0
+
                 event = MessageEvent(
                     text=message,
                     message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
@@ -1570,7 +1587,30 @@ class GatewayRunner:
                     media_urls=media_urls,
                     media_types=media_types,
                 )
-                await self._handle_message(event)
+                command_result = await self._handle_message(event)
+
+                # Sidecar slash commands return text immediately from _handle_message
+                # and do not pass through adapter send/transcript hooks. Persist a
+                # minimal user/assistant exchange when the command handler did not
+                # already append to transcript so sidepanel queue sync can clear.
+                if is_slash_command_turn:
+                    try:
+                        history_len_after = len(self.session_store.load_transcript(session_entry.session_id))
+                    except Exception:
+                        history_len_after = history_len_before
+                    transcript_already_updated = history_len_after > history_len_before
+                    result_text = str(command_result or "").strip()
+                    if result_text and not transcript_already_updated:
+                        ts = datetime.now().isoformat()
+                        self.session_store.append_to_transcript(
+                            session_entry.session_id,
+                            {"role": "user", "content": message, "timestamp": ts},
+                        )
+                        self.session_store.append_to_transcript(
+                            session_entry.session_id,
+                            {"role": "assistant", "content": result_text, "timestamp": ts},
+                        )
+
                 interrupted = session_key in self._browser_bridge_pending_interrupts
                 if interrupted:
                     self._browser_bridge_pending_interrupts.discard(session_key)
@@ -2363,11 +2403,12 @@ class GatewayRunner:
         
         # Emit command:* hook for any recognized slash command
         _known_commands = {"new", "reset", "help", "status", "stop", "model", "reasoning",
-                          "personality", "plan", "retry", "undo", "sethome", "set-home",
-                          "compress", "usage", "insights", "reload-mcp", "reload_mcp",
-                          "update", "title", "resume", "provider", "rollback",
-                          "background", "reasoning", "voice", "terminal", "shell", "cron",
-                          "invokeai-defaults", "invokeai_defaults", "wiki-host", "wiki_host"}
+                           "personality", "plan", "retry", "undo", "sethome", "set-home",
+                           "compress", "usage", "insights", "reload-mcp", "reload_mcp",
+                           "update", "title", "resume", "provider", "rollback",
+                           "background", "reasoning", "voice", "terminal", "shell", "cron",
+                           "invokeai-defaults", "invokeai_defaults", "wiki-host", "wiki_host",
+                           "browser"}
         if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
                 "platform": source.platform.value if source.platform else "",
@@ -2408,6 +2449,9 @@ class GatewayRunner:
 
         if command in ["terminal", "shell"]:
             return await self._handle_terminal_command(event)
+
+        if command == "browser":
+            return await self._handle_browser_command(event)
 
         if command == "cron":
             return await self._handle_cron_command(event)
@@ -3070,6 +3114,22 @@ class GatewayRunner:
 
             return response
             
+        except asyncio.CancelledError:
+            running = bool(getattr(self, "_running", False))
+            shutdown_requested = bool(
+                getattr(self, "_shutdown_event", None) and self._shutdown_event.is_set()
+            )
+            if running and not shutdown_requested:
+                logger.error(
+                    "Agent turn cancelled unexpectedly in active session %s; "
+                    "returning interrupted-turn response.",
+                    session_key,
+                )
+                return (
+                    "Sorry, that turn was interrupted unexpectedly. "
+                    "Hermes is still running; please send it again."
+                )
+            raise
         except Exception as e:
             logger.exception("Agent error in session %s", session_key)
             return (
@@ -3190,6 +3250,7 @@ class GatewayRunner:
             "`/background <prompt>` — Run a prompt in a separate background session",
             "`/voice [on|off|tts|status]` — Toggle voice reply mode",
             "`/cron [list|add|remove|run|pause|resume|status|tick]` — Manage cron jobs",
+            "`/browser [connect|disconnect|status]` — Manage live CDP browser link for sidecar/browser tools",
             "`/reload-mcp` — Reload MCP servers from config",
             "`/update` — Update Hermes Agent to the latest version",
             "`/help` — Show this message",
@@ -3845,6 +3906,233 @@ class GatewayRunner:
             f"🖥️ Terminal mode set to **{human_mode}** "
             f"(`HERMES_WINDOWS_SHELL={new_value}`).\n"
             "Future local commands will use this shell."
+        )
+
+    @staticmethod
+    def _normalize_cdp_browser_name(raw: str) -> str:
+        normalized = (raw or "").strip().lower()
+        alias_map = {
+            "": "auto",
+            "auto": "auto",
+            "chrome": "chrome",
+            "google-chrome": "chrome",
+            "edge": "edge",
+            "msedge": "edge",
+            "microsoft-edge": "edge",
+            "brave": "brave",
+            "brave-browser": "brave",
+            "chromium": "chromium",
+            "comet": "comet",
+        }
+        return alias_map.get(normalized, normalized)
+
+    @staticmethod
+    def _default_cdp_port_for_browser(browser: str) -> int:
+        mapping = {
+            "auto": 9222,
+            "chrome": 9222,
+            "edge": 9223,
+            "brave": 9224,
+            "chromium": 9225,
+            "comet": 9226,
+        }
+        return mapping.get(GatewayRunner._normalize_cdp_browser_name(browser), 9222)
+
+    @staticmethod
+    def _is_likely_cdp_endpoint(raw: str) -> bool:
+        token = (raw or "").strip()
+        if not token:
+            return False
+        if token.startswith(("ws://", "wss://", "http://", "https://")):
+            return True
+        if token.isdigit():
+            return True
+        if " " in token:
+            return False
+        host, sep, port = token.rpartition(":")
+        return bool(sep and host and port.isdigit())
+
+    @staticmethod
+    def _resolve_browser_connect_target(raw_arg: str, default_port: int, default_browser: str, default_cdp_url: str):
+        arg = (raw_arg or "").strip()
+        browser_choice = GatewayRunner._normalize_cdp_browser_name(default_browser)
+        if not arg:
+            cdp_url = (default_cdp_url or "").strip() or f"ws://localhost:{default_port}"
+            return cdp_url, browser_choice, ""
+
+        if GatewayRunner._is_likely_cdp_endpoint(arg):
+            endpoint = arg
+            if endpoint.isdigit():
+                endpoint = f"ws://localhost:{endpoint}"
+            elif "://" not in endpoint:
+                endpoint = f"ws://{endpoint}"
+            return endpoint, browser_choice, ""
+
+        candidate = GatewayRunner._normalize_cdp_browser_name(arg)
+        supported = {"auto", "chrome", "edge", "brave", "chromium", "comet"}
+        if candidate in supported:
+            cdp_port = GatewayRunner._default_cdp_port_for_browser(candidate)
+            return f"ws://localhost:{cdp_port}", candidate, ""
+
+        err = (
+            f"Unknown browser target `{arg}`. "
+            "Use one of: auto, chrome, edge, brave, chromium, comet, or pass a CDP endpoint "
+            "(example: ws://localhost:9222)."
+        )
+        return "", "", err
+
+    @staticmethod
+    def _extract_cdp_port(cdp_url: str, fallback_port: int) -> int:
+        try:
+            parsed = urlparse((cdp_url or "").strip())
+            if parsed.port:
+                return int(parsed.port)
+        except Exception:
+            pass
+        try:
+            return int(str(cdp_url).rsplit(":", 1)[-1].split("/")[0])
+        except (ValueError, IndexError):
+            return fallback_port
+
+    @staticmethod
+    def _is_local_cdp_url(cdp_url: str) -> bool:
+        try:
+            parsed = urlparse((cdp_url or "").strip())
+        except Exception:
+            return False
+        host = (parsed.hostname or "").strip().lower()
+        return host in {"localhost", "127.0.0.1"}
+
+    async def _handle_browser_command(self, event: MessageEvent) -> str:
+        """Handle /browser connect|disconnect|status in gateway/sidecar sessions."""
+        try:
+            from tools.browser_tool import (
+                cleanup_all_browsers,
+                read_shared_cdp_state,
+                persist_shared_cdp_state,
+                clear_shared_cdp_state,
+            )
+        except Exception as e:
+            return f"Browser command unavailable: {e}"
+
+        args = event.get_command_args().strip()
+        if not args:
+            sub = "status"
+            target_arg = ""
+        else:
+            parts = args.split(None, 1)
+            sub = (parts[0] or "status").strip().lower()
+            target_arg = (parts[1] if len(parts) > 1 else "").strip()
+
+        default_browser = self._normalize_cdp_browser_name(os.environ.get("BROWSER_CDP_BROWSER", "auto"))
+        try:
+            default_port = int(str(os.environ.get("BROWSER_CDP_PORT", "9222")).strip())
+        except ValueError:
+            default_port = 9222
+
+        shared_state = read_shared_cdp_state() or {}
+        shared_cdp = str(shared_state.get("cdp_url") or "").strip()
+        current_env = os.environ.get("BROWSER_CDP_URL", "").strip()
+        current = current_env or shared_cdp
+        default_cdp = current or f"ws://localhost:{default_port}"
+
+        if sub == "status":
+            if current:
+                lines = [
+                    "🌐 Browser is connected to live CDP.",
+                    f"- Endpoint: `{current}`",
+                ]
+                if not current_env and shared_cdp:
+                    lines.append("- Source: shared runtime state")
+                port = self._extract_cdp_port(current, default_port)
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(1)
+                    s.connect(("127.0.0.1", port))
+                    s.close()
+                    lines.append("- Reachability: ✓ local endpoint reachable")
+                except Exception:
+                    lines.append("- Reachability: ⚠ local endpoint not reachable")
+                lines.append(f"- Preferred target: `{default_browser}`")
+                lines.append(f"- Default port: `{default_port}`")
+                return "\n".join(lines)
+            if os.environ.get("BROWSERBASE_API_KEY"):
+                return (
+                    "🌐 Browser mode: Browserbase (cloud).\n"
+                    "Use `/browser connect` to attach a live local CDP browser."
+                )
+            return (
+                "🌐 Browser mode: local headless Chromium.\n"
+                "Use `/browser connect [target]` to attach live CDP.\n"
+                "Targets: `auto`, `chrome`, `edge`, `brave`, `chromium`, `comet`, `ws://host:port`, `port`."
+            )
+
+        if sub == "disconnect":
+            if not current:
+                return "Browser is already disconnected from live CDP."
+            os.environ.pop("BROWSER_CDP_URL", None)
+            clear_shared_cdp_state()
+            try:
+                cleanup_all_browsers()
+            except Exception:
+                pass
+            return (
+                "🌐 Browser disconnected from live CDP.\n"
+                "Browser tools reverted to default mode (local headless or Browserbase)."
+            )
+
+        if sub == "connect":
+            cdp_url, browser_choice, resolve_err = self._resolve_browser_connect_target(
+                raw_arg=target_arg,
+                default_port=default_port,
+                default_browser=default_browser,
+                default_cdp_url=default_cdp,
+            )
+            if resolve_err:
+                return resolve_err
+
+            port = self._extract_cdp_port(cdp_url, default_port)
+            is_local = self._is_local_cdp_url(cdp_url)
+
+            reachable = True
+            if is_local:
+                reachable = False
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(1)
+                    s.connect(("127.0.0.1", port))
+                    s.close()
+                    reachable = True
+                except Exception:
+                    reachable = False
+
+            if is_local and not reachable:
+                return (
+                    "⚠ Browser not connected yet (CDP endpoint is unreachable).\n"
+                    f"- Expected endpoint: `{cdp_url}`\n"
+                    "- Start your browser with remote debugging enabled, then run `/browser connect` again."
+                )
+
+            os.environ["BROWSER_CDP_URL"] = cdp_url
+            os.environ["BROWSER_CDP_BROWSER"] = browser_choice
+            persisted = persist_shared_cdp_state(cdp_url, browser_choice)
+            try:
+                cleanup_all_browsers()
+            except Exception:
+                pass
+
+            lines = [
+                "🌐 Browser connected to live CDP.",
+                f"- Endpoint: `{cdp_url}`",
+                f"- Target: `{browser_choice}`",
+            ]
+            if not persisted:
+                lines.append("- ⚠ Could not persist shared runtime state.")
+            return "\n".join(lines)
+
+        return (
+            "Usage: `/browser connect [target]`, `/browser disconnect`, `/browser status`\n"
+            "Targets: `auto`, `chrome`, `edge`, `brave`, `chromium`, `comet`, `ws://host:port`, `port`."
         )
     
     async def _handle_retry_command(self, event: MessageEvent) -> str:
@@ -5447,7 +5735,8 @@ class GatewayRunner:
         browser_sidecar_max_iterations = None
         browser_sidecar_max_tool_calls = None
 
-        # Browser sidecar sessions intentionally avoid browser automation tools.
+        # Browser sidecar sessions default to dedicated sidecar toolsets.
+        # By default this includes browser automation and excludes delegation.
         if self._is_browser_bridge_source(source):
             configured_sidecar_toolsets = browser_sidecar_cfg.get("toolsets")
             normalized_sidecar_toolsets = []
@@ -5924,7 +6213,17 @@ class GatewayRunner:
                             if _p:
                                 _history_media_paths.add(_p)
             
-            result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+            tool_task_id = session_id
+            if self._is_browser_bridge_source(source):
+                # Sidecar turns use a stable prefix so tools can apply sidecar-only
+                # execution policy (for example forcing local/CDP browser mode).
+                tool_task_id = f"sidecar_{session_id}"
+
+            result = agent.run_conversation(
+                message,
+                conversation_history=agent_history,
+                task_id=tool_task_id,
+            )
             result_holder[0] = result
             
             # Return final response, or a message if something went wrong
@@ -6284,6 +6583,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     logging.getLogger().addHandler(error_handler)
 
     runner = GatewayRunner(config)
+    detached_mode = os.getenv("HERMES_GATEWAY_DETACHED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    previous_sigint_handler = None
+
+    # Detached gateway windows should not be torn down by stray SIGINT delivery.
+    # This process is meant to be controlled via `hermes gateway stop/restart`.
+    if detached_mode:
+        try:
+            previous_sigint_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            logger.info("Detached gateway mode: ignoring SIGINT to prevent accidental shutdown.")
+        except Exception as e:
+            logger.debug("Could not install detached SIGINT ignore handler: %s", e)
     
     # Set up signal handlers
     def signal_handler():
@@ -6335,10 +6651,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     not task.done()
                     for task in getattr(runner, "_browser_bridge_tasks", {}).values()
                 )
-                if running and not shutdown_requested and active_sidecar_turns:
+                recoverable_cancel = running and not shutdown_requested and (
+                    detached_mode or active_sidecar_turns
+                )
+                if recoverable_cancel:
+                    detail = "detached mode" if detached_mode else "active browser sidecar turn"
                     logger.error(
-                        "Unexpected cancellation while browser sidecar turn is active; "
-                        "keeping gateway alive and resuming wait."
+                        "Unexpected cancellation while gateway is running (%s); "
+                        "keeping gateway alive and resuming wait.",
+                        detail,
                     )
                     current = asyncio.current_task()
                     if current and hasattr(current, "uncancel"):
@@ -6357,6 +6678,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                         logger.debug("Graceful stop after cancellation failed: %s", e)
                 break
     finally:
+        if previous_sigint_handler is not None:
+            try:
+                signal.signal(signal.SIGINT, previous_sigint_handler)
+            except Exception:
+                pass
+
         # Stop cron ticker cleanly
         cron_stop.set()
         cron_thread.join(timeout=5)
@@ -6365,6 +6692,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         try:
             from tools.mcp_tool import shutdown_mcp_servers
             shutdown_mcp_servers()
+        except Exception:
+            pass
+
+        # Ensure runtime status and PID are not left stale after abnormal exits.
+        try:
+            from gateway.status import remove_pid_file, write_runtime_status
+            remove_pid_file()
+            write_runtime_status(gateway_state="stopped", exit_reason=getattr(runner, "_exit_reason", None))
         except Exception:
             pass
 

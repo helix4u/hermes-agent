@@ -291,3 +291,96 @@ def test_stop_browser_cleanup_thread_handles_join_interrupt():
     finally:
         browser_tool._cleanup_thread = original
         browser_tool._cleanup_running = original_running
+
+
+def test_sidecar_blocks_live_actions_without_cdp_connection():
+    from tools import browser_tool
+
+    with (
+        patch("tools.browser_tool._find_agent_browser") as find_browser,
+        patch(
+            "tools.browser_tool._get_session_info",
+            return_value={"session_name": "sidecar_local", "features": {"local": True}},
+        ),
+        patch.dict(
+            "tools.browser_tool.os.environ",
+            {
+                "PATH": "C:\\Windows\\System32",
+                "HERMES_HOME": "C:\\Users\\btgil\\.hermes",
+            },
+            clear=False,
+        ),
+    ):
+        result = browser_tool._run_browser_command("sidecar_test", "open", ["https://github.com"])
+
+    assert result.get("success") is False
+    assert result.get("requires_live_cdp") is True
+    assert "no live CDP browser is connected" in (result.get("error") or "")
+    find_browser.assert_not_called()
+
+
+def test_get_cdp_override_reads_shared_runtime_state(tmp_path):
+    from tools import browser_tool
+
+    runtime_dir = tmp_path / ".hermes" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "browser_cdp_state.json").write_text(
+        json.dumps({"cdp_url": "ws://localhost:9222"}),
+        encoding="utf-8",
+    )
+
+    with patch.dict(
+        "tools.browser_tool.os.environ",
+        {
+            "HERMES_HOME": str(tmp_path / ".hermes"),
+            "BROWSER_CDP_URL": "",
+        },
+        clear=False,
+    ):
+        assert browser_tool._get_cdp_override() == "ws://localhost:9222"
+
+
+def test_get_cdp_override_prefers_env_over_shared_runtime_state(tmp_path):
+    from tools import browser_tool
+
+    runtime_dir = tmp_path / ".hermes" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "browser_cdp_state.json").write_text(
+        json.dumps({"cdp_url": "ws://localhost:9333"}),
+        encoding="utf-8",
+    )
+
+    with patch.dict(
+        "tools.browser_tool.os.environ",
+        {
+            "HERMES_HOME": str(tmp_path / ".hermes"),
+            "BROWSER_CDP_URL": "ws://localhost:9222",
+        },
+        clear=False,
+    ):
+        assert browser_tool._get_cdp_override() == "ws://localhost:9222"
+
+
+def test_sidecar_can_opt_in_to_headless_live_actions():
+    from tools import browser_tool
+
+    with (
+        patch("tools.browser_tool._find_agent_browser", return_value=["agent-browser"]),
+        patch(
+            "tools.browser_tool._get_session_info",
+            return_value={"session_name": "sidecar_local", "features": {"local": True}},
+        ),
+        patch("tools.browser_tool._run_agent_browser_subprocess", return_value=_success_result()),
+        patch.dict(
+            "tools.browser_tool.os.environ",
+            {
+                "PATH": "C:\\Windows\\System32",
+                "HERMES_HOME": "C:\\Users\\btgil\\.hermes",
+                "HERMES_SIDECAR_ALLOW_HEADLESS_BROWSER_ACTIONS": "true",
+            },
+            clear=False,
+        ),
+    ):
+        result = browser_tool._run_browser_command("sidecar_test", "open", ["https://example.com"])
+
+    assert result.get("success") is True
