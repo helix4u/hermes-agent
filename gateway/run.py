@@ -24,8 +24,9 @@ import re
 import shlex
 import shutil
 import socket
-import sys
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -293,6 +294,23 @@ from gateway.browser_bridge import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class BrowserBridgeTranscriptUnavailable(Exception):
+    """Raised when a YouTube transcript exists but can't be fetched usefully."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        video_id: str = "",
+        requested_language: str = "",
+        available_languages: Optional[List[str]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.video_id = video_id
+        self.requested_language = requested_language
+        self.available_languages = list(available_languages or [])
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -1224,6 +1242,260 @@ class GatewayRunner:
                 return line[len(prefix):].strip()
         return ""
 
+    @staticmethod
+    def _extract_youtube_video_id(url_or_id: str) -> str:
+        value = str(url_or_id or "").strip()
+        patterns = [
+            r"(?:v=|youtu\.be/|shorts/|embed/|live/)([a-zA-Z0-9_-]{11})",
+            r"^([a-zA-Z0-9_-]{11})$",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, value)
+            if match:
+                return match.group(1)
+        return value
+
+    @staticmethod
+    def _run_gateway_python_install_command(args: List[str], timeout: int = 120) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+
+    @classmethod
+    def _ensure_gateway_python_package(
+        cls,
+        *,
+        import_name: str,
+        package_spec: str,
+    ) -> None:
+        try:
+            __import__(import_name)
+            return
+        except Exception:
+            pass
+
+        uv_exe = shutil.which("uv")
+        if uv_exe:
+            install = subprocess.run(
+                [
+                    uv_exe,
+                    "pip",
+                    "install",
+                    "--python",
+                    sys.executable,
+                    package_spec,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
+            if install.returncode != 0:
+                details = (install.stderr or install.stdout or "").strip()
+                raise ValueError(
+                    f"Failed to install {package_spec} in the Hermes gateway environment with uv pip."
+                    + (f" Details: {details}" if details else "")
+                )
+        else:
+            pip_probe = cls._run_gateway_python_install_command(["-m", "pip", "--version"], timeout=30)
+            if pip_probe.returncode != 0:
+                ensurepip = cls._run_gateway_python_install_command(["-m", "ensurepip", "--upgrade"], timeout=180)
+                if ensurepip.returncode != 0:
+                    details = (ensurepip.stderr or ensurepip.stdout or "").strip()
+                    raise ValueError(
+                        f"Failed to bootstrap pip in the Hermes gateway environment."
+                        + (f" Details: {details}" if details else "")
+                    )
+
+            install = cls._run_gateway_python_install_command(
+                [
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    package_spec,
+                ],
+                timeout=180,
+            )
+            if install.returncode != 0:
+                details = (install.stderr or install.stdout or "").strip()
+                raise ValueError(
+                    f"Failed to install {package_spec} in the Hermes gateway environment."
+                    + (f" Details: {details}" if details else "")
+                )
+
+        try:
+            __import__(import_name)
+        except Exception as exc:
+            raise ValueError(
+                f"{package_spec} install completed but import still failed."
+            ) from exc
+
+    @classmethod
+    def _fetch_bridge_youtube_transcript(
+        cls,
+        url_or_id: str,
+        language: str = "",
+    ) -> Dict[str, Any]:
+        """Fetch transcript text for browser bridge sidebar previews."""
+        video_id = cls._extract_youtube_video_id(url_or_id)
+        if not video_id:
+            raise ValueError("A YouTube URL or video ID is required.")
+
+        def _load_transcript_api():
+            from youtube_transcript_api import YouTubeTranscriptApi
+
+            return YouTubeTranscriptApi
+
+        def _clean_language(value: str) -> str:
+            return str(value or "").strip().replace("_", "-")
+
+        def _build_language_preferences(requested_language: str, available_codes: List[str]) -> List[str]:
+            requested = _clean_language(requested_language)
+            lowered_available = {
+                _clean_language(code).lower(): _clean_language(code)
+                for code in available_codes
+                if code
+            }
+            preferred: List[str] = []
+
+            def _append(code: str) -> None:
+                cleaned = _clean_language(code)
+                if not cleaned:
+                    return
+                for existing in preferred:
+                    if existing.lower() == cleaned.lower():
+                        return
+                preferred.append(cleaned)
+
+            if requested:
+                base = requested.split("-", 1)[0].lower()
+                if base == "en":
+                    _append("en")
+                    if "en-us" in lowered_available:
+                        _append(lowered_available["en-us"])
+                    elif requested.lower() == "en-us":
+                        _append("en-US")
+                    for code in available_codes:
+                        cleaned = _clean_language(code)
+                        if cleaned.lower().split("-", 1)[0] == "en":
+                            _append(cleaned)
+                    if requested.lower() != "en":
+                        _append(requested)
+                else:
+                    _append(requested)
+                    for code in available_codes:
+                        cleaned = _clean_language(code)
+                        if cleaned.lower() == requested.lower():
+                            _append(cleaned)
+                    for code in available_codes:
+                        cleaned = _clean_language(code)
+                        if cleaned.lower().split("-", 1)[0] == base:
+                            _append(cleaned)
+            else:
+                if "en" in lowered_available:
+                    _append(lowered_available["en"])
+                if "en-us" in lowered_available:
+                    _append(lowered_available["en-us"])
+                for code in available_codes:
+                    cleaned = _clean_language(code)
+                    if cleaned.lower().split("-", 1)[0] == "en":
+                        _append(cleaned)
+                for code in available_codes:
+                    _append(code)
+
+            return preferred
+
+        def _extract_segments(fetched: Any) -> List[str]:
+            segments: List[str] = []
+            for segment in fetched:
+                if isinstance(segment, dict):
+                    text = str(segment.get("text") or "").strip()
+                else:
+                    text = str(getattr(segment, "text", "") or "").strip()
+                if text:
+                    segments.append(text)
+            return segments
+
+        try:
+            YouTubeTranscriptApi = _load_transcript_api()
+        except Exception:
+            cls._ensure_gateway_python_package(
+                import_name="youtube_transcript_api",
+                package_spec="youtube-transcript-api>=1.2.0",
+            )
+            try:
+                YouTubeTranscriptApi = _load_transcript_api()
+            except Exception as exc:
+                raise ValueError(
+                    "youtube-transcript-api install completed but import still failed."
+                ) from exc
+
+        requested_language = _clean_language(language)
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id) if hasattr(api, "list") else None
+        available_codes: List[str] = []
+        if transcript_list is not None:
+            try:
+                available_codes = [
+                    str(getattr(transcript, "language_code", "") or "").strip()
+                    for transcript in list(transcript_list)
+                    if str(getattr(transcript, "language_code", "") or "").strip()
+                ]
+            except Exception:
+                available_codes = []
+
+        languages = _build_language_preferences(requested_language, available_codes)
+        matched_language = ""
+
+        try:
+            if transcript_list is not None:
+                lookup_languages = languages or available_codes
+                chosen_transcript = transcript_list.find_transcript(lookup_languages)
+                matched_language = str(getattr(chosen_transcript, "language_code", "") or "").strip()
+                segments = _extract_segments(chosen_transcript.fetch())
+            elif hasattr(api, "fetch"):
+                kwargs = {"languages": languages} if languages else {}
+                segments = _extract_segments(api.fetch(video_id, **kwargs))
+            else:
+                raw_segments = (
+                    YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
+                    if languages
+                    else YouTubeTranscriptApi.get_transcript(video_id)
+                )
+                segments = [
+                    str(segment.get("text") or "").strip()
+                    for segment in raw_segments
+                    if isinstance(segment, dict) and str(segment.get("text") or "").strip()
+                ]
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            raise BrowserBridgeTranscriptUnavailable(
+                message,
+                video_id=video_id,
+                requested_language=requested_language,
+                available_languages=available_codes,
+            ) from exc
+
+        full_text = " ".join(segments).strip()
+        resolved_language = (
+            matched_language
+            or (languages[0] if languages else (available_codes[0] if available_codes else requested_language))
+        )
+        return {
+            "video_id": video_id,
+            "language": resolved_language,
+            "segment_count": len(segments),
+            "transcript_text": full_text,
+            "char_count": len(full_text),
+        }
+
     def _serialize_browser_bridge_history(
         self,
         history: List[Dict[str, Any]],
@@ -1425,7 +1697,34 @@ class GatewayRunner:
             return {"image_count": len(images)}
 
         if action == "fetch_transcript":
-            raise ValueError("Unsupported browser bridge action: fetch_transcript")
+            target = str(payload.get("url") or payload.get("video_id") or "").strip()
+            language = str(payload.get("language") or "").strip()
+            if not target:
+                raise ValueError("fetch_transcript requires a YouTube URL or video_id.")
+
+            try:
+                result = await asyncio.to_thread(
+                    self._fetch_bridge_youtube_transcript,
+                    target,
+                    language,
+                )
+            except BrowserBridgeTranscriptUnavailable as exc:
+                return {
+                    "ok": True,
+                    "available": False,
+                    "video_id": exc.video_id or self._extract_youtube_video_id(target),
+                    "language": exc.requested_language,
+                    "transcript_text": "",
+                    "char_count": 0,
+                    "segment_count": 0,
+                    "error": str(exc),
+                    "available_languages": exc.available_languages,
+                }
+            return {
+                "ok": True,
+                "available": True,
+                **result,
+            }
 
         if action == "tts":
             text = str(payload.get("text") or "").strip()

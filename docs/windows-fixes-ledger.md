@@ -929,3 +929,54 @@ Scope: `hermes-agent` Windows install/startup/runtime reliability fixes validate
 - default browser bridge request timeout and sync sidecar turn timeout are now both 5 minutes unless overridden by:
 - `HERMES_BROWSER_BRIDGE_REQUEST_TIMEOUT_SECONDS`
 - `HERMES_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS`
+
+### WF-045 - Windows CDP browser recovery isolates final daemon retry after persistent bind errors
+- Status: `done`
+- Problem:
+- In Windows live-Chrome CDP mode, browser commands could still fail with:
+- `Daemon process exited during startup`
+- `Failed to bind TCP ... (os error 10013)`
+- even after the existing stream-port retry and stale-process cleanup. The remaining recovery path reused the same session identity and default socket behavior, which could leave the command colliding with stale daemon state.
+- Changes made:
+- `tools/browser_tool.py`
+- added `_build_agent_browser_socket_dir(...)` and `_build_agent_browser_backend_args(...)` helpers so retries can rebuild a clean agent-browser launch deterministically.
+- kept the existing Windows CDP fast path intact for normal operation.
+- added a final Windows+CDP-only recovery pass after normal bind retries fail:
+- generate a fresh recovery session name
+- assign an isolated `AGENT_BROWSER_SOCKET_DIR`
+- assign a fresh explicit `AGENT_BROWSER_STREAM_PORT`
+- rebuild backend args with the new session identity and retry once more
+- This strengthens recovery without forcing custom socket-dir behavior on every Windows CDP launch.
+- Added regression coverage:
+- `tests/tools/test_browser_windows_stream_port.py`
+- added coverage for persistent `10013` in Windows CDP mode requiring isolated-session recovery.
+- Validation:
+- targeted browser Windows stream-port tests were re-run after patch.
+
+### WF-046 - Browser extension quick prompts now support transcript fetch session actions
+- Status: `done`
+- Problem:
+- The browser extension quick prompts such as "Summarize this video" were sending `/session` requests with `action: "fetch_transcript"`, but the gateway still hard-rejected that action with:
+- `ValueError: Unsupported browser bridge action: fetch_transcript`
+- That made the sidepanel look like it was about to send a request and then snap back with no message persisted.
+- Changes made:
+- `gateway/run.py`
+- added `BrowserBridgeTranscriptUnavailable` so transcript fetch failures can be returned as a structured bridge response instead of exploding the request.
+- added `_extract_youtube_video_id(...)` and `_fetch_bridge_youtube_transcript(...)` helpers, adapted from `hermes-agent1`, with:
+- YouTube URL or raw video-ID support
+- language preference resolution
+- lazy `youtube-transcript-api` install/import fallback in the gateway environment
+- installer now prefers `uv pip install --python <gateway-python> ...`, which matches the repo's package-management path better than assuming `pip` exists inside the venv
+- if `uv` is unavailable, the fallback still bootstraps `pip` with `ensurepip` before using `python -m pip`
+- structured unavailable-transcript handling for disabled/missing transcript cases
+- replaced the old hard failure in `_handle_browser_bridge_session(...)` with real `fetch_transcript` support returning the extension-compatible payload:
+- success: `{ ok, available, transcript_text, video_id, language, segment_count, char_count }`
+- unavailable transcript: `{ ok, available: false, transcript_text: "", error, available_languages, ... }`
+- Added regression coverage:
+- `tests/gateway/test_browser_bridge_transcript.py`
+- added success-path coverage for URL-based transcript fetches
+- added unavailable-transcript coverage that still returns the expected bridge payload
+- added validation for missing URL/video ID
+- added installer coverage for both the preferred `uv pip` path and the fallback `ensurepip`/`pip` path
+- Validation:
+- targeted gateway browser-bridge transcript tests were run after patch.

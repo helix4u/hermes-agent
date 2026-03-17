@@ -964,6 +964,26 @@ def _allocate_free_tcp_port() -> str:
         return str(sock.getsockname()[1])
 
 
+def _build_agent_browser_socket_dir(session_name: str) -> str:
+    """Return the per-session socket directory path used for agent-browser."""
+    return os.path.join(_socket_safe_tmpdir(), f"agent-browser-{session_name}")
+
+
+def _build_agent_browser_backend_args(
+    session_info: Dict[str, Any],
+    *,
+    session_name: Optional[str] = None,
+) -> List[str]:
+    """Build backend args for agent-browser, optionally overriding session name."""
+    active_session_name = session_name or session_info["session_name"]
+    if session_info.get("cdp_url"):
+        cdp_target = _normalize_agent_browser_cdp_arg(session_info["cdp_url"])
+        if os.name == "nt":
+            return ["--session", active_session_name, "--cdp", cdp_target]
+        return ["--cdp", cdp_target]
+    return ["--session", active_session_name]
+
+
 def _kill_daemon_pid_from_socket_dir(session_name: str, socket_dir: str) -> bool:
     """Best-effort kill of an agent-browser daemon using its pid file."""
     pid_file = os.path.join(socket_dir, f"{session_name}.pid")
@@ -1123,21 +1143,7 @@ def _run_browser_command(
     # Cloud/live-CDP mode: --cdp <endpoint> connects to an existing browser.
     # Local mode: --session <name> launches a local headless Chromium.
     # The rest of the command (--json, command, args) is identical.
-    if session_info.get("cdp_url"):
-        # CDP mode — connect to Browserbase/live Chrome via CDP.
-        cdp_target = _normalize_agent_browser_cdp_arg(session_info["cdp_url"])
-        #
-        # Windows-specific workaround:
-        # With agent-browser 0.20.x, "--cdp" alone can fail daemon startup with
-        # "Failed to bind TCP ... (os error 10013)". Including a deterministic
-        # session name stabilizes daemon startup while preserving CDP connectivity.
-        if os.name == "nt":
-            backend_args = ["--session", session_info["session_name"], "--cdp", cdp_target]
-        else:
-            backend_args = ["--cdp", cdp_target]
-    else:
-        # Local mode — launch a headless Chromium instance
-        backend_args = ["--session", session_info["session_name"]]
+    backend_args = _build_agent_browser_backend_args(session_info)
 
     cmd_parts = browser_cmd_parts + backend_args + [
         "--json",
@@ -1153,10 +1159,7 @@ def _run_browser_command(
         # AGENT_BROWSER_SOCKET_DIR is overridden while connected via --cdp.
         # In that mode we let agent-browser choose its default socket dir.
         use_custom_socket_dir = not (os.name == "nt" and session_info.get("cdp_url"))
-        task_socket_dir = os.path.join(
-            _socket_safe_tmpdir(),
-            f"agent-browser-{session_info['session_name']}"
-        )
+        task_socket_dir = _build_agent_browser_socket_dir(session_info["session_name"])
         if use_custom_socket_dir:
             os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
             logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
@@ -1250,6 +1253,43 @@ def _run_browser_command(
                 cmd_parts=cmd_parts,
                 timeout=retry_timeout,
                 env=recovery_env,
+            )
+
+        if (
+            os.name == "nt"
+            and session_info.get("cdp_url")
+            and _is_agent_browser_windows_bind_error(result.stderr, result.stdout)
+        ):
+            import uuid
+
+            recovery_session_name = f"{session_info['session_name']}-recovery-{uuid.uuid4().hex[:8]}"
+            recovery_socket_dir = _build_agent_browser_socket_dir(recovery_session_name)
+            os.makedirs(recovery_socket_dir, mode=0o700, exist_ok=True)
+
+            isolated_recovery_env = {**browser_env}
+            isolated_recovery_env["AGENT_BROWSER_SOCKET_DIR"] = recovery_socket_dir
+            isolated_recovery_env["AGENT_BROWSER_STREAM_PORT"] = _allocate_free_tcp_port()
+            isolated_cmd_parts = (
+                browser_cmd_parts
+                + _build_agent_browser_backend_args(
+                    session_info,
+                    session_name=recovery_session_name,
+                )
+                + ["--json", command]
+                + args
+            )
+            logger.warning(
+                "browser '%s' still hit Windows CDP daemon bind error; retrying with isolated "
+                "session=%s socket_dir=%s stream_port=%s",
+                command,
+                recovery_session_name,
+                recovery_socket_dir,
+                isolated_recovery_env["AGENT_BROWSER_STREAM_PORT"],
+            )
+            result = _run_agent_browser_subprocess(
+                cmd_parts=isolated_cmd_parts,
+                timeout=retry_timeout,
+                env=isolated_recovery_env,
             )
         
         # Log stderr for diagnostics — use warning level on failure so it's visible

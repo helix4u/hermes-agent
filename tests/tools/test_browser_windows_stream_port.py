@@ -371,6 +371,75 @@ def test_windows_cdp_mode_skips_custom_socket_dir_env():
     assert "AGENT_BROWSER_SOCKET_DIR" not in observed_envs[0]
 
 
+def test_windows_cdp_mode_uses_isolated_session_recovery_after_persistent_bind():
+    from tools import browser_tool
+
+    bind_failure = subprocess.CompletedProcess(
+        args=["agent-browser"],
+        returncode=1,
+        stdout=json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "Daemon process exited during startup:\n"
+                    "Daemon error: Failed to bind TCP: "
+                    "An attempt was made to access a socket in a way forbidden "
+                    "by its access permissions. (os error 10013)"
+                ),
+            }
+        ),
+        stderr="",
+    )
+    success = _success_result()
+
+    observed_envs = []
+    observed_cmds = []
+
+    def _fake_run(*, cmd_parts, timeout, env):
+        observed_cmds.append(list(cmd_parts))
+        observed_envs.append(dict(env))
+        if len(observed_envs) < 4:
+            return bind_failure
+        return success
+
+    with (
+        patch("tools.browser_tool._find_agent_browser", return_value=["agent-browser"]),
+        patch(
+            "tools.browser_tool._get_session_info",
+            return_value={"session_name": "cdp_bind_retry", "cdp_url": "ws://localhost:9222"},
+        ),
+        patch("tools.browser_tool._kill_windows_agent_browser_processes", return_value=1) as kill_taskkill,
+        patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
+        patch("tools.browser_tool.os.name", "nt"),
+        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch.dict(
+            "tools.browser_tool.os.environ",
+            {
+                "PATH": "C:\\Windows\\System32",
+                "HERMES_HOME": "C:\\Users\\btgil\\.hermes",
+            },
+            clear=True,
+        ),
+    ):
+        result = browser_tool._run_browser_command("task-cdp-bind", "open", ["https://example.com"])
+
+    assert result.get("success") is True
+    assert len(observed_envs) == 4
+    assert "AGENT_BROWSER_SOCKET_DIR" not in observed_envs[0]
+    assert "AGENT_BROWSER_SOCKET_DIR" not in observed_envs[1]
+    assert "AGENT_BROWSER_SOCKET_DIR" not in observed_envs[2]
+    assert observed_envs[3].get("AGENT_BROWSER_SOCKET_DIR")
+    assert observed_envs[3].get("AGENT_BROWSER_STREAM_PORT") not in ("", "0", None)
+
+    initial_cmd = observed_cmds[0]
+    isolated_cmd = observed_cmds[3]
+    assert "--session" in initial_cmd
+    assert "cdp_bind_retry" in initial_cmd
+    assert "--session" in isolated_cmd
+    assert any(part.startswith("cdp_bind_retry-recovery-") for part in isolated_cmd)
+    kill_taskkill.assert_called_once()
+
+
 def test_cleanup_browser_handles_keyboard_interrupt_during_close():
     from tools import browser_tool
 
