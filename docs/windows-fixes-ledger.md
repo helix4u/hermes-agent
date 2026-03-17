@@ -513,6 +513,74 @@ Scope: `hermes-agent` Windows install/startup/runtime reliability fixes validate
 - Live repro check (uv tool runtime, cwd `C:\Users\btgil\.hermes`) now succeeds:
 - `_run_browser_command(... open https://github.com ...)` returned success in ~`1.16s`.
 
+### WF-027 - Exit-time browser cleanup interrupt noise + Honcho SDK restore
+- Status: `done`
+- Problem:
+- Closing Hermes after browser use could print noisy atexit traceback:
+- `Exception ignored in atexit callback ... _stop_browser_cleanup_thread ... KeyboardInterrupt`
+- Honcho initialization also warned:
+- `Honcho init failed: honcho-ai is required for Honcho integration`
+- Code evidence:
+- `tools/browser_tool.py`
+- `_stop_browser_cleanup_thread()` now catches `BaseException` around thread join and logs at debug level.
+- Added regression test:
+- `tests/tools/test_browser_windows_stream_port.py`
+- `test_stop_browser_cleanup_thread_handles_join_interrupt`
+- Runtime environment fix performed:
+- Reinstalled Honcho SDK into active uv tool runtime:
+- `uv pip install --python C:\Users\btgil\AppData\Roaming\uv\tools\hermes-agent\Scripts\python.exe "honcho-ai>=2.0.1"`
+- Verified import in that runtime:
+- `import honcho` succeeded (`honcho_import_ok`).
+- Validation notes:
+- `pytest -q -o addopts='' tests/tools/test_browser_windows_stream_port.py` -> `9 passed`.
+
+### WF-028 - UV-first install guidance cleanup (voice + honcho + ACP)
+- Status: `done`
+- Problem:
+- User-facing install hints still mixed in pip-first text in a uv-tool runtime, which made failures look inconsistent/noisy (`pip` missing warnings vs uv-managed install reality).
+- Code evidence:
+- `honcho_integration/cli.py`
+- `_ensure_sdk_installed()` "skip install" guidance now prints uv-first command with current interpreter and pip fallback.
+- `tools/voice_mode.py`
+- environment warning now says `run /voice install` instead of pip-only wording.
+- `AudioRecorder.start()` install error now prints:
+- `/voice install` first
+- uv pip command for current runtime when available
+- python `-m pip` fallback.
+- requirements details now avoid pip-first phrasing:
+- `Audio capture: MISSING (run /voice install)`
+- `STT provider: MISSING (install faster-whisper in Hermes runtime, ...)`
+- `cli.py`
+- voice-mode runtime errors now provide `/voice install` plus uv-first/fallback commands.
+- `/voice on` unmet-requirements block now prints `/voice install` first, then uv/pip command lines.
+- `hermes_cli/main.py`
+- ACP ImportError guidance now prints uv-first editable install command and explicit pip fallback.
+- Validation notes:
+- `python -m py_compile honcho_integration/cli.py tools/voice_mode.py cli.py hermes_cli/main.py` passed.
+- `pytest -q -o addopts='' tests/honcho_integration/test_cli.py` -> `5 passed`.
+- `pytest -q -o addopts='' tests/tools/test_browser_windows_stream_port.py` -> `9 passed`.
+- Known local test env issue (not introduced by this change):
+- `tests/tools/test_voice_mode.py` currently fails to import due missing optional dependency `firecrawl` via `tools/__init__.py`.
+
+### WF-029 - Voice runtime dependency restore + CLI `/voice` readiness verification
+- Status: `done`
+- Problem:
+- Voice mode previously reported missing audio libs in Hermes runtime (`sounddevice` absent in uv tool interpreter).
+- Changes performed:
+- Installed `sounddevice` into active Hermes uv runtime:
+- `uv pip install --python C:\Users\btgil\AppData\Roaming\uv\tools\hermes-agent\Scripts\python.exe sounddevice`
+- Validation performed:
+- Runtime package check:
+- `uv pip list --python ...` shows `sounddevice 0.5.5`, `numpy 2.4.3`, `faster-whisper 1.2.1`.
+- Direct runtime import/device probe:
+- `import sounddevice` succeeded; `sd.query_devices()` returned `197` devices.
+- Hermes CLI smoke:
+- launched `hermes` and ran `/voice status`.
+- observed:
+- `Requirements:`
+- `Audio capture: OK`
+- `STT provider: OK (OpenAI)` (in this interactive run).
+
 ## Open Follow-ups
 - Re-run targeted pytest in your preferred Windows environment after current merge work settles to confirm no hidden cross-fixture assumptions remain.
 - Keep this ledger as source-of-truth for Windows stability fixes; append entries instead of rewriting history.

@@ -4257,15 +4257,40 @@ class HermesCLI:
 
         reqs = check_voice_requirements()
         if not reqs["audio_available"]:
+            uv_path = shutil.which("uv")
+            install_uv = (
+                f"{uv_path} pip install --python \"{sys.executable}\" sounddevice numpy"
+                if uv_path
+                else None
+            )
+            install_pip = f"{sys.executable} -m pip install sounddevice numpy"
             raise RuntimeError(
                 "Voice mode requires sounddevice and numpy.\n"
-                "Install with: pip install sounddevice numpy\n"
-                "Or: pip install hermes-agent[voice]"
+                "Run: /voice install\n"
+                + (f"Manual: {install_uv}\n" if install_uv else "")
+                + f"Fallback: {install_pip}"
             )
         if not reqs.get("stt_available", reqs.get("stt_key_set")):
+            uv_path = shutil.which("uv")
+            install_uv = (
+                f"{uv_path} pip install --python \"{sys.executable}\" faster-whisper"
+                if uv_path
+                else None
+            )
+            install_pip = f"{sys.executable} -m pip install faster-whisper"
             raise RuntimeError(
                 "Voice mode requires an STT provider for transcription.\n"
-                "Option 1: pip install faster-whisper  (free, local)\n"
+                + (
+                    f"Option 1: {install_uv}  (free, local)\n"
+                    if install_uv
+                    else f"Option 1: {install_pip}  (free, local)\n"
+                )
+                + (
+                    f"Fallback: {install_pip}\n"
+                    if install_uv
+                    else ""
+                )
+                +
                 "Option 2: Set GROQ_API_KEY (free tier)\n"
                 "Option 3: Set VOICE_TOOLS_OPENAI_KEY (paid)"
             )
@@ -4525,8 +4550,15 @@ class HermesCLI:
             for line in reqs["details"].split("\n"):
                 _cprint(f"  {_DIM}{line}{_RST}")
             if reqs["missing_packages"]:
-                _cprint(f"\n  {_BOLD}Install: pip install {' '.join(reqs['missing_packages'])}{_RST}")
-                _cprint(f"  {_DIM}Or: pip install hermes-agent[voice]{_RST}")
+                missing = " ".join(reqs["missing_packages"])
+                uv_path = shutil.which("uv")
+                _cprint(f"\n  {_BOLD}Install: /voice install{_RST}")
+                if uv_path:
+                    _cprint(
+                        f"  {_DIM}{uv_path} pip install --python "
+                        f"\"{sys.executable}\" {missing}{_RST}"
+                    )
+                _cprint(f"  {_DIM}{sys.executable} -m pip install {missing}{_RST}")
             return
 
         with self._voice_lock:

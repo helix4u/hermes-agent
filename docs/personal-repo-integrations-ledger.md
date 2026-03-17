@@ -639,6 +639,71 @@ This ledger tracks private integration work by **code comparison and runtime val
 - Live uv-tool runtime probe from `C:\Users\btgil\.hermes`:
 - `_run_browser_command(... open https://github.com ...)` returned success in ~`1.16s`.
 
+### PRI-033 - Exit cleanup interrupt hardening + Honcho runtime dependency restore
+- Status: `done`
+- Integrated slices:
+- Hardened browser cleanup thread shutdown path:
+- `tools/browser_tool.py` now catches `BaseException` in `_stop_browser_cleanup_thread()` to avoid atexit traceback noise during Ctrl+C/exit races.
+- Added regression test:
+- `tests/tools/test_browser_windows_stream_port.py`
+- `test_stop_browser_cleanup_thread_handles_join_interrupt`
+- Restored Honcho SDK in active Hermes uv-tool runtime:
+- installed `honcho-ai>=2.0.1` with `uv pip --python ...`
+- validated by importing `honcho` in the same runtime.
+- File refs:
+- `tools/browser_tool.py`
+- `tests/tools/test_browser_windows_stream_port.py`
+- Validation:
+- `pytest -q -o addopts='' tests/tools/test_browser_windows_stream_port.py` passed (`9 passed`).
+- Runtime check:
+- `honcho_import_ok honcho`.
+
+### PRI-034 - UV-first install messaging parity (voice, honcho, ACP)
+- Status: `done`
+- Integrated slices:
+- `honcho_integration/cli.py`
+- updated `_ensure_sdk_installed()` skip guidance to uv-first command with interpreter pinning and pip fallback.
+- `tools/voice_mode.py`
+- replaced pip-first missing-dependency phrasing with `/voice install` guidance.
+- `AudioRecorder.start()` runtime error now includes:
+- `/voice install` first
+- uv pip command for active interpreter when available
+- python `-m pip` fallback.
+- requirements detail strings now reference runtime install action instead of pip-only text.
+- `cli.py`
+- `_voice_start_recording()` errors now use uv-first command hints + pip fallback.
+- `_enable_voice_mode()` unmet requirements block now prints `/voice install` first and runtime-scoped commands next.
+- `hermes_cli/main.py`
+- ACP ImportError guidance now prints uv-first editable install command and explicit pip fallback.
+- File refs:
+- `honcho_integration/cli.py`
+- `tools/voice_mode.py`
+- `cli.py`
+- `hermes_cli/main.py`
+- Validation:
+- `python -m py_compile honcho_integration/cli.py tools/voice_mode.py cli.py hermes_cli/main.py` passed.
+- `pytest -q -o addopts='' tests/honcho_integration/test_cli.py` passed (`5 passed`).
+- `pytest -q -o addopts='' tests/tools/test_browser_windows_stream_port.py` passed (`9 passed`).
+- Note:
+- `tests/tools/test_voice_mode.py` currently fails in this local environment due optional `firecrawl` import path in `tools/__init__.py`, unrelated to this integration slice.
+
+### PRI-035 - Voice dependency/runtime parity in active uv tool env
+- Status: `done`
+- Integrated slices:
+- Restored missing voice dependency in active Hermes uv runtime by installing `sounddevice`.
+- Verified runtime package parity for voice stack (`sounddevice`, `numpy`, `faster-whisper`).
+- Performed interactive CLI verification:
+- `hermes` -> `/voice status`
+- confirmed voice readiness in live CLI output:
+- `Audio capture: OK`
+- `STT provider: OK (...)`
+- File refs:
+- `docs/windows-fixes-ledger.md` (WF-029 evidence trail)
+- Validation:
+- `uv pip install --python C:\Users\btgil\AppData\Roaming\uv\tools\hermes-agent\Scripts\python.exe sounddevice` succeeded.
+- Runtime probe:
+- `import sounddevice` succeeded and device query returned non-zero devices.
+
 ## Merge Safety Rules
 - Keep upstream `main` behavior as baseline.
 - Port integrations in small slices with compile/smoke validation per slice.

@@ -45,6 +45,7 @@ Usage:
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -3445,7 +3446,13 @@ For more help on a command:
             acp_main()
         except ImportError:
             print("ACP dependencies not installed.")
-            print("Install them with:  pip install -e '.[acp]'")
+            uv_path = shutil.which("uv")
+            if uv_path:
+                print(
+                    f"Install with: {uv_path} pip install --python "
+                    f"\"{sys.executable}\" -e '.[acp]'"
+                )
+            print(f"Fallback: {sys.executable} -m pip install -e '.[acp]'")
             sys.exit(1)
 
     acp_parser.set_defaults(func=cmd_acp)

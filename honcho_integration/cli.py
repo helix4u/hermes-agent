@@ -123,7 +123,11 @@ def _ensure_sdk_installed() -> bool:
     print("  honcho-ai is not installed.")
     answer = _prompt(f"Install it now? ({HONCHO_SDK_SPEC})", default="y")
     if answer.lower() not in ("y", "yes"):
-        print(f"  Skipping install. Run: pip install '{HONCHO_SDK_SPEC}'\n")
+        print(
+            f"  Skipping install. Run: uv pip install --python \"{sys.executable}\" "
+            f"'{HONCHO_SDK_SPEC}'"
+        )
+        print(f"  Or: python -m pip install '{HONCHO_SDK_SPEC}'\n")
         return False
 
     print("  Installing honcho-ai...", flush=True)

@@ -272,3 +272,22 @@ def test_cleanup_browser_handles_keyboard_interrupt_during_close():
         browser_tool.cleanup_browser("task-kbi")
 
     assert "task-kbi" not in browser_tool._active_sessions
+
+
+def test_stop_browser_cleanup_thread_handles_join_interrupt():
+    from tools import browser_tool
+
+    class _ThreadLike:
+        def join(self, timeout=None):
+            raise KeyboardInterrupt()
+
+    original = browser_tool._cleanup_thread
+    original_running = browser_tool._cleanup_running
+    try:
+        browser_tool._cleanup_thread = _ThreadLike()
+        browser_tool._cleanup_running = True
+        browser_tool._stop_browser_cleanup_thread()
+        assert browser_tool._cleanup_running is False
+    finally:
+        browser_tool._cleanup_thread = original
+        browser_tool._cleanup_running = original_running
