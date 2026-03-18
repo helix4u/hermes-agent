@@ -335,6 +335,17 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
+def _normalize_gateway_model_for_provider(model: str, provider: str) -> str:
+    """Normalize model names for providers whose APIs reject aggregator slugs."""
+    normalized_model = (model or "").strip()
+    normalized_provider = (provider or "").strip().lower()
+
+    if normalized_provider == "openai-codex" and "/" in normalized_model:
+        return normalized_model.split("/", 1)[1].strip()
+
+    return normalized_model
+
+
 def _resolve_gateway_model() -> str:
     """Read model from env/config — mirrors the resolution in _run_agent_sync.
 
@@ -343,6 +354,7 @@ def _resolve_gateway_model() -> str:
     when the active provider is openai-codex.
     """
     model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
+    requested_provider = ""
     try:
         import yaml as _y
         _cfg_path = _hermes_home / "config.yaml"
@@ -354,9 +366,26 @@ def _resolve_gateway_model() -> str:
                 model = _model_cfg
             elif isinstance(_model_cfg, dict):
                 model = _model_cfg.get("default", model)
+                _cfg_provider = _model_cfg.get("provider", "")
+                if isinstance(_cfg_provider, str) and _cfg_provider.strip():
+                    requested_provider = _cfg_provider.strip()
     except Exception:
         pass
-    return model
+
+    if not requested_provider:
+        requested_provider = os.getenv("HERMES_INFERENCE_PROVIDER", "").strip()
+
+    try:
+        from hermes_cli.auth import resolve_provider as _resolve_provider
+        from hermes_cli.models import normalize_provider as _normalize_provider
+
+        resolved_provider = _normalize_provider(requested_provider or "auto")
+        if resolved_provider == "auto":
+            resolved_provider = _resolve_provider(resolved_provider)
+    except Exception:
+        resolved_provider = (requested_provider or "").strip().lower()
+
+    return _normalize_gateway_model_for_provider(model, resolved_provider)
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -3810,6 +3839,8 @@ class GatewayRunner:
             except Exception:
                 current_provider = "openrouter"
 
+        current = _normalize_gateway_model_for_provider(current, current_provider)
+
         # Detect custom endpoint: provider resolved to openrouter but a custom
         # base URL is configured — the user set up a custom endpoint.
         if current_provider == "openrouter" and os.getenv("OPENAI_BASE_URL", "").strip():
@@ -3836,6 +3867,7 @@ class GatewayRunner:
 
         # Parse provider:model syntax
         target_provider, new_model = parse_model_input(args, current_provider)
+        new_model = _normalize_gateway_model_for_provider(new_model, target_provider)
         # Auto-detect provider when no explicit provider:model syntax was used
         if target_provider == current_provider:
             from hermes_cli.models import detect_provider_for_model
@@ -3901,8 +3933,7 @@ class GatewayRunner:
 
         # Set env vars so the next agent run picks up the change
         os.environ["HERMES_MODEL"] = new_model
-        if provider_changed:
-            os.environ["HERMES_INFERENCE_PROVIDER"] = target_provider
+        os.environ["HERMES_INFERENCE_PROVIDER"] = target_provider
 
         provider_label = _PROVIDER_LABELS.get(target_provider, target_provider)
         provider_note = f"\n**Provider:** {provider_label}" if provider_changed else ""

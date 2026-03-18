@@ -94,6 +94,10 @@ class TestDetectProviderForModel:
         """Models belonging to the current provider should not trigger a switch."""
         assert detect_provider_for_model("gpt-5.3-codex", "openai-codex") is None
 
+    def test_current_provider_forward_compat_model_returns_none(self):
+        """Codex-native GPT-5 models should stay on OpenAI Codex."""
+        assert detect_provider_for_model("gpt-5.4", "openai-codex") is None
+
     def test_openrouter_slug_match(self):
         """Models in the OpenRouter catalog should be found."""
         result = detect_provider_for_model("anthropic/claude-opus-4.6", "openai-codex")
