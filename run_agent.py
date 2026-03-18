@@ -1993,6 +1993,13 @@ class AIAgent:
 
         mode = get_local_shell_mode()
         override = resolve_windows_shell_override()
+        stale_shell_warning = (
+            "If memory, Honcho context, or prior observations mention WSL, `/mnt/c/...`, "
+            "Cygwin, or a mixed shell context that conflicts with this runtime, treat those "
+            "notes as stale and ignore them for this turn. Prefer paths rooted in the active "
+            "workspace/current shell context, and do not guess alternate home-directory copies "
+            "of project files. "
+        )
 
         if mode == "powershell":
             return (
@@ -2002,6 +2009,8 @@ class AIAgent:
                 "`Select-String` over `grep`, and `New-Item -ItemType Directory -Force` over "
                 "`mkdir -p`. Do not assume POSIX command behavior unless a tool explicitly targets "
                 "a Unix/containerized environment. "
+                f"{stale_shell_warning}"
+                "To verify the active shell, run: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell — "
                 "When the user gives a direct terminal action, do that action first before memory "
                 "or worldview file reads."
             )
@@ -2021,6 +2030,8 @@ class AIAgent:
                 "`type`, `cd`, `mkdir`, and `%VAR%` env-var expansion with Windows `C:\\` paths. "
                 "Do NOT use PowerShell syntax and do NOT assume POSIX commands like `pwd`, `uname`, "
                 "`ls`, or `grep`. "
+                f"{stale_shell_warning}"
+                "To verify the active shell, run: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell — "
                 "When the user gives a direct terminal action, do that action first before memory "
                 "or worldview file reads."
             )

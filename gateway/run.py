@@ -5077,7 +5077,7 @@ class GatewayRunner:
                     **runtime_kwargs,
                     max_iterations=max_iterations,
                     quiet_mode=True,
-                    verbose_logging=False,
+                    verbose_logging=(progress_mode == "verbose"),
                     enabled_toolsets=enabled_toolsets,
                     reasoning_config=reasoning_config,
                     providers_allowed=pr.get("only"),
@@ -6328,11 +6328,29 @@ class GatewayRunner:
             # Verbose mode: include argument keys/preview.
             if progress_mode == "verbose" and args:
                 try:
+                    if tool_name == "terminal":
+                        command = str(args.get("command") or "").strip()
+                        workdir = str(args.get("workdir") or "").strip()
+                        timeout = args.get("timeout")
+                        parts = [f"{emoji} terminal"]
+                        if workdir:
+                            parts.append(f"cwd={workdir}")
+                        if timeout not in (None, ""):
+                            parts.append(f"timeout={timeout}")
+                        if command:
+                            max_command_chars = max(240, min(progress_embed_max_chars - 250, 1800))
+                            if len(command) > max_command_chars:
+                                command = command[: max_command_chars - 3] + "..."
+                            parts.append(f"cmd={command}")
+                        detail = " | ".join(parts)
+                        _set_progress_state(phase="tool", detail=detail, tool_call=True)
+                        return
                     args_str = json.dumps(args, ensure_ascii=False, default=str)
                 except Exception:
                     args_str = str(args)
-                if len(args_str) > 200:
-                    args_str = args_str[:197] + "..."
+                max_args_chars = max(240, min(progress_embed_max_chars - 250, 1200))
+                if len(args_str) > max_args_chars:
+                    args_str = args_str[: max_args_chars - 3] + "..."
                 detail = f"{emoji} {tool_name}({list(args.keys())}) {args_str}"
                 _set_progress_state(phase="tool", detail=detail, tool_call=True)
                 return
@@ -6507,7 +6525,7 @@ class GatewayRunner:
                 **runtime_kwargs,
                 max_iterations=max_iterations,
                 quiet_mode=True,
-                verbose_logging=False,
+                verbose_logging=(progress_mode == "verbose"),
                 enabled_toolsets=enabled_toolsets,
                 ephemeral_system_prompt=combined_ephemeral or None,
                 prefill_messages=self._prefill_messages or None,

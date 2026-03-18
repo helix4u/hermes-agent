@@ -1220,7 +1220,8 @@ class HermesCLI:
         self._secret_state = None
         self._secret_deadline = 0
         self._spinner_text: str = ""  # thinking spinner text for TUI
-        self._active_tool_status: dict[str, str] = {}
+        self._active_tool_status: dict[str, list[str]] = {}
+        self._active_tool_count = 0
         self._last_tool_status: str = ""
         self._command_running = False
         self._command_status = ""
@@ -1496,8 +1497,10 @@ class HermesCLI:
     def _refresh_tool_spinner_text(self) -> None:
         """Render live concurrent-tool status into the TUI spinner line."""
         if self._active_tool_status:
-            previews = list(self._active_tool_status.values())
-            count = len(previews)
+            previews: list[str] = []
+            for labels in self._active_tool_status.values():
+                previews.extend(labels)
+            count = self._active_tool_count or len(previews)
             shown = ", ".join(previews[:2])
             if count > 2:
                 shown += ", ..."
@@ -1510,6 +1513,7 @@ class HermesCLI:
     def _reset_tool_status(self) -> None:
         """Clear per-turn tool status so stale concurrent banners don't linger."""
         self._active_tool_status.clear()
+        self._active_tool_count = 0
         self._last_tool_status = ""
         self._spinner_text = ""
         self._invalidate()
@@ -4515,7 +4519,12 @@ class HermesCLI:
         """Called when a tool starts/completes. Updates TUI status and voice cue."""
         if function_name == "_tool_result":
             tool_name = preview or function_args.get("tool", "tool")
-            self._active_tool_status.pop(tool_name, None)
+            labels = self._active_tool_status.get(tool_name)
+            if labels:
+                labels.pop(0)
+                self._active_tool_count = max(0, self._active_tool_count - 1)
+                if not labels:
+                    self._active_tool_status.pop(tool_name, None)
             duration = function_args.get("duration_seconds")
             if isinstance(duration, (int, float)):
                 self._last_tool_status = f"completed {tool_name} in {duration:.1f}s"
@@ -4529,7 +4538,9 @@ class HermesCLI:
             return
 
         label = preview or function_name
-        self._active_tool_status[function_name] = f"{function_name}({label})" if preview else function_name
+        labels = self._active_tool_status.setdefault(function_name, [])
+        labels.append(f"{function_name}({label})" if preview else function_name)
+        self._active_tool_count += 1
         self._last_tool_status = ""
         self._refresh_tool_spinner_text()
 

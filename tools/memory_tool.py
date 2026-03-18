@@ -37,6 +37,13 @@ logger = logging.getLogger(__name__)
 MEMORY_DIR = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
+_DYNAMIC_SHELL_CONTEXT_PATTERNS = (
+    "This terminal session runs in WSL on the user's Windows machine",
+    "Current command context is mixed: terminal commands run in WSL/Linux",
+    "hermes's working directory resolves as `/cygdrive/",
+    "hermes is using a Bash/Cygwin-style layer with Windows interop",
+    "hermes will use cmd-safe commands and Windows paths for execution unless explicitly told otherwise.",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -114,11 +121,23 @@ class MemoryStore:
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
 
+        prompt_memory_entries = [
+            entry for entry in self.memory_entries
+            if not self._is_dynamic_shell_context_entry(entry)
+        ]
+
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
-            "memory": self._render_block("memory", self.memory_entries),
+            "memory": self._render_block("memory", prompt_memory_entries),
             "user": self._render_block("user", self.user_entries),
         }
+
+    @staticmethod
+    def _is_dynamic_shell_context_entry(entry: str) -> bool:
+        text = (entry or "").strip()
+        if not text:
+            return False
+        return any(pattern in text for pattern in _DYNAMIC_SHELL_CONTEXT_PATTERNS)
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
