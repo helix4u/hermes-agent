@@ -391,6 +391,8 @@ def _build_terminal_tool_description() -> str:
             windows_note = (
                 "Windows note: with terminal.backend=local, commands run in PowerShell. "
                 "Use PowerShell syntax and Windows paths (e.g. C:\\Users\\... or D:\\...). "
+                "Path note: prefer Windows-style paths (e.g. C:\\Users\\...) in this mode. "
+                "Some systems also have POSIX-like tools on PATH (Git Bash, Cygwin, etc.); choose commands and path style that match the active shell.\n\n"
                 "To detect shell: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell "
                 "(prints CMD or PowerShell).\n\n"
             )
@@ -398,6 +400,8 @@ def _build_terminal_tool_description() -> str:
             windows_note = (
                 "Windows note: with terminal.backend=local, commands run in cmd.exe. "
                 "Use cmd syntax and Windows paths (e.g. C:\\Users\\... or D:\\...). "
+                "Path note: prefer Windows-style paths (e.g. C:\\Users\\...) in this mode. "
+                "Some systems also have POSIX-like tools on PATH (Git Bash, Cygwin, etc.); choose commands and path style that match the active shell.\n\n"
                 "To detect shell: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell "
                 "(prints CMD or PowerShell).\n\n"
             )
@@ -500,7 +504,18 @@ def _get_env_config() -> Dict[str, Any]:
     # else starts in the user's home (~ resolves to whatever account
     # is running inside the container/remote).
     if env_type == "local":
-        default_cwd = os.getcwd()
+        # For CLI, default to the process CWD (user's terminal).
+        # For gateway/messaging, prefer Hermes workspace for deterministic paths.
+        platform = (os.getenv("HERMES_SESSION_PLATFORM") or "").strip().lower()
+        if platform and platform not in {"local", "cli"}:
+            try:
+                hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+                workspace = hermes_home / "workspace"
+                default_cwd = str(workspace) if workspace.exists() else os.getcwd()
+            except Exception:
+                default_cwd = os.getcwd()
+        else:
+            default_cwd = os.getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
     else:
