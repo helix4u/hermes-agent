@@ -82,6 +82,7 @@ let pendingAttachments = [];
 let previewPollingEnabled = false;
 let voiceRecordingActive = false;
 let voiceTranscriptionPending = false;
+let lastYouTubePreviewPageKey = "";
 const voiceInputChannel = typeof BroadcastChannel !== "undefined"
   ? new BroadcastChannel("hermes-sidecar-voice-input")
   : null;
@@ -1092,6 +1093,30 @@ function getExtensionContextInvalidatedMessage() {
   );
 }
 
+function getYouTubePreviewPageKey(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    if (!/(^|\.)youtube\.com$/i.test(url.hostname)) {
+      return "";
+    }
+    if (url.pathname !== "/watch") {
+      return "";
+    }
+    const videoId = String(url.searchParams.get("v") || "").trim();
+    return videoId ? `youtube-watch:${videoId}` : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function rememberPreviewPageKey(rawUrl) {
+  lastYouTubePreviewPageKey = getYouTubePreviewPageKey(rawUrl);
+}
+
+function clearRememberedYouTubePreviewPage() {
+  lastYouTubePreviewPageKey = "";
+}
+
 function handleExtensionContextInvalidated(error, { openActivity = true } = {}) {
   const message = getExtensionContextInvalidatedMessage(error);
   extensionContextInvalidated = true;
@@ -1773,12 +1798,21 @@ async function refreshPreview({ quiet = false } = {}) {
   let tab = null;
   try {
     tab = await getActiveTab();
+    const activeYouTubePageKey = getYouTubePreviewPageKey(tab?.url || "");
+    if (quiet) {
+      if (!activeYouTubePageKey) {
+        lastYouTubePreviewPageKey = "";
+      } else if (activeYouTubePageKey === lastYouTubePreviewPageKey) {
+        return;
+      }
+    }
     const response = await sendRuntimeMessage({
       type: "hermes:preview-page-context",
       tabId: tab.id
     });
     const preview = response.result || {};
     renderPreview(preview);
+    rememberPreviewPageKey(preview.url || tab?.url || "");
     if (isExtensionsPolicyBlockedMessage(preview.unavailableReason || "")) {
       if (previewPollingEnabled) {
         await setPreviewPollingEnabled(false, { persist: true, quiet: true });
@@ -2526,6 +2560,12 @@ chrome.tabs.onActivated.addListener(() => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (tabId === activeTabId && Object.prototype.hasOwnProperty.call(changeInfo || {}, "url")) {
+    const nextPageKey = getYouTubePreviewPageKey(changeInfo.url || "");
+    if (!nextPageKey || nextPageKey !== lastYouTubePreviewPageKey) {
+      clearRememberedYouTubePreviewPage();
+    }
+  }
   if (tabId === activeTabId && (changeInfo.status === "complete" || changeInfo.url)) {
     scheduleRefresh();
   }

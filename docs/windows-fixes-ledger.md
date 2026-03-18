@@ -980,3 +980,17 @@ Scope: `hermes-agent` Windows install/startup/runtime reliability fixes validate
 - added installer coverage for both the preferred `uv pip` path and the fallback `ensurepip`/`pip` path
 - Validation:
 - targeted gateway browser-bridge transcript tests were run after patch.
+
+### WF-047 - YouTube sidepanel polling now refreshes at most once per watch page
+- Status: `done`
+- Problem:
+- The browser extension sidepanel preview auto-refresh loop was polling every second on all pages.
+- On YouTube watch pages, those repeated preview fetches were expensive enough to slow down the active player.
+- Changes made:
+- `browser-extension/sidepanel.js`
+- added a YouTube watch-page key derived from the current `v=` video ID.
+- sidepanel preview refreshes now remember the last YouTube watch page they successfully previewed.
+- quiet auto-refresh polling skips repeated preview fetches for the same YouTube watch page and only refreshes again after the URL changes to a different video.
+- manual refresh still works normally; this only changes the background polling behavior.
+- Validation:
+- `node --check browser-extension/sidepanel.js` passed.
