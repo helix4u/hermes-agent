@@ -1572,7 +1572,10 @@ class GatewayRunner:
             "browser_label": source.chat_name or source.user_name or "Chrome Extension",
             "messages": self._serialize_browser_bridge_history(history),
             "progress": progress,
-            "can_send": not bool(progress.get("running")),
+            # Browser sidecar sessions remain locally controllable while running:
+            # send is still blocked by busy-state in the sidepanel, but interrupt
+            # should stay available instead of downgrading the session to read-only.
+            "can_send": True,
         }
 
     def _list_browser_bridge_sessions(

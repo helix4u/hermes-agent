@@ -113,3 +113,20 @@ async def test_sidecar_sync_turn_timeout_cleans_progress_and_task(monkeypatch):
     assert progress["detail"] == "Sidecar turn timed out."
     assert "cancelled" in progress["error"]
     assert "browser-bridge:test" not in runner._browser_bridge_tasks
+
+
+def test_browser_bridge_snapshot_keeps_running_sidecar_session_interruptable():
+    runner = _make_runner()
+    runner.session_store.get_or_create_session.return_value = SimpleNamespace(
+        session_key="browser-bridge:test",
+        session_id="session-4",
+    )
+    runner.session_store.load_transcript.return_value = [{"role": "user", "content": "hello"}]
+    runner._get_browser_bridge_progress_snapshot = MagicMock(
+        return_value={"running": True, "detail": "Hermes is thinking..."}
+    )
+
+    snapshot = GatewayRunner._get_browser_bridge_session_snapshot(runner, _make_source())
+
+    assert snapshot["progress"]["running"] is True
+    assert snapshot["can_send"] is True
