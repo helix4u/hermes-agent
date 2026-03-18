@@ -205,6 +205,7 @@ def resolve_runtime_provider(
     requested: Optional[str] = None,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    allow_device_auth: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution."""
     requested_provider = resolve_requested_provider(requested)
@@ -240,7 +241,10 @@ def resolve_runtime_provider(
         }
 
     if provider == "openai-codex":
-        creds = resolve_codex_runtime_credentials()
+        if allow_device_auth is None:
+            creds = resolve_codex_runtime_credentials()
+        else:
+            creds = resolve_codex_runtime_credentials(allow_device_auth=allow_device_auth)
         return {
             "provider": "openai-codex",
             "api_mode": "codex_responses",
@@ -292,6 +296,8 @@ def resolve_runtime_provider(
 
 
 def format_runtime_provider_error(error: Exception) -> str:
+    from hermes_cli.colors import strip_ansi
+
     if isinstance(error, AuthError):
-        return format_auth_error(error)
-    return str(error)
+        return strip_ansi(format_auth_error(error))
+    return strip_ansi(str(error))

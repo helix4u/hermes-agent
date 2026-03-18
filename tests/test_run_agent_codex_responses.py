@@ -392,7 +392,7 @@ def test_try_refresh_codex_client_credentials_rebuilds_client(monkeypatch):
 
     monkeypatch.setattr(
         "hermes_cli.auth.resolve_codex_runtime_credentials",
-        lambda force_refresh=True: {
+        lambda force_refresh=True, allow_device_auth=None: {
             "api_key": "new-codex-token",
             "base_url": "https://chatgpt.com/backend-api/codex",
         },

@@ -258,11 +258,14 @@ class AuthError(RuntimeError):
 
 def format_auth_error(error: Exception) -> str:
     """Map auth failures to concise user-facing guidance."""
+    from hermes_cli.colors import strip_ansi
+
+    message = strip_ansi(str(error))
     if not isinstance(error, AuthError):
-        return str(error)
+        return message
 
     if error.relogin_required:
-        return f"{error} Run `hermes model` to re-authenticate."
+        return f"{message} Run `hermes model` to re-authenticate."
 
     if error.code == "subscription_required":
         return (
@@ -277,7 +280,9 @@ def format_auth_error(error: Exception) -> str:
         )
 
     if error.code == "temporarily_unavailable":
-        return f"{error} Please retry in a few seconds."
+        return f"{message} Please retry in a few seconds."
+
+    return message
 
     return str(error)
 
@@ -750,7 +755,9 @@ def _refresh_codex_auth_tokens(
     if response.status_code != 200:
         code = "codex_refresh_failed"
         message = f"Codex token refresh failed with status {response.status_code}."
-        relogin_required = False
+        # Some providers return a 401 without a parseable error body.
+        # Treat 401 as a strong signal the refresh token is revoked/expired.
+        relogin_required = response.status_code == 401
         try:
             err = response.json()
             if isinstance(err, dict):
@@ -823,11 +830,66 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         return None
 
 
+def _codex_can_prompt_for_reauth() -> bool:
+    """Return True when Hermes can safely run interactive Codex device auth."""
+    def _stream_is_tty(stream: Any) -> bool:
+        try:
+            return bool(stream) and bool(stream.isatty())
+        except Exception:
+            return False
+
+    stdin_tty = _stream_is_tty(getattr(sys, "stdin", None)) or _stream_is_tty(getattr(sys, "__stdin__", None))
+    stdout_tty = _stream_is_tty(getattr(sys, "stdout", None)) or _stream_is_tty(getattr(sys, "__stdout__", None))
+    return stdin_tty and stdout_tty
+
+
+def _recover_codex_relogin(
+    *,
+    prior_tokens: Dict[str, str],
+    refresh_error: AuthError,
+    allow_device_auth: Optional[bool] = None,
+) -> Dict[str, str]:
+    """Recover from a revoked Codex refresh token.
+
+    Recovery order:
+    1. Import a fresh shared Codex session if one exists.
+    2. If interactive, run Hermes-owned device auth and persist it.
+    3. Otherwise re-raise the original auth error.
+    """
+    prior_access = str(prior_tokens.get("access_token", "") or "").strip()
+    prior_refresh = str(prior_tokens.get("refresh_token", "") or "").strip()
+
+    cli_tokens = _import_codex_cli_tokens()
+    if cli_tokens:
+        cli_access = str(cli_tokens.get("access_token", "") or "").strip()
+        cli_refresh = str(cli_tokens.get("refresh_token", "") or "").strip()
+        if cli_access and cli_refresh and (cli_access != prior_access or cli_refresh != prior_refresh):
+            logger.warning("Codex refresh failed; importing fresh shared Codex auth into Hermes store")
+            _save_codex_tokens(cli_tokens)
+            return dict(cli_tokens)
+
+    can_device_auth = (
+        _codex_can_prompt_for_reauth() if allow_device_auth is None else bool(allow_device_auth)
+    )
+    if can_device_auth:
+        print("Codex session expired. Starting Hermes device re-auth...")
+        creds = _codex_device_code_login()
+        recovered_tokens = dict(creds.get("tokens") or {})
+        access_token = str(recovered_tokens.get("access_token", "") or "").strip()
+        refresh_token = str(recovered_tokens.get("refresh_token", "") or "").strip()
+        if access_token and refresh_token:
+            _save_codex_tokens(recovered_tokens, creds.get("last_refresh"))
+            return recovered_tokens
+
+    raise refresh_error
+
+
 def resolve_codex_runtime_credentials(
     *,
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    allow_device_auth: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime credentials from Hermes's own Codex token store."""
     try:
@@ -868,7 +930,17 @@ def resolve_codex_runtime_credentials(
                 should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
 
             if should_refresh:
-                tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+                try:
+                    tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+                except AuthError as refresh_error:
+                    if refresh_error.relogin_required:
+                        tokens = _recover_codex_relogin(
+                            prior_tokens=tokens,
+                            refresh_error=refresh_error,
+                            allow_device_auth=allow_device_auth,
+                        )
+                    else:
+                        raise
                 access_token = str(tokens.get("access_token", "") or "").strip()
 
     base_url = (
@@ -1831,11 +1903,13 @@ def _codex_device_code_login() -> Dict[str, Any]:
         )
 
     # Step 2: Show user the code
+    from hermes_cli.colors import Colors, color
+
     print("To continue, follow these steps:\n")
     print(f"  1. Open this URL in your browser:")
-    print(f"     \033[94m{issuer}/codex/device\033[0m\n")
+    print(f"     {color(f'{issuer}/codex/device', Colors.BLUE)}\n")
     print(f"  2. Enter this code:")
-    print(f"     \033[94m{user_code}\033[0m\n")
+    print(f"     {color(user_code, Colors.BLUE)}\n")
     print("Waiting for sign-in... (press Ctrl+C to cancel)")
 
     # Step 3: Poll for authorization code

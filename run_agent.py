@@ -45,6 +45,12 @@ import fire
 from datetime import datetime
 from pathlib import Path
 
+try:
+    from hermes_cli.colors import strip_ansi as _strip_cli_ansi
+except Exception:
+    def _strip_cli_ansi(text):
+        return text
+
 
 def _ensure_project_root_precedence() -> None:
     """Put this project root first on sys.path to avoid cwd shadowing."""
@@ -149,6 +155,15 @@ class _SafeWriter:
     def write(self, data):
         try:
             return self._inner.write(data)
+        except UnicodeEncodeError:
+            if isinstance(data, str):
+                encoding = getattr(self._inner, "encoding", None) or "utf-8"
+                safe = data.encode(encoding, errors="replace").decode(encoding, errors="replace")
+                try:
+                    return self._inner.write(safe)
+                except Exception:
+                    return len(safe)
+            return 0
         except OSError:
             return len(data) if isinstance(data, str) else 0
 
@@ -889,7 +904,16 @@ class AIAgent:
         """
         if not force and getattr(self, "_stream_callback", None) is not None:
             return
-        print(*args, **kwargs)
+        try:
+            from hermes_cli.colors import strip_ansi
+
+            sanitized_args = tuple(
+                strip_ansi(arg) if isinstance(arg, str) else arg
+                for arg in args
+            )
+        except Exception:
+            sanitized_args = args
+        print(*sanitized_args, **kwargs)
 
     def _max_tokens_param(self, value: int) -> dict:
         """Return the correct max tokens kwarg for the current provider.
@@ -2766,7 +2790,17 @@ class AIAgent:
         try:
             from hermes_cli.auth import resolve_codex_runtime_credentials
 
-            creds = resolve_codex_runtime_credentials(force_refresh=force)
+            allow_device_auth = None
+            platform_key = (self.platform or "").lower().strip()
+            if platform_key == "cron":
+                allow_device_auth = False
+            elif platform_key == "cli":
+                allow_device_auth = True
+
+            creds = resolve_codex_runtime_credentials(
+                force_refresh=force,
+                allow_device_auth=allow_device_auth,
+            )
         except Exception as exc:
             logger.debug("Codex credential refresh failed: %s", exc)
             return False
@@ -4012,7 +4046,7 @@ class AIAgent:
 
         # Start spinner for CLI mode
         spinner = None
-        if self.quiet_mode:
+        if self.quiet_mode and not (self.thinking_callback or self.tool_progress_callback):
             face = random.choice(KawaiiSpinner.KAWAII_WAITING)
             spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots')
             spinner.start()
@@ -5619,7 +5653,7 @@ class AIAgent:
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
-                            "error": str(api_error),
+                            "error": _strip_cli_ansi(str(api_error)),
                         }
 
                     if retry_count >= max_retries:
@@ -5678,7 +5712,7 @@ class AIAgent:
             # (e.g. repeated context-length errors that exhausted retry_count),
             # the `response` variable is still None. Break out cleanly.
             if response is None:
-                print(f"{self.log_prefix}❌ All API retries exhausted with no successful response.")
+                print(_strip_cli_ansi(f"{self.log_prefix}❌ All API retries exhausted with no successful response."))
                 self._persist_session(messages, conversation_history)
                 break
 

@@ -190,3 +190,99 @@ def test_resolve_returns_hermes_auth_store_source(tmp_path, monkeypatch):
     assert creds["source"] == "hermes-auth-store"
     assert creds["provider"] == "openai-codex"
     assert creds["base_url"] == DEFAULT_CODEX_BASE_URL
+
+
+def test_resolve_codex_runtime_credentials_recovers_from_shared_codex_auth(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="access-stale", refresh_token="refresh-stale")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _fake_refresh(tokens, timeout_seconds):
+        raise AuthError(
+            "Codex token refresh failed with status 401.",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: {"access_token": "cli-access", "refresh_token": "cli-refresh"},
+    )
+
+    resolved = resolve_codex_runtime_credentials(force_refresh=True, refresh_if_expiring=False)
+
+    assert resolved["api_key"] == "cli-access"
+    stored = _read_codex_tokens()
+    assert stored["tokens"]["access_token"] == "cli-access"
+    assert stored["tokens"]["refresh_token"] == "cli-refresh"
+
+
+def test_resolve_codex_runtime_credentials_recovers_with_device_auth_when_interactive(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="access-stale", refresh_token="refresh-stale")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _fake_refresh(tokens, timeout_seconds):
+        raise AuthError(
+            "Codex token refresh failed with status 401.",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    monkeypatch.setattr("hermes_cli.auth._codex_can_prompt_for_reauth", lambda: True)
+    monkeypatch.setattr(
+        "hermes_cli.auth._codex_device_code_login",
+        lambda: {
+            "tokens": {"access_token": "device-access", "refresh_token": "device-refresh"},
+            "last_refresh": "2026-03-18T00:00:00Z",
+        },
+    )
+
+    resolved = resolve_codex_runtime_credentials(force_refresh=True, refresh_if_expiring=False)
+
+    assert resolved["api_key"] == "device-access"
+    stored = _read_codex_tokens()
+    assert stored["tokens"]["access_token"] == "device-access"
+    assert stored["tokens"]["refresh_token"] == "device-refresh"
+
+
+def test_resolve_codex_runtime_credentials_allows_device_auth_when_forced(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="access-stale", refresh_token="refresh-stale")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _fake_refresh(tokens, timeout_seconds):
+        raise AuthError(
+            "Codex token refresh failed with status 401.",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    # Simulate a non-TTY environment, but force-enable device auth.
+    monkeypatch.setattr("hermes_cli.auth._codex_can_prompt_for_reauth", lambda: False)
+    monkeypatch.setattr(
+        "hermes_cli.auth._codex_device_code_login",
+        lambda: {
+            "tokens": {"access_token": "device-access", "refresh_token": "device-refresh"},
+            "last_refresh": "2026-03-18T00:00:00Z",
+        },
+    )
+
+    resolved = resolve_codex_runtime_credentials(
+        force_refresh=True,
+        refresh_if_expiring=False,
+        allow_device_auth=True,
+    )
+
+    assert resolved["api_key"] == "device-access"
+    stored = _read_codex_tokens()
+    assert stored["tokens"]["access_token"] == "device-access"
+    assert stored["tokens"]["refresh_token"] == "device-refresh"

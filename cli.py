@@ -840,10 +840,15 @@ class ChatConsole:
     def __init__(self):
         from io import StringIO
         self._buffer = StringIO()
+        try:
+            from hermes_cli.colors import _ansi_supported as _hermes_ansi_supported
+        except Exception:
+            _hermes_ansi_supported = lambda: True
+        ansi_ok = bool(_hermes_ansi_supported())
         self._inner = Console(
             file=self._buffer,
-            force_terminal=True,
-            color_system="truecolor",
+            force_terminal=ansi_ok,
+            color_system="truecolor" if ansi_ok else None,
             highlight=False,
         )
 
@@ -1215,6 +1220,8 @@ class HermesCLI:
         self._secret_state = None
         self._secret_deadline = 0
         self._spinner_text: str = ""  # thinking spinner text for TUI
+        self._active_tool_status: dict[str, str] = {}
+        self._last_tool_status: str = ""
         self._command_running = False
         self._command_status = ""
         self._attached_images: list[Path] = []
@@ -1478,7 +1485,33 @@ class HermesCLI:
 
     def _on_thinking(self, text: str) -> None:
         """Called by agent when thinking starts/stops. Updates TUI spinner."""
-        self._spinner_text = text or ""
+        if text:
+            self._spinner_text = text
+        elif self._active_tool_status:
+            self._refresh_tool_spinner_text()
+        else:
+            self._spinner_text = ""
+        self._invalidate()
+
+    def _refresh_tool_spinner_text(self) -> None:
+        """Render live concurrent-tool status into the TUI spinner line."""
+        if self._active_tool_status:
+            previews = list(self._active_tool_status.values())
+            count = len(previews)
+            shown = ", ".join(previews[:2])
+            if count > 2:
+                shown += ", ..."
+            noun = "tool" if count == 1 else "tools"
+            self._spinner_text = f"running {count} {noun}: {shown}"
+        elif self._last_tool_status:
+            self._spinner_text = self._last_tool_status
+        self._invalidate()
+
+    def _reset_tool_status(self) -> None:
+        """Clear per-turn tool status so stale concurrent banners don't linger."""
+        self._active_tool_status.clear()
+        self._last_tool_status = ""
+        self._spinner_text = ""
         self._invalidate()
 
     def _slow_command_status(self, command: str) -> str:
@@ -1538,6 +1571,7 @@ class HermesCLI:
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                allow_device_auth=True,
             )
         except Exception as exc:
             message = format_runtime_provider_error(exc)
@@ -1680,7 +1714,9 @@ class HermesCLI:
                     self._pending_title = None
             return True
         except Exception as e:
-            self.console.print(f"[bold red]Failed to initialize agent: {e}[/]")
+            from hermes_cli.colors import strip_ansi
+
+            self.console.print(f"[bold red]Failed to initialize agent: {strip_ansi(str(e))}[/]")
             return False
     
     def show_banner(self):
@@ -3235,7 +3271,7 @@ class HermesCLI:
                 if provider_changed:
                     try:
                         from hermes_cli.runtime_provider import resolve_runtime_provider
-                        runtime = resolve_runtime_provider(requested=target_provider)
+                        runtime = resolve_runtime_provider(requested=target_provider, allow_device_auth=True)
                         api_key_for_probe = runtime.get("api_key", "")
                         base_url_for_probe = runtime.get("base_url", "")
                     except Exception as e:
@@ -4476,11 +4512,28 @@ class HermesCLI:
     # ====================================================================
 
     def _on_tool_progress(self, function_name: str, preview: str, function_args: dict):
-        """Called when a tool starts executing. Plays audio cue in voice mode."""
-        if not self._voice_mode:
+        """Called when a tool starts/completes. Updates TUI status and voice cue."""
+        if function_name == "_tool_result":
+            tool_name = preview or function_args.get("tool", "tool")
+            self._active_tool_status.pop(tool_name, None)
+            duration = function_args.get("duration_seconds")
+            if isinstance(duration, (int, float)):
+                self._last_tool_status = f"completed {tool_name} in {duration:.1f}s"
+            else:
+                self._last_tool_status = f"completed {tool_name}"
+            self._refresh_tool_spinner_text()
             return
-        # Skip internal/thinking tools
+
+        # Skip internal/thinking tools for active-tool tracking
         if function_name.startswith("_"):
+            return
+
+        label = preview or function_name
+        self._active_tool_status[function_name] = f"{function_name}({label})" if preview else function_name
+        self._last_tool_status = ""
+        self._refresh_tool_spinner_text()
+
+        if not self._voice_mode:
             return
         try:
             from tools.voice_mode import play_beep
@@ -5328,6 +5381,7 @@ class HermesCLI:
         print(flush=True)
         
         try:
+            self._reset_tool_status()
             # Run the conversation with interrupt monitoring
             result = None
 
@@ -5481,7 +5535,9 @@ class HermesCLI:
             # truncated output, invalid tool calls). Both "failed" and "partial" with
             # an empty final_response mean the agent couldn't produce a usable answer.
             if result and (result.get("failed") or result.get("partial")) and not response:
-                error_detail = result.get("error", "Unknown error")
+                from hermes_cli.colors import strip_ansi
+
+                error_detail = strip_ansi(result.get("error", "Unknown error"))
                 response = f"Error: {error_detail}"
                 # Stop continuous voice mode on persistent errors (e.g. 429 rate limit)
                 # to avoid an infinite error → record → error loop
@@ -5582,9 +5638,13 @@ class HermesCLI:
             return response
             
         except Exception as e:
-            print(f"Error: {e}")
+            from hermes_cli.colors import strip_ansi
+
+            self._reset_tool_status()
+            print(f"Error: {strip_ansi(str(e))}")
             return None
         finally:
+            self._reset_tool_status()
             # Ensure streaming TTS resources are cleaned up even on error.
             # Normal path sends the sentinel at line ~3568; this is a safety
             # net for exception paths that skip it.  Duplicate sentinels are
