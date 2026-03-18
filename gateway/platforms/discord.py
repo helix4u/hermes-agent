@@ -10,14 +10,19 @@ Uses discord.py library for:
 """
 
 import asyncio
+import io
 import json
 import logging
+import math
+import mimetypes
 import os
+import shutil
 import struct
 import subprocess
 import tempfile
 import threading
 import time
+import wave
 from collections import defaultdict
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any
@@ -25,6 +30,7 @@ from typing import Callable, Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
+DISCORD_AUDIO_SAFE_BYTES = 7_500_000
 
 try:
     import discord
@@ -1024,6 +1030,184 @@ class DiscordAdapter(BasePlatformAdapter):
                 return SendResult(success=success)
         return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
 
+    @staticmethod
+    def _discord_audio_duration_seconds(audio_path: str) -> Optional[float]:
+        suffix = os.path.splitext(audio_path)[1].lower()
+        try:
+            if suffix == ".wav":
+                with wave.open(audio_path, "rb") as wav_file:
+                    frame_rate = wav_file.getframerate()
+                    frame_count = wav_file.getnframes()
+                    return (frame_count / float(frame_rate)) if frame_rate else None
+            if suffix in {".ogg", ".opus"}:
+                from mutagen.oggopus import OggOpus
+
+                info = OggOpus(audio_path)
+                return float(getattr(info.info, "length", 0.0) or 0.0) or None
+            if suffix == ".mp3":
+                from mutagen.mp3 import MP3
+
+                info = MP3(audio_path)
+                return float(getattr(info.info, "length", 0.0) or 0.0) or None
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _cleanup_temp_audio_files(paths: List[str], preserve: Optional[set[str]] = None) -> None:
+        keep = preserve or set()
+        for path in paths:
+            if not path or path in keep:
+                continue
+            with suppress(OSError):
+                os.unlink(path)
+
+    @staticmethod
+    def _transcode_audio_for_discord(audio_path: str) -> str:
+        if not shutil.which("ffmpeg"):
+            return audio_path
+
+        suffix = os.path.splitext(audio_path)[1].lower()
+        if suffix in {".ogg", ".opus"} and os.path.getsize(audio_path) <= DISCORD_AUDIO_SAFE_BYTES:
+            return audio_path
+
+        output_path = tempfile.NamedTemporaryFile(
+            suffix=".ogg",
+            prefix="discord-audio-",
+            delete=False,
+        ).name
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-i",
+                    audio_path,
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-c:a",
+                    "libopus",
+                    "-b:a",
+                    "64k",
+                    "-vbr",
+                    "on",
+                    "-application",
+                    "voip",
+                    output_path,
+                    "-y",
+                ],
+                capture_output=True,
+                timeout=180,
+            )
+            if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                return output_path
+        except Exception:
+            pass
+
+        with suppress(OSError):
+            os.unlink(output_path)
+        return audio_path
+
+    @classmethod
+    def _split_wav_for_discord(cls, audio_path: str, max_bytes: int) -> List[str]:
+        target_bytes = int(max_bytes * 0.9)
+        if target_bytes <= 0:
+            return [audio_path]
+
+        parts: List[str] = []
+        with wave.open(audio_path, "rb") as wav_file:
+            params = wav_file.getparams()
+            bytes_per_frame = params.nchannels * params.sampwidth
+            if bytes_per_frame <= 0:
+                return [audio_path]
+            frames_per_chunk = max(params.framerate, target_bytes // bytes_per_frame)
+            index = 1
+            while True:
+                frames = wav_file.readframes(frames_per_chunk)
+                if not frames:
+                    break
+                part_path = tempfile.NamedTemporaryFile(
+                    suffix=f".part{index:03d}.wav",
+                    prefix="discord-audio-",
+                    delete=False,
+                ).name
+                with wave.open(part_path, "wb") as out_file:
+                    out_file.setparams(params)
+                    out_file.writeframes(frames)
+                parts.append(part_path)
+                index += 1
+        return parts or [audio_path]
+
+    @classmethod
+    def _split_audio_for_discord(cls, audio_path: str, max_bytes: int = DISCORD_AUDIO_SAFE_BYTES) -> List[str]:
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) <= max_bytes:
+            return [audio_path]
+
+        duration = cls._discord_audio_duration_seconds(audio_path)
+        if shutil.which("ffmpeg") and duration and duration > 1:
+            estimated_parts = max(2, math.ceil(os.path.getsize(audio_path) / float(max_bytes)))
+            segment_seconds = max(15, int(math.ceil(duration / estimated_parts)))
+            for _attempt in range(4):
+                part_dir = tempfile.mkdtemp(prefix="discord-audio-parts-")
+                pattern = os.path.join(part_dir, "part-%03d.ogg")
+                try:
+                    result = subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-i",
+                            audio_path,
+                            "-vn",
+                            "-ac",
+                            "1",
+                            "-c:a",
+                            "libopus",
+                            "-b:a",
+                            "64k",
+                            "-vbr",
+                            "on",
+                            "-application",
+                            "voip",
+                            "-f",
+                            "segment",
+                            "-segment_time",
+                            str(segment_seconds),
+                            "-reset_timestamps",
+                            "1",
+                            pattern,
+                            "-y",
+                        ],
+                        capture_output=True,
+                        timeout=300,
+                    )
+                    parts = sorted(
+                        os.path.join(part_dir, name)
+                        for name in os.listdir(part_dir)
+                        if name.endswith(".ogg")
+                    )
+                    if result.returncode == 0 and parts and all(os.path.getsize(part) <= max_bytes for part in parts):
+                        return parts
+                except Exception:
+                    pass
+                segment_seconds = max(5, segment_seconds // 2)
+
+        if os.path.splitext(audio_path)[1].lower() == ".wav":
+            return cls._split_wav_for_discord(audio_path, max_bytes)
+
+        return [audio_path]
+
+    async def _send_discord_audio_file(
+        self,
+        channel,
+        audio_path: str,
+        *,
+        caption: Optional[str] = None,
+    ) -> str:
+        filename = os.path.basename(audio_path)
+        with open(audio_path, "rb") as f:
+            file = discord.File(io.BytesIO(f.read()), filename=filename)
+        msg = await channel.send(content=str(caption or "").strip() or None, file=file)
+        return str(msg.id)
+
     async def send_voice(
         self,
         chat_id: str,
@@ -1034,9 +1218,8 @@ class DiscordAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send audio as a Discord file attachment."""
+        temp_paths: List[str] = []
         try:
-            import io
-
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
@@ -1046,58 +1229,37 @@ class DiscordAdapter(BasePlatformAdapter):
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
 
-            filename = os.path.basename(audio_path)
+            prepared_path = self._transcode_audio_for_discord(audio_path)
+            if prepared_path != audio_path:
+                temp_paths.append(prepared_path)
 
-            with open(audio_path, "rb") as f:
-                file_data = f.read()
+            segment_paths = self._split_audio_for_discord(prepared_path, DISCORD_AUDIO_SAFE_BYTES)
+            for path in segment_paths:
+                if path not in {audio_path, prepared_path}:
+                    temp_paths.append(path)
 
-            # Try sending as a native voice message via raw API (flags=8192).
-            try:
-                import base64
+            message_id = ""
+            total_segments = len(segment_paths)
+            for index, segment_path in enumerate(segment_paths, start=1):
+                segment_caption = None
+                if total_segments > 1:
+                    prefix = f"Audio segment {index}/{total_segments}"
+                    segment_caption = prefix if not caption or index > 1 else f"{caption}\n{prefix}"
+                elif caption:
+                    segment_caption = caption
 
-                duration_secs = 5.0
-                try:
-                    from mutagen.oggopus import OggOpus
-                    info = OggOpus(audio_path)
-                    duration_secs = info.info.length
-                except Exception:
-                    duration_secs = max(1.0, len(file_data) / 2000.0)
-
-                waveform_bytes = bytes([128] * 256)
-                waveform_b64 = base64.b64encode(waveform_bytes).decode()
-
-                import json as _json
-                payload = _json.dumps({
-                    "flags": 8192,
-                    "attachments": [{
-                        "id": "0",
-                        "filename": "voice-message.ogg",
-                        "duration_secs": round(duration_secs, 2),
-                        "waveform": waveform_b64,
-                    }],
-                })
-                form = [
-                    {"name": "payload_json", "value": payload},
-                    {
-                        "name": "files[0]",
-                        "value": file_data,
-                        "filename": "voice-message.ogg",
-                        "content_type": "audio/ogg",
-                    },
-                ]
-                msg_data = await self._client.http.request(
-                    discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id),
-                    form=form,
+                message_id = await self._send_discord_audio_file(
+                    channel,
+                    segment_path,
+                    caption=segment_caption,
                 )
-                return SendResult(success=True, message_id=str(msg_data["id"]))
-            except Exception as voice_err:
-                logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
-                file = discord.File(io.BytesIO(file_data), filename=filename)
-                msg = await channel.send(file=file)
-                return SendResult(success=True, message_id=str(msg.id))
+
+            return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send audio, falling back to base adapter: %s", self.name, e, exc_info=True)
-            return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
+            logger.error("[%s] Failed to send Discord audio: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+        finally:
+            self._cleanup_temp_audio_files(temp_paths, preserve={audio_path})
 
     # ------------------------------------------------------------------
     # Voice channel methods (join / leave / play)

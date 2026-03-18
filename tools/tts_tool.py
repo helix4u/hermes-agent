@@ -531,11 +531,11 @@ def text_to_speech_tool(
     provider = _get_provider(tts_config)
 
     # Detect platform from gateway env var to choose the best output format.
-    # Telegram voice bubbles require Opus (.ogg); OpenAI and ElevenLabs can
-    # produce Opus natively (no ffmpeg needed). Edge and F5 will be converted
-    # with ffmpeg when available.
+    # Telegram and Discord both benefit from compressed audio. OpenAI and
+    # ElevenLabs can produce Opus natively; Edge and F5 can be converted with
+    # ffmpeg when available.
     platform = os.getenv("HERMES_SESSION_PLATFORM", "").lower()
-    want_opus = (platform == "telegram")
+    want_opus = platform in {"telegram", "discord"}
 
     # Determine output path
     if output_path:
@@ -544,8 +544,9 @@ def text_to_speech_tool(
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = Path(DEFAULT_OUTPUT_DIR)
         out_dir.mkdir(parents=True, exist_ok=True)
-        # Use .ogg for Telegram with providers that support native Opus output.
-        # Use .wav for local F5 output, otherwise .mp3.
+        # Use .ogg for platforms that prefer compressed voice/audio output when
+        # providers support native Opus output. Use .wav for local F5 output
+        # before optional conversion, otherwise .mp3.
         if want_opus and provider in ("openai", "elevenlabs"):
             file_path = out_dir / f"tts_{timestamp}.ogg"
         elif provider == "f5":
