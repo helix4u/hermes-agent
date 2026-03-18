@@ -2,7 +2,7 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
-Never make a push to remote without asking me. if it aint tested by a human, it doesnt go.
+Never make a push to remote without asking me. If it ain't tested by a human, it doesnt go.
 
 
 ## Development Environment
