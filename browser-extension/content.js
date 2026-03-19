@@ -1,3 +1,9 @@
+(() => {
+if (globalThis.__hermesSidecarContentInstalled) {
+  return;
+}
+globalThis.__hermesSidecarContentInstalled = true;
+
 function collapseWhitespace(text) {
   return (text || "")
     .replace(/\u00a0/g, " ")
@@ -1206,3 +1212,4 @@ try {
   }
   console.debug("Hermes extension: skipped content listener registration after reload.");
 }
+})();

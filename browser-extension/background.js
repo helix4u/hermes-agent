@@ -1628,9 +1628,6 @@ async function previewPageContext(tabId) {
   }
 
   const onYouTubeWatch = isYouTubeWatchUrl(tabUrl);
-  if (onYouTubeWatch) {
-    await ensureContentScript(tabId);
-  }
   const wantTranscriptForPreview = onYouTubeWatch;
   let context = await collectPageContext(tabId, wantTranscriptForPreview, wantTranscriptForPreview);
   if (!context?.contentKind) {
@@ -1705,10 +1702,6 @@ async function buildPageContextPayload(tabId, message, includeTranscript, browse
     Boolean(includeTranscript) &&
     (preview.transcriptAvailable || onYouTubeWatch) &&
     !preview.transcriptAlreadyShared;
-
-  if (shouldIncludeTranscript && onYouTubeWatch) {
-    await ensureContentScript(tabId);
-  }
 
   let context = await collectPageContext(tabId, shouldIncludeTranscript, true);
   if (!context?.contentKind) {
