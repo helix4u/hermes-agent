@@ -48,6 +48,111 @@ function getCurrentUrl() {
   }
 }
 
+let lastRouteSignalUrl = String(window.location.href || "").trim();
+let lastRouteSignalTitle = String(document.title || "").trim();
+let routeSignalTimer = null;
+let routeWatchInstalled = false;
+let routeWatchIntervalId = null;
+
+function getCurrentContentKind() {
+  if (isYouTubeWatchPage()) {
+    return "youtube-watch";
+  }
+  if (isXOrTwitterHost()) {
+    return "x-feed";
+  }
+  if (isPdfDocumentPage()) {
+    return "pdf-document";
+  }
+  if (getEmbeddedPdfInfo()) {
+    return "pdf-embed";
+  }
+  return "web-page";
+}
+
+function emitRouteChange(reason = "") {
+  const url = String(window.location.href || "").trim();
+  const title = clamp(String(document.title || "").trim(), 512);
+  if (!url) {
+    return;
+  }
+  if (url === lastRouteSignalUrl && title === lastRouteSignalTitle) {
+    return;
+  }
+
+  lastRouteSignalUrl = url;
+  lastRouteSignalTitle = title;
+
+  try {
+    chrome.runtime.sendMessage(
+      {
+        type: "hermes:page-route-changed",
+        url,
+        title,
+        contentKind: getCurrentContentKind(),
+        reason: String(reason || "").trim(),
+        emittedAt: Date.now()
+      },
+      () => {
+        const runtimeError = chrome.runtime?.lastError;
+        if (runtimeError && !isExtensionContextInvalidated(runtimeError)) {
+          console.debug("Hermes extension: failed to report route change", runtimeError);
+        }
+      }
+    );
+  } catch (error) {
+    if (!isExtensionContextInvalidated(error)) {
+      console.debug("Hermes extension: failed to emit route change", error);
+    }
+  }
+}
+
+function scheduleRouteChange(reason = "", delayMs = 180) {
+  if (routeSignalTimer) {
+    clearTimeout(routeSignalTimer);
+  }
+  routeSignalTimer = setTimeout(() => {
+    routeSignalTimer = null;
+    emitRouteChange(reason);
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
+function installRouteWatchers() {
+  if (routeWatchInstalled) {
+    return;
+  }
+  routeWatchInstalled = true;
+
+  const patchHistoryMethod = (methodName) => {
+    const original = history[methodName];
+    if (typeof original !== "function") {
+      return;
+    }
+    history[methodName] = function patchedHistoryMethod(...args) {
+      const result = original.apply(this, args);
+      scheduleRouteChange(`history.${methodName}`, 120);
+      return result;
+    };
+  };
+
+  patchHistoryMethod("pushState");
+  patchHistoryMethod("replaceState");
+
+  window.addEventListener("popstate", () => scheduleRouteChange("popstate", 120), true);
+  window.addEventListener("hashchange", () => scheduleRouteChange("hashchange", 120), true);
+  document.addEventListener("yt-navigate-start", () => scheduleRouteChange("yt-navigate-start", 60), true);
+  document.addEventListener("yt-navigate-finish", () => scheduleRouteChange("yt-navigate-finish", 180), true);
+  document.addEventListener("yt-page-data-updated", () => scheduleRouteChange("yt-page-data-updated", 180), true);
+
+  routeWatchIntervalId = window.setInterval(() => {
+    const currentUrl = String(window.location.href || "").trim();
+    const currentTitle = String(document.title || "").trim();
+    if (currentUrl !== lastRouteSignalUrl || currentTitle !== lastRouteSignalTitle) {
+      scheduleRouteChange("interval", 120);
+    }
+  }, 500);
+}
+
 function isXOrTwitterHost() {
   const url = getCurrentUrl();
   const host = (url?.hostname || "").toLowerCase();
@@ -1075,6 +1180,8 @@ async function collectPageContext(includeTranscriptText, waitForHydration = fals
 }
 
 try {
+  installRouteWatchers();
+
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type !== "hermes:collect-page-context") {
       return false;

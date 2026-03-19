@@ -82,7 +82,6 @@ let pendingAttachments = [];
 let previewPollingEnabled = false;
 let voiceRecordingActive = false;
 let voiceTranscriptionPending = false;
-let lastYouTubePreviewPageKey = "";
 const voiceInputChannel = typeof BroadcastChannel !== "undefined"
   ? new BroadcastChannel("hermes-sidecar-voice-input")
   : null;
@@ -1093,28 +1092,26 @@ function getExtensionContextInvalidatedMessage() {
   );
 }
 
-function getYouTubePreviewPageKey(rawUrl) {
-  try {
-    const url = new URL(String(rawUrl || ""));
-    if (!/(^|\.)youtube\.com$/i.test(url.hostname)) {
-      return "";
+function handleObservedPageRouteChange(message, sender = {}) {
+  const senderTabId = Number(sender?.tab?.id || 0);
+  const senderTabActive = sender?.tab?.active === true;
+  if (senderTabId) {
+    if (activeTabId && senderTabId !== activeTabId && !senderTabActive) {
+      return;
     }
-    if (url.pathname !== "/watch") {
-      return "";
-    }
-    const videoId = String(url.searchParams.get("v") || "").trim();
-    return videoId ? `youtube-watch:${videoId}` : "";
-  } catch (_error) {
-    return "";
+    activeTabId = senderTabId;
   }
-}
 
-function rememberPreviewPageKey(rawUrl) {
-  lastYouTubePreviewPageKey = getYouTubePreviewPageKey(rawUrl);
-}
+  const nextUrl = String(message?.url || sender?.tab?.url || "").trim();
+  if (!nextUrl) {
+    return;
+  }
 
-function clearRememberedYouTubePreviewPage() {
-  lastYouTubePreviewPageKey = "";
+  if (lastPreview?.url && String(lastPreview.url).trim() !== nextUrl && previewPollingEnabled) {
+    setStatus("Detected in-page navigation. Refreshing current page preview...");
+  }
+
+  scheduleRefresh();
 }
 
 function handleExtensionContextInvalidated(error, { openActivity = true } = {}) {
@@ -1798,21 +1795,12 @@ async function refreshPreview({ quiet = false } = {}) {
   let tab = null;
   try {
     tab = await getActiveTab();
-    const activeYouTubePageKey = getYouTubePreviewPageKey(tab?.url || "");
-    if (quiet) {
-      if (!activeYouTubePageKey) {
-        lastYouTubePreviewPageKey = "";
-      } else if (activeYouTubePageKey === lastYouTubePreviewPageKey) {
-        return;
-      }
-    }
     const response = await sendRuntimeMessage({
       type: "hermes:preview-page-context",
       tabId: tab.id
     });
     const preview = response.result || {};
     renderPreview(preview);
-    rememberPreviewPageKey(preview.url || tab?.url || "");
     if (isExtensionsPolicyBlockedMessage(preview.unavailableReason || "")) {
       if (previewPollingEnabled) {
         await setPreviewPollingEnabled(false, { persist: true, quiet: true });
@@ -2368,7 +2356,12 @@ if (voiceInputButton) {
   });
 }
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (message?.type === "hermes:page-route-changed") {
+    handleObservedPageRouteChange(message, sender);
+    return;
+  }
+
   if (message?.type !== "hermes:voice-input-broadcast") {
     return;
   }
@@ -2560,12 +2553,6 @@ chrome.tabs.onActivated.addListener(() => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (tabId === activeTabId && Object.prototype.hasOwnProperty.call(changeInfo || {}, "url")) {
-    const nextPageKey = getYouTubePreviewPageKey(changeInfo.url || "");
-    if (!nextPageKey || nextPageKey !== lastYouTubePreviewPageKey) {
-      clearRememberedYouTubePreviewPage();
-    }
-  }
   if (tabId === activeTabId && (changeInfo.status === "complete" || changeInfo.url)) {
     scheduleRefresh();
   }
