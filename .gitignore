@@ -47,6 +47,7 @@ cli-config.yaml
 
 # Skills Hub state (lives in ~/.hermes/skills/.hub/ at runtime, but just in case)
 skills/.hub/
+skills/media/plex-dj-playlists/local/
 ignored/
 .worktrees/
 environments/benchmarks/evals/

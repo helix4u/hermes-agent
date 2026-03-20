@@ -24,19 +24,29 @@ Credential contract
   - `PLEX_BASE_URL`
   - `PLEX_SERVER_TOKEN`
   - `PLEX_MACHINE_ID`
+- Optional env vars:
+  - `PLEX_PLAYLISTS_FILE` for a local-only JSON file containing named artist lists for static playlist generation
 - Do not hardcode or print tokens in output.
 
 Output location
 - All generated exports go to `HERMES_TMP`.
+
+Private playlist data
+- Personal artist lists must live outside tracked repo content.
+- Default local-only path for static playlists:
+  - `skills/media/plex-dj-playlists/local/playlists.json`
+- A safe checked-in template lives at:
+  - `skills/media/plex-dj-playlists/playlists.example.json`
 
 Music workflow
 
 A) Static multi-playlist builder (artist list based)
 1. Export tracks:
    - `python skills/media/plex-dj-playlists/scripts/plex_export_library.py`
-2. Build predefined playlists from that export:
+2. Create your local playlist JSON by copying the example file to `skills/media/plex-dj-playlists/local/playlists.json`, or point `PLEX_PLAYLISTS_FILE` at another private JSON file.
+3. Build predefined playlists from that export:
    - `python skills/media/plex-dj-playlists/scripts/plex_make_playlists.py --tracks TMP/plex-dj-playlists/<export-file>.json`
-3. Existing playlists with matching names are deleted and recreated for deterministic results.
+4. Existing playlists with matching names are deleted and recreated for deterministic results.
 
 B) Dynamic style-cue playlist builder (preferred for Plexamp voice requests)
 1. Create or replace one music playlist from free-form cues:

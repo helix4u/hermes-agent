@@ -29,6 +29,13 @@ def get_env(name: str) -> str:
     return val
 
 
+def get_optional_env(name: str) -> str | None:
+    val = os.environ.get(name)
+    if not val:
+        return None
+    return val
+
+
 def request(url: str, method: str = "GET") -> bytes:
     req = urllib.request.Request(url, method=method)
     with urllib.request.urlopen(req, timeout=120) as r:
@@ -101,35 +108,66 @@ def create_playlist(base: str, token: str, machine: str, name: str, keys: list[s
     return len(keys)
 
 
+def load_playlists(path: Path, example_path: Path | None = None) -> dict[str, list[str]]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except FileNotFoundError as exc:
+        message = f"Playlist file not found: {path}"
+        if example_path is not None:
+            message += f". Copy {example_path} to {path} and customize it, or pass --playlists-file."
+        raise SystemExit(message) from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Playlist file is not valid JSON: {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise SystemExit(f"Playlist file must contain a JSON object mapping playlist names to artist lists: {path}")
+
+    playlists: dict[str, list[str]] = {}
+    for name, artists in data.items():
+        if not isinstance(name, str) or not name.strip():
+            raise SystemExit(f"Playlist names must be non-empty strings: {path}")
+        if not isinstance(artists, list) or not all(isinstance(artist, str) and artist.strip() for artist in artists):
+            raise SystemExit(f"Playlist '{name}' must map to a JSON array of non-empty artist strings: {path}")
+        playlists[name] = artists
+
+    if not playlists:
+        raise SystemExit(f"Playlist file is empty: {path}")
+
+    return playlists
+
+
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[4]
+    skill_root = Path(__file__).resolve().parents[1]
     load_env_file(repo_root / ".env")
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--tracks", required=True, help="Path to exported track JSON")
     ap.add_argument("--max-per-artist", type=int, default=4)
     ap.add_argument("--max-tracks", type=int, default=30)
+    ap.add_argument(
+        "--playlists-file",
+        help="Path to JSON file mapping playlist names to artist lists. "
+        "Defaults to PLEX_PLAYLISTS_FILE or skills/media/plex-dj-playlists/local/playlists.json.",
+    )
     args = ap.parse_args()
 
     base = get_env("PLEX_BASE_URL")
     token = get_env("PLEX_SERVER_TOKEN")
     machine = get_env("PLEX_MACHINE_ID")
+    example_playlists_file = skill_root / "playlists.example.json"
+    playlists_file = Path(
+        args.playlists_file
+        or get_optional_env("PLEX_PLAYLISTS_FILE")
+        or (skill_root / "local" / "playlists.json")
+    ).expanduser()
 
     with open(args.tracks, "r", encoding="utf-8", errors="replace") as f:
         tracks = json.load(f)
 
     by_artist = build_artist_index(tracks)
-
-    playlists = {
-        "Good Mood Songs": ["gorillaz", "sublime", "beastie boys", "twenty one pilots", "polyphia", "coheed and cambria", "son lux", "tom waits", "modest mouse"],
-        "Check These Gems Out": ["the mars volta", "aesop rock", "the dresden dolls", "ren", "polyphia", "coheed and cambria", "tom waits", "sigur ros", "kings of convenience", "bright eyes", "conor oberst", "dashboard confessional", "queens of the stone age", "deftones", "portishead", "massive attack", "modest mouse"],
-        "Melancholy Songs": ["sigur ros", "kings of convenience", "son lux", "tom waits", "ren", "bright eyes", "conor oberst", "dashboard confessional", "portishead", "massive attack", "modest mouse"],
-        "Songs to Sleep To": ["sigur ros", "kings of convenience", "son lux", "tom waits", "bright eyes", "conor oberst", "portishead"],
-        "Songs to Wake You Up": ["the prodigy", "rage against the machine", "twenty one pilots", "polyphia", "aesop rock", "coheed and cambria", "queens of the stone age", "deftones"],
-        "Songs to Rage Out To": ["rage against the machine", "the prodigy", "aesop rock", "ren", "the mars volta", "coheed and cambria", "queens of the stone age", "deftones"],
-        "Songs for Driving Fast": ["the prodigy", "polyphia", "rage against the machine", "coheed and cambria", "gorillaz", "twenty one pilots", "queens of the stone age", "deftones"],
-        "Calm Sunday Drives": ["kings of convenience", "sigur ros", "sublime", "tom waits", "son lux", "bright eyes", "conor oberst", "dashboard confessional", "modest mouse"],
-    }
+    playlists = load_playlists(playlists_file, example_playlists_file)
 
     delete_existing(base, token, list(playlists.keys()))
 
