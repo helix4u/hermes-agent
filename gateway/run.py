@@ -6407,8 +6407,44 @@ class GatewayRunner:
             if not adapter:
                 return
 
+            def _is_retryable_progress_edit_error(error_text: str | None) -> bool:
+                """Treat transport/server issues as transient so we keep one live message."""
+                err = (error_text or "").lower()
+                permanent_markers = (
+                    "unknown message",
+                    "not found",
+                    "forbidden",
+                    "missing access",
+                    "missing permissions",
+                    "cannot edit",
+                    "error code: 10008",
+                    "error code: 50013",
+                )
+                if any(marker in err for marker in permanent_markers):
+                    return False
+                transient_markers = (
+                    "503",
+                    "502",
+                    "504",
+                    "service unavailable",
+                    "gateway timeout",
+                    "upstream connect error",
+                    "remote connection failure",
+                    "reset before headers",
+                    "timeout",
+                    "timed out",
+                    "temporarily unavailable",
+                    "connection reset",
+                    "try again",
+                    "rate limit",
+                    "429",
+                )
+                if any(marker in err for marker in transient_markers):
+                    return True
+                # Default to retryable so one flaky edit does not fan out into message spam.
+                return True
+
             progress_msg_id = None
-            can_edit = True
             last_rendered = ""
             last_emit_at = 0.0
 
@@ -6434,21 +6470,25 @@ class GatewayRunner:
 
                     msg = _build_progress_message()
                     if progress_style == "single":
-                        if can_edit and progress_msg_id is not None:
+                        result = None
+                        if progress_msg_id is not None:
                             result = await adapter.edit_message(
                                 chat_id=source.chat_id,
                                 message_id=progress_msg_id,
                                 content=msg,
                             )
                             if not result.success:
-                                can_edit = False
-                                result = await adapter.send(
-                                    chat_id=source.chat_id,
-                                    content=msg,
-                                    metadata=_progress_metadata,
-                                )
-                                if result.success and result.message_id:
-                                    progress_msg_id = result.message_id
+                                if _is_retryable_progress_edit_error(result.error):
+                                    logger.warning(
+                                        "Transient progress edit failure for %s message %s; preserving single-message mode: %s",
+                                        source.platform,
+                                        progress_msg_id,
+                                        result.error,
+                                    )
+                                    last_emit_at = now
+                                    await asyncio.sleep(0.25)
+                                    continue
+                                progress_msg_id = None
                         else:
                             result = await adapter.send(
                                 chat_id=source.chat_id,
@@ -6457,19 +6497,28 @@ class GatewayRunner:
                             )
                             if result.success and result.message_id:
                                 progress_msg_id = result.message_id
+                        if progress_msg_id is None and (result is None or not result.success):
+                            result = await adapter.send(
+                                chat_id=source.chat_id,
+                                content=msg,
+                                metadata=_progress_metadata,
+                            )
+                            if result.success and result.message_id:
+                                progress_msg_id = result.message_id
                     else:
-                        await adapter.send(
+                        result = await adapter.send(
                             chat_id=source.chat_id,
                             content=msg,
                             metadata=_progress_metadata,
                         )
 
-                    last_rendered = msg
+                    if result is None or result.success:
+                        last_rendered = msg
                     last_emit_at = now
                     await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
                     await asyncio.sleep(0.25)
                 except asyncio.CancelledError:
-                    if can_edit and progress_msg_id and last_rendered:
+                    if progress_msg_id and last_rendered:
                         try:
                             await adapter.edit_message(
                                 chat_id=source.chat_id,

@@ -54,6 +54,32 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class TransientEditFailureAdapter(ProgressCaptureAdapter):
+    def __init__(self):
+        super().__init__()
+        self._edit_attempts = 0
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self._edit_attempts += 1
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+            }
+        )
+        if self._edit_attempts == 1:
+            return SendResult(
+                success=False,
+                message_id=message_id,
+                error=(
+                    "503 Service Unavailable (error code: 0): upstream connect error "
+                    "or disconnect/reset before headers"
+                ),
+            )
+        return SendResult(success=True, message_id=message_id)
+
+
 class FakeAgent:
     def __init__(self, **kwargs):
         self.tool_progress_callback = kwargs["tool_progress_callback"]
@@ -131,3 +157,42 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     assert first["metadata"] == {"tool_progress": True, "thread_id": "17585"}
     assert adapter.edits
     assert all(call["metadata"] == {"tool_progress": True, "thread_id": "17585"} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_progress_keeps_single_message_on_transient_edit_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = TransientEditFailureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-1",
+        session_key="agent:main:telegram:group:-1001:17585",
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    assert len(adapter.edits) >= 2
+    assert all(edit["message_id"] == "progress-1" for edit in adapter.edits)
