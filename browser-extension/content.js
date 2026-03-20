@@ -31,6 +31,32 @@ function isExtensionContextInvalidated(error) {
   );
 }
 
+function getRuntimeSafely() {
+  try {
+    return globalThis.chrome?.runtime || null;
+  } catch (error) {
+    if (isExtensionContextInvalidated(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function getRuntimeLastErrorSafely() {
+  const runtime = getRuntimeSafely();
+  if (!runtime) {
+    return null;
+  }
+  try {
+    return runtime.lastError || null;
+  } catch (error) {
+    if (isExtensionContextInvalidated(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
 function getMetaValue(selectors) {
   for (const selector of selectors) {
     const element = document.querySelector(selector);
@@ -79,7 +105,11 @@ function getCurrentContentKind() {
 function emitRouteChange(reason = "") {
   const url = String(window.location.href || "").trim();
   const title = clamp(String(document.title || "").trim(), 512);
+  const runtime = getRuntimeSafely();
   if (!url) {
+    return;
+  }
+  if (!runtime) {
     return;
   }
   if (url === lastRouteSignalUrl && title === lastRouteSignalTitle) {
@@ -90,7 +120,7 @@ function emitRouteChange(reason = "") {
   lastRouteSignalTitle = title;
 
   try {
-    chrome.runtime.sendMessage(
+    runtime.sendMessage(
       {
         type: "hermes:page-route-changed",
         url,
@@ -100,9 +130,15 @@ function emitRouteChange(reason = "") {
         emittedAt: Date.now()
       },
       () => {
-        const runtimeError = chrome.runtime?.lastError;
-        if (runtimeError && !isExtensionContextInvalidated(runtimeError)) {
-          console.debug("Hermes extension: failed to report route change", runtimeError);
+        try {
+          const runtimeError = getRuntimeLastErrorSafely();
+          if (runtimeError && !isExtensionContextInvalidated(runtimeError)) {
+            console.debug("Hermes extension: failed to report route change", runtimeError);
+          }
+        } catch (error) {
+          if (!isExtensionContextInvalidated(error)) {
+            console.debug("Hermes extension: failed to read route change response", error);
+          }
         }
       }
     );
@@ -1188,7 +1224,13 @@ async function collectPageContext(includeTranscriptText, waitForHydration = fals
 try {
   installRouteWatchers();
 
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  const runtime = getRuntimeSafely();
+  if (!runtime) {
+    // Extension was reloaded/unpacked update happened; skip listener wiring quietly.
+    return;
+  }
+
+  runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type !== "hermes:collect-page-context") {
       return false;
     }
