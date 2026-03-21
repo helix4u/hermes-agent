@@ -82,6 +82,47 @@ def check_discord_requirements() -> bool:
     return DISCORD_AVAILABLE
 
 
+def _find_opus_library_path() -> Optional[str]:
+    """Locate an Opus shared library path for discord.py voice support."""
+    import ctypes.util
+
+    opus_path = ctypes.util.find_library("opus")
+    if opus_path:
+        return opus_path
+
+    # ctypes.util.find_library fails on macOS with Homebrew-installed libs,
+    # so fall back to known Homebrew paths if needed.
+    _homebrew_paths = (
+        "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
+        "/usr/local/lib/libopus.dylib",     # Intel Mac
+    )
+    if sys.platform == "darwin":
+        for _hp in _homebrew_paths:
+            if os.path.isfile(_hp):
+                return _hp
+
+    # On Windows, discord.py often bundles libopus alongside the package.
+    # Prefer those DLLs before giving up, since find_library() commonly
+    # returns None even when the bundled codec is present.
+    if sys.platform == "win32" and discord is not None:
+        discord_pkg_dir = Path(getattr(discord, "__file__", "")).resolve().parent
+        candidates = [
+            discord_pkg_dir / "bin" / "libopus-0.x64.dll",
+            discord_pkg_dir / "bin" / "libopus-0.x86.dll",
+        ]
+        try:
+            av_libs_dir = discord_pkg_dir.parent / "av.libs"
+            if av_libs_dir.is_dir():
+                candidates.extend(sorted(av_libs_dir.glob("libopus-*.dll")))
+        except Exception:
+            pass
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+
+    return None
+
+
 class VoiceReceiver:
     """Captures and decodes voice audio from a Discord voice channel.
 
@@ -533,21 +574,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Load opus codec for voice channel support
         if not discord.opus.is_loaded():
-            import ctypes.util
-            opus_path = ctypes.util.find_library("opus")
-            # ctypes.util.find_library fails on macOS with Homebrew-installed libs,
-            # so fall back to known Homebrew paths if needed.
-            if not opus_path:
-                import sys
-                _homebrew_paths = (
-                    "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
-                    "/usr/local/lib/libopus.dylib",     # Intel Mac
-                )
-                if sys.platform == "darwin":
-                    for _hp in _homebrew_paths:
-                        if os.path.isfile(_hp):
-                            opus_path = _hp
-                            break
+            opus_path = _find_opus_library_path()
             if opus_path:
                 try:
                     discord.opus.load_opus(opus_path)

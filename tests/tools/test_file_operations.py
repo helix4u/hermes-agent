@@ -311,6 +311,53 @@ class TestShellFileOpsHelpers:
         assert result.matches[0].path == str(sample)
         assert result.matches[0].line_number == 2
 
+    def test_search_content_windows_local_backend_skips_hidden_dirs_and_binary_files(self, tmp_path):
+        visible = tmp_path / "notes.txt"
+        visible.write_text("hello hermes_cli\n", encoding="utf-8")
+
+        hidden_dir = tmp_path / ".git"
+        hidden_dir.mkdir()
+        (hidden_dir / "index").write_text("hermes_cli\n", encoding="utf-8")
+
+        binary_file = tmp_path / "cache.bin"
+        binary_file.write_bytes(b"hermes_cli\x00\x01\x02")
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        result = ops.search("hermes_cli", path=str(tmp_path), output_mode="files_only")
+
+        assert result.error is None
+        assert result.files == [str(visible)]
+        assert result.total_count == 1
+
+    def test_search_files_windows_local_backend_skips_hidden_dirs(self, tmp_path):
+        visible_dir = tmp_path / "pkg"
+        visible_dir.mkdir()
+        visible_file = visible_dir / "a.py"
+        visible_file.write_text("print('a')\n", encoding="utf-8")
+
+        hidden_dir = tmp_path / ".git"
+        hidden_dir.mkdir()
+        (hidden_dir / "hidden.py").write_text("print('hidden')\n", encoding="utf-8")
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        result = ops.search("*.py", path=str(tmp_path), target="files")
+
+        assert result.error is None
+        assert result.files == [str(visible_file)]
+        assert result.total_count == 1
+
     def test_write_file_windows_local_backend(self, tmp_path):
         env = MagicMock()
         env.cwd = str(tmp_path)

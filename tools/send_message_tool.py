@@ -286,7 +286,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # Platform message length limits (from adapter class attributes)
     _MAX_LENGTHS = {
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH,
-        Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
+        # Detached sends should mirror the gateway's embed-based Discord path,
+        # which is constrained by embed description length rather than the
+        # plain-message 2000-character limit.
+        Platform.DISCORD: DiscordAdapter.MAX_EMBED_DESCRIPTION,
         Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
     }
 
@@ -480,10 +483,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 
 
 async def _send_discord(token, chat_id, message):
-    """Send a single message via Discord REST API (no websocket client needed).
-
-    Chunking is handled by _send_to_platform() before this is called.
-    """
+    """Send a single Discord message via REST using the normal embed format."""
     try:
         import aiohttp
     except ImportError:
@@ -494,7 +494,10 @@ async def _send_discord(token, chat_id, message):
         if not message:
             return {"error": "Discord send failed: message is empty"}
         async with aiohttp.ClientSession() as session:
-            payload = {"content": message, "allowed_mentions": {"parse": []}}
+            payload = {
+                "embeds": [{"description": message}],
+                "allowed_mentions": {"parse": []},
+            }
             async with session.post(url, headers=headers, json=payload) as resp:
                 if resp.status not in (200, 201):
                     body = await resp.text()

@@ -1099,8 +1099,11 @@ class ShellFileOperations(FileOperations):
                 if fnmatch.fnmatch(os.path.basename(base_path), search_pattern):
                     matches = [base_path]
             else:
-                for root, _, files in os.walk(base_path):
+                for root, dirs, files in os.walk(base_path):
+                    dirs[:] = [name for name in dirs if not name.startswith(".")]
                     for name in files:
+                        if name.startswith("."):
+                            continue
                         full = os.path.join(root, name)
                         if fnmatch.fnmatch(name, search_pattern):
                             matches.append((full, os.path.getmtime(full)))
@@ -1120,11 +1123,22 @@ class ShellFileOperations(FileOperations):
             files_to_scan = [base_path]
         else:
             files_to_scan = []
-            for root, _, files in os.walk(base_path):
+            for root, dirs, files in os.walk(base_path):
+                # Mirror ripgrep's default behavior on Windows: don't descend
+                # into hidden dot-directories like .git or .venv.
+                dirs[:] = [name for name in dirs if not name.startswith(".")]
                 for name in files:
+                    if name.startswith("."):
+                        continue
                     if file_glob and not fnmatch.fnmatch(name, file_glob):
                         continue
-                    files_to_scan.append(os.path.join(root, name))
+                    full_path = os.path.join(root, name)
+                    # Avoid chewing through binary blobs and git pack/index
+                    # files when the local Windows backend falls back to the
+                    # native Python search path.
+                    if self._is_likely_binary(full_path):
+                        continue
+                    files_to_scan.append(full_path)
 
         content_matches = []
         files_only = set()
