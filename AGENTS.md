@@ -2,7 +2,7 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
-Never make a push to remote without asking me. If it ain't tested by a human, it doesnt go.
+Never push to a remote unless the user explicitly asks. Human testing is required before pushing. If the user asks to push, treat that as confirmation that the required human testing has been completed. Do not ask them to test again or treat testing as a blocker.
 
 
 ## Development Environment
