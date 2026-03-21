@@ -155,6 +155,66 @@ class TestDeliverResultMirrorLogging:
             thread_id="17585",
         )
 
+    def test_delivery_attempt_and_success_are_logged(self, caplog):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.token = "***"
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        job = {
+            "id": "test-job",
+            "deliver": "origin",
+            "origin": {
+                "platform": "discord",
+                "chat_id": "123456789012345678",
+            },
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.mirror.mirror_to_session"):
+            with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+                _deliver_result(job, "hello from cron")
+
+        messages = [record.message for record in caplog.records]
+        assert any("attempting delivery to discord:123456789012345678" in msg for msg in messages)
+        assert any("delivered to discord:123456789012345678" in msg for msg in messages)
+
+    def test_delivery_error_logs_target_label(self, caplog):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.token = "***"
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        job = {
+            "id": "test-job",
+            "deliver": "origin",
+            "origin": {
+                "platform": "discord",
+                "chat_id": "123456789012345678",
+            },
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new=AsyncMock(return_value={"error": "Discord API error (403): Missing Access"}),
+             ):
+            with caplog.at_level(logging.ERROR, logger="cron.scheduler"):
+                _deliver_result(job, "hello from cron")
+
+        messages = [record.message for record in caplog.records]
+        assert any(
+            "delivery error to discord:123456789012345678: Discord API error (403): Missing Access" in msg
+            for msg in messages
+        )
+
 
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):

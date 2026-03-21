@@ -126,6 +126,9 @@ def _deliver_result(job: dict, content: str) -> None:
     platform_name = target["platform"]
     chat_id = target["chat_id"]
     thread_id = target.get("thread_id")
+    target_label = f"{platform_name}:{chat_id}"
+    if thread_id is not None:
+        target_label += f":{thread_id}"
 
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
@@ -148,6 +151,14 @@ def _deliver_result(job: dict, content: str) -> None:
         logger.warning("Job '%s': unknown platform '%s' for delivery", job["id"], platform_name)
         return
 
+    logger.info(
+        "Job '%s': attempting delivery to %s (deliver=%s, chars=%d)",
+        job["id"],
+        target_label,
+        job.get("deliver", "local"),
+        len(str(content or "")),
+    )
+
     try:
         config = load_gateway_config()
     except Exception as e:
@@ -156,7 +167,13 @@ def _deliver_result(job: dict, content: str) -> None:
 
     pconfig = config.platforms.get(platform)
     if not pconfig or not pconfig.enabled:
-        logger.warning("Job '%s': platform '%s' not configured/enabled", job["id"], platform_name)
+        logger.warning(
+            "Job '%s': platform '%s' not configured/enabled (enabled=%s, has_token=%s)",
+            job["id"],
+            platform_name,
+            bool(pconfig and pconfig.enabled),
+            bool(getattr(pconfig, "token", None)),
+        )
         return
 
     # Run the async send in a fresh event loop (safe from any thread)
@@ -170,13 +187,13 @@ def _deliver_result(job: dict, content: str) -> None:
             future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, content, thread_id=thread_id))
             result = future.result(timeout=30)
     except Exception as e:
-        logger.error("Job '%s': delivery to %s:%s failed: %s", job["id"], platform_name, chat_id, e)
+        logger.error("Job '%s': delivery to %s failed: %s", job["id"], target_label, e)
         return
 
     if result and result.get("error"):
-        logger.error("Job '%s': delivery error: %s", job["id"], result["error"])
+        logger.error("Job '%s': delivery error to %s: %s", job["id"], target_label, result["error"])
     else:
-        logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+        logger.info("Job '%s': delivered to %s", job["id"], target_label)
         # Mirror the delivered content into the target's gateway session
         try:
             from gateway.mirror import mirror_to_session
@@ -533,6 +550,11 @@ def tick(verbose: bool = True) -> int:
                 if should_deliver and success and deliver_content.strip().upper().startswith(SILENT_MARKER):
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
+                elif not should_deliver:
+                    logger.info(
+                        "Job '%s': no delivery attempted because final response was empty",
+                        job["id"],
+                    )
 
                 if should_deliver:
                     try:

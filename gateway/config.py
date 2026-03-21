@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Any
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
+from hermes_cli.env_loader import load_hermes_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -393,6 +394,13 @@ def load_gateway_config() -> GatewayConfig:
     _home = get_hermes_home()
     gw_data: dict = {}
 
+    # Detached entrypoints like cron delivery may load gateway config without
+    # going through gateway.run, so bootstrap Hermes env files here as well.
+    load_hermes_dotenv(
+        hermes_home=_home,
+        project_env=Path(__file__).resolve().parents[1] / ".env",
+    )
+
     # Legacy fallback: gateway.json provides the base layer.
     # config.yaml keys always win when both specify the same setting.
     gateway_json_path = _home / "gateway.json"
@@ -768,6 +776,5 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.default_reset_policy.at_hour = int(reset_hour)
         except ValueError:
             pass
-
 
 
