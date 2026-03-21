@@ -409,10 +409,30 @@ def create_job(
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get a job by ID."""
+    resolved_job_id = _resolve_job_id(job_id)
+    if not resolved_job_id:
+        return None
     jobs = load_jobs()
     for job in jobs:
-        if job["id"] == job_id:
+        if job["id"] == resolved_job_id:
             return _apply_skill_fields(job)
+    return None
+
+
+def _resolve_job_id(job_id: str) -> Optional[str]:
+    """Resolve an exact or unique-prefix job ID to the stored canonical ID."""
+    lookup = str(job_id or "").strip()
+    if not lookup:
+        return None
+
+    jobs = load_jobs()
+    exact = next((job["id"] for job in jobs if job.get("id") == lookup), None)
+    if exact:
+        return exact
+
+    matches = [job["id"] for job in jobs if str(job.get("id") or "").startswith(lookup)]
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 
@@ -426,9 +446,12 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
+    resolved_job_id = _resolve_job_id(job_id)
+    if not resolved_job_id:
+        return None
     jobs = load_jobs()
     for i, job in enumerate(jobs):
-        if job["id"] != job_id:
+        if job["id"] != resolved_job_id:
             continue
 
         updated = _apply_skill_fields({**job, **updates})
@@ -508,9 +531,12 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID."""
+    resolved_job_id = _resolve_job_id(job_id)
+    if not resolved_job_id:
+        return False
     jobs = load_jobs()
     original_len = len(jobs)
-    jobs = [j for j in jobs if j["id"] != job_id]
+    jobs = [j for j in jobs if j["id"] != resolved_job_id]
     if len(jobs) < original_len:
         save_jobs(jobs)
         return True

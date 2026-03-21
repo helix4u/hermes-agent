@@ -1838,6 +1838,45 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("Discord followup failed: %s", e)
 
+    async def _cron_job_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> List[Any]:
+        """Return Discord autocomplete choices for cron job selectors."""
+        del interaction  # unused for now; keep signature compatible with discord.py
+
+        choice_cls = getattr(getattr(discord, "app_commands", None), "Choice", None)
+        if choice_cls is None:
+            return []
+
+        try:
+            from cron.jobs import list_jobs
+            jobs = list_jobs(include_disabled=True)
+        except Exception:
+            return []
+
+        needle = str(current or "").strip().lower()
+        choices: List[Any] = []
+        for job in jobs:
+            job_id = str(job.get("id") or "").strip()
+            if not job_id:
+                continue
+            name = str(job.get("name") or "(unnamed)").strip()
+            state = str(job.get("state") or ("scheduled" if job.get("enabled", True) else "paused")).strip()
+            schedule = str(job.get("schedule_display") or job.get("schedule") or "").strip()
+            haystack = " ".join(part for part in (job_id, name, state, schedule) if part).lower()
+            if needle and needle not in haystack:
+                continue
+
+            label = f"{name} [{state}] ({job_id})"
+            if len(label) > 100:
+                label = label[:97] + "..."
+            choices.append(choice_cls(name=label, value=job_id))
+            if len(choices) >= 25:
+                break
+        return choices
+
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
         if not self._client:
@@ -1922,6 +1961,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     followup_msg=None,
                     delete_original=True,
                 )
+            autocomplete = getattr(discord.app_commands, "autocomplete", None)
+            if autocomplete is not None:
+                slash_cron_remove = autocomplete(job_id=self._cron_job_autocomplete)(slash_cron_remove)
 
             @cron.command(name="run", description="Run one cron job immediately")
             @discord.app_commands.describe(job_id="Job ID from /cron list")
@@ -1932,6 +1974,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     followup_msg=None,
                     delete_original=True,
                 )
+            if autocomplete is not None:
+                slash_cron_run = autocomplete(job_id=self._cron_job_autocomplete)(slash_cron_run)
 
             if hasattr(tree, "add_command"):
                 tree.add_command(cron)

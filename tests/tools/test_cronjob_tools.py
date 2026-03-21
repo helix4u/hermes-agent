@@ -306,6 +306,14 @@ class TestUnifiedCronjobTool:
         assert resumed["success"] is True
         assert resumed["job"]["state"] == "scheduled"
 
+    def test_run_accepts_unique_prefix(self):
+        created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+        short_id = created["job_id"][:8]
+
+        triggered = json.loads(cronjob(action="run", job_id=short_id))
+        assert triggered["success"] is True
+        assert triggered["job"]["job_id"] == created["job_id"]
+
     def test_update_schedule_recomputes_display(self):
         created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
         job_id = created["job_id"]

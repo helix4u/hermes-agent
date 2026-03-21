@@ -678,6 +678,28 @@ class _EncodingSafeStream:
         return getattr(self._stream, name)
 
 
+_gateway_console_progress_lock = threading.Lock()
+
+
+def _write_gateway_console_progress_line(text: str) -> None:
+    """Best-effort direct console mirror for live gateway progress updates."""
+    line = str(text or "").rstrip()
+    if not line:
+        return
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return
+    safe_stream = stream
+    if os.name == "nt":
+        safe_stream = _EncodingSafeStream(stream)
+    try:
+        with _gateway_console_progress_lock:
+            safe_stream.write(line + "\n")
+            safe_stream.flush()
+    except Exception:
+        pass
+
+
 def _harden_windows_console_logging() -> None:
     """Prevent logging UnicodeEncodeError on legacy Windows console codepages."""
     if os.name != "nt":
@@ -3915,6 +3937,256 @@ class GatewayRunner:
             pass
         return "\n".join(lines)
 
+    async def _run_cron_job_interactive(self, job: dict, source: SessionSource) -> None:
+        """Execute a cron job immediately and stream progress back to the source chat."""
+        from cron.jobs import mark_job_run, save_job_output
+        from cron.scheduler import SILENT_MARKER, _deliver_result, _resolve_delivery_target, run_job
+        import queue
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.warning("Interactive cron run requested for %s but no adapter is connected", source.platform)
+            return
+
+        progress_queue = queue.Queue()
+        last_tool = [None]
+        progress_state = {
+            "started_at": time.monotonic(),
+            "phase": "thinking",
+            "last_detail": f"Queued cron job {job.get('name', job.get('id', '?'))}...",
+            "tool_calls": 0,
+            "updates": 0,
+            "recent_events": [],
+        }
+
+        def _push_recent_event(detail: str) -> None:
+            text = (detail or "").strip()
+            if not text:
+                return
+            ts = datetime.now().strftime("%H:%M:%S")
+            event_line = f"`{ts}` {text}"
+            recent_events = progress_state.setdefault("recent_events", [])
+            if recent_events and recent_events[-1] == event_line:
+                return
+            recent_events.append(event_line)
+            while len(recent_events) > 4:
+                recent_events.pop(0)
+
+        def _set_progress_state(*, phase: str | None = None, detail: str | None = None, tool_call: bool = False) -> None:
+            if phase:
+                progress_state["phase"] = phase
+            if detail:
+                progress_state["last_detail"] = detail
+                _push_recent_event(detail)
+            if tool_call:
+                progress_state["tool_calls"] += 1
+            progress_state["updates"] += 1
+            progress_queue.put("__tick__")
+
+        _set_progress_state(
+            phase="starting",
+            detail=f"Starting cron job {job.get('name', job.get('id', '?'))}...",
+        )
+
+        def _summarize_result_for_status(result_text: str, is_error: bool) -> str:
+            text = (result_text or "").strip()
+            if not text:
+                return ""
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return text if is_error else ""
+
+            if isinstance(parsed, dict):
+                parts: list[str] = []
+                status = str(parsed.get("status") or "").strip()
+                details = str(parsed.get("details") or "").strip()
+                if status:
+                    parts.append(f"status={status}")
+                if details:
+                    parts.append(details)
+                if "exit_code" in parsed:
+                    parts.append(f"exit={parsed.get('exit_code')}")
+                err = parsed.get("error")
+                if err:
+                    parts.append(f"error={err}")
+                stderr = parsed.get("stderr")
+                if not err and is_error and isinstance(stderr, str) and stderr.strip():
+                    parts.append(f"stderr={stderr.strip()}")
+                return " | ".join(parts)
+            return text if is_error else ""
+
+        def _build_progress_message() -> str:
+            elapsed = int(max(0, time.monotonic() - progress_state["started_at"]))
+            phase = progress_state.get("phase", "thinking")
+            phase_label = {
+                "starting": "starting",
+                "thinking": "thinking",
+                "tool": "running tools",
+                "finalizing": "finalizing",
+            }.get(phase, "working")
+            phase_emoji = {
+                "starting": "🚀",
+                "thinking": "💡",
+                "tool": "🛠️",
+                "finalizing": "🧾",
+            }.get(phase, "⚙️")
+            header = f"{phase_emoji} Hermes is {phase_label} on cron job `{job.get('id', '?')}`... ({elapsed}s)"
+            footer = f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
+            events = list(progress_state.get("recent_events") or [])
+            if not events:
+                fallback = (progress_state.get("last_detail") or "Working...").strip()
+                events = [f"`{datetime.now().strftime('%H:%M:%S')}` {fallback}"]
+            body = "\n".join(f"• {line}" for line in events[-4:])
+            return f"{header}\n{body}\n{footer}"
+
+        def progress_callback(tool_name: str, preview: str = None, args: dict = None) -> None:
+            if tool_name == "_tool_result":
+                payload = args or {}
+                completed_tool = str(payload.get("tool") or preview or "tool")
+                duration = payload.get("duration_seconds")
+                is_error = bool(payload.get("is_error"))
+                status_suffix = str(payload.get("status_suffix") or "").strip()
+                result_text = str(payload.get("result") or "").strip()
+                status_emoji = "❌" if is_error else "✅"
+                duration_text = f" in {float(duration):.2f}s" if isinstance(duration, (int, float)) else ""
+                detail = f"{status_emoji} {completed_tool} finished{duration_text}"
+                if status_suffix:
+                    detail = f"{detail} {status_suffix}"
+                summary_suffix = _summarize_result_for_status(result_text, is_error)
+                if summary_suffix:
+                    detail = f"{detail} | {summary_suffix}"
+                _set_progress_state(phase="tool", detail=detail, tool_call=False)
+                return
+
+            if tool_name == last_tool[0] and tool_name != "_thinking":
+                return
+            last_tool[0] = tool_name
+
+            from agent.display import get_tool_emoji
+            emoji = get_tool_emoji(tool_name, default="⚙️")
+            if tool_name == "_thinking":
+                _set_progress_state(phase="thinking", detail=f"💡 thinking: {preview or 'working...'}")
+                return
+            if preview:
+                if len(preview) > 80:
+                    preview = preview[:77] + "..."
+                detail = f"{emoji} {tool_name}: \"{preview}\""
+            else:
+                detail = f"{emoji} {tool_name}..."
+            _set_progress_state(phase="tool", detail=detail, tool_call=True)
+
+        def progress_thinking_callback(text: str) -> None:
+            cleaned = str(text or "").strip()
+            if cleaned:
+                progress_callback("_thinking", cleaned)
+
+        progress_metadata = {"tool_progress": True}
+        if source.thread_id:
+            progress_metadata["thread_id"] = source.thread_id
+
+        async def send_progress_messages() -> None:
+            progress_msg_id = None
+            last_rendered = ""
+            while True:
+                try:
+                    updated = False
+                    while True:
+                        try:
+                            progress_queue.get_nowait()
+                            updated = True
+                        except queue.Empty:
+                            break
+                    if not updated and progress_state["updates"] <= 0:
+                        await asyncio.sleep(0.25)
+                        continue
+                    msg = _build_progress_message()
+                    if progress_msg_id is not None:
+                        result = await adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=progress_msg_id,
+                            content=msg,
+                        )
+                        if not result.success:
+                            progress_msg_id = None
+                    if progress_msg_id is None:
+                        result = await adapter.send(
+                            chat_id=source.chat_id,
+                            content=msg,
+                            metadata=progress_metadata,
+                        )
+                        if result.success and result.message_id:
+                            progress_msg_id = result.message_id
+                    last_rendered = msg
+                    await adapter.send_typing(source.chat_id, metadata=progress_metadata)
+                    await asyncio.sleep(0.25)
+                except asyncio.CancelledError:
+                    if progress_msg_id and last_rendered:
+                        with contextlib.suppress(Exception):
+                            await adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=progress_msg_id,
+                                content=last_rendered,
+                            )
+                    return
+                except Exception as exc:
+                    logger.error("Interactive cron progress error: %s", exc)
+                    await asyncio.sleep(1)
+
+        progress_task = asyncio.create_task(send_progress_messages())
+        job_id = str(job.get("id") or "?")
+        success = False
+        output = ""
+        final_response = ""
+        error = None
+        try:
+            success, output, final_response, error = await asyncio.to_thread(
+                run_job,
+                job,
+                tool_progress_callback=progress_callback,
+                thinking_callback=progress_thinking_callback,
+                platform=source.platform.value if source.platform else "cron",
+                session_id=f"cron_manual_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            )
+        except Exception as exc:
+            error = str(exc)
+            logger.error("Interactive cron run failed for %s: %s", job_id, exc, exc_info=True)
+        finally:
+            progress_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await progress_task
+
+        output_file = save_job_output(job_id, output or f"# Cron Job: {job.get('name', job_id)}\n\n(No output captured)")
+        deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job_id)}' failed:\n{error or 'unknown error'}"
+        if success and deliver_content and deliver_content.strip().upper().startswith(SILENT_MARKER):
+            deliver_content = f"✅ Cron job `{job_id}` finished with no new report."
+        if success and not str(deliver_content or "").strip():
+            deliver_content = f"✅ Cron job `{job_id}` finished, but returned no message."
+
+        try:
+            await adapter.send(
+                chat_id=source.chat_id,
+                content=deliver_content,
+                metadata={"thread_id": source.thread_id} if source.thread_id else None,
+            )
+        except Exception as exc:
+            logger.error("Interactive cron completion delivery failed for %s: %s", job_id, exc)
+
+        try:
+            delivery_target = _resolve_delivery_target(job)
+            same_target = (
+                delivery_target
+                and str(delivery_target.get("platform")) == source.platform.value
+                and str(delivery_target.get("chat_id")) == str(source.chat_id)
+                and str(delivery_target.get("thread_id") or "") == str(source.thread_id or "")
+            )
+            if delivery_target and not same_target and deliver_content:
+                await asyncio.to_thread(_deliver_result, job, deliver_content)
+        except Exception as exc:
+            logger.error("Interactive cron secondary delivery failed for %s: %s", job_id, exc)
+
+        mark_job_run(job_id, bool(success), error if not success else None)
+
     async def _handle_cron_command(self, event: MessageEvent) -> str:
         """Handle /cron command in gateway chats."""
         from tools.cronjob_tools import cronjob as cronjob_tool
@@ -3938,7 +4210,7 @@ class GatewayRunner:
                 return {"success": False, "error": str(e)}
 
         def _format_job_line(job: dict) -> str:
-            job_id = str(job.get("job_id", "?"))[:8]
+            job_id = str(job.get("job_id", "?"))
             name = str(job.get("name", "(unnamed)"))
             schedule = str(job.get("schedule", "?"))
             state = str(job.get("state", "scheduled"))
@@ -3994,16 +4266,18 @@ class GatewayRunner:
             return f"🗑️ Removed cron job `{removed.get('id', job_id)}` ({removed.get('name', 'unnamed')})."
 
         if action in {"run", "run_now", "trigger"}:
+            from cron.jobs import get_job
+
             if len(tokens) < 2:
                 return "Usage: `/cron run <job_id>`"
             job_id = tokens[1]
-            result = _cron_api(action="run", job_id=job_id)
-            if not result.get("success"):
-                return f"Failed to trigger cron job: {result.get('error', 'unknown error')}"
-            job = result.get("job", {})
+            job = get_job(job_id)
+            if not job:
+                return "Failed to trigger cron job: Job not found."
+            asyncio.create_task(self._run_cron_job_interactive(job, event.source))
             return (
-                f"▶️ Triggered cron job `{job.get('job_id', job_id)}` ({job.get('name', 'unnamed')}).\n"
-                "It will run on the next scheduler tick."
+                f"▶️ Running cron job `{job.get('id', job_id)}` ({job.get('name', 'unnamed')}) now.\n"
+                "I’ll stream progress here and post the result when it finishes."
             )
 
         if action == "pause":
@@ -6512,6 +6786,7 @@ class GatewayRunner:
         # Queue for progress/status ticks (thread-safe).
         progress_queue = queue.Queue() if tool_progress_enabled else None
         last_tool = [None]  # Mutable container for tracking in closure
+        last_terminal_progress = [None]
         progress_state = {
             "started_at": time.monotonic(),
             "phase": "thinking",
@@ -6520,6 +6795,38 @@ class GatewayRunner:
             "updates": 0,
             "recent_events": [],
         }
+
+        def _summarize_result_for_status(result_text: str, is_error: bool) -> str:
+            text = (result_text or "").strip()
+            if not text:
+                return ""
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return text if is_error else ""
+
+            if isinstance(parsed, dict):
+                parts: list[str] = []
+                status = str(parsed.get("status") or "").strip()
+                details = str(parsed.get("details") or "").strip()
+                if status:
+                    parts.append(f"status={status}")
+                if details:
+                    parts.append(details)
+                if "exit_code" in parsed:
+                    parts.append(f"exit={parsed.get('exit_code')}")
+                err = parsed.get("error")
+                if err:
+                    parts.append(f"error={err}")
+                stderr = parsed.get("stderr")
+                if not err and is_error and isinstance(stderr, str) and stderr.strip():
+                    parts.append(f"stderr={stderr.strip()}")
+                if not parts and is_error:
+                    message_text = parsed.get("message")
+                    if isinstance(message_text, str) and message_text.strip():
+                        parts.append(message_text.strip())
+                return " | ".join(parts)
+            return text if is_error else ""
 
         def _push_recent_event(detail: str) -> None:
             text = (detail or "").strip()
@@ -6534,12 +6841,30 @@ class GatewayRunner:
             while len(recent_events) > progress_rolling_entries:
                 recent_events.pop(0)
 
+        def _emit_gateway_terminal_progress(detail: str, phase: str | None = None) -> None:
+            text = (detail or "").strip()
+            if not text:
+                return
+            rendered = text if not phase else f"[{phase}] {text}"
+            if rendered == last_terminal_progress[0]:
+                return
+            last_terminal_progress[0] = rendered
+            _write_gateway_console_progress_line(
+                f"[gateway-progress][session {session_id}] {rendered}"
+            )
+            logger.info(
+                "[gateway-progress][session %s] %s",
+                session_id,
+                rendered,
+            )
+
         def _set_progress_state(*, phase: str | None = None, detail: str | None = None, tool_call: bool = False):
             if phase:
                 progress_state["phase"] = phase
             if detail:
                 progress_state["last_detail"] = detail
                 _push_recent_event(detail)
+                _emit_gateway_terminal_progress(detail, progress_state.get("phase"))
             if tool_call:
                 progress_state["tool_calls"] += 1
             progress_state["updates"] += 1
@@ -6601,11 +6926,18 @@ class GatewayRunner:
                 completed_tool = str(payload.get("tool") or preview or "tool")
                 duration = payload.get("duration_seconds")
                 is_error = bool(payload.get("is_error"))
+                status_suffix = str(payload.get("status_suffix") or "").strip()
+                result_text = str(payload.get("result") or "").strip()
                 status_emoji = "❌" if is_error else "✅"
                 duration_text = ""
                 if isinstance(duration, (int, float)):
                     duration_text = f" in {float(duration):.2f}s"
                 detail = f"{status_emoji} {completed_tool} finished{duration_text}"
+                summary_suffix = _summarize_result_for_status(result_text, is_error)
+                if status_suffix:
+                    detail = f"{detail} {status_suffix}"
+                if summary_suffix:
+                    detail = f"{detail} | {summary_suffix}"
                 _set_progress_state(phase="tool", detail=detail, tool_call=False)
                 return
 
@@ -6658,6 +6990,12 @@ class GatewayRunner:
             else:
                 detail = f"{emoji} {tool_name}..."
             _set_progress_state(phase="tool", detail=detail, tool_call=True)
+
+        def progress_thinking_callback(text: str) -> None:
+            cleaned = str(text or "").strip()
+            if not cleaned:
+                return
+            progress_callback("_thinking", cleaned)
 
         # Background task to send progress messages.
         _progress_metadata = {"tool_progress": True}
@@ -6883,6 +7221,11 @@ class GatewayRunner:
                 provider_data_collection=pr.get("data_collection"),
                 session_id=session_id,
                 tool_progress_callback=progress_callback if tool_progress_enabled else None,
+                thinking_callback=(
+                    progress_thinking_callback
+                    if tool_progress_enabled and source.platform == Platform.DISCORD
+                    else None
+                ),
                 step_callback=_step_callback_sync if _hooks_ref.loaded_hooks else None,
                 platform=platform_key,
                 honcho_session_key=session_key,

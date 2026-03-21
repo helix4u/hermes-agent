@@ -245,7 +245,14 @@ def _build_job_prompt(job: dict) -> str:
     return "\n".join(parts)
 
 
-def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+def run_job(
+    job: dict,
+    *,
+    tool_progress_callback=None,
+    thinking_callback=None,
+    platform: str = "cron",
+    session_id: Optional[str] = None,
+) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
     
@@ -397,9 +404,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             provider_sort=pr.get("sort"),
             disabled_toolsets=["cronjob", "messaging", "clarify"],
             quiet_mode=True,
-            platform="cron",
-            session_id=f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}",
+            platform=platform,
+            session_id=session_id or f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}",
             session_db=_session_db,
+            tool_progress_callback=tool_progress_callback,
+            thinking_callback=thinking_callback,
         )
         
         result = agent.run_conversation(prompt)

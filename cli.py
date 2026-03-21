@@ -3034,7 +3034,7 @@ class HermesCLI:
                 print(f"  Next run: {result['job'].get('next_run_at')}")
             elif action == "run":
                 print(f"(^_^)b Triggered job: {result['job']['name']} ({job_id})")
-                print("  It will run on the next scheduler tick.")
+                print("  Hermes checks cron jobs about once a minute, so this should run within about 60 seconds.")
             else:
                 removed = result.get("removed_job", {})
                 print(f"(^_^)b Removed job: {removed.get('name', job_id)} ({job_id})")

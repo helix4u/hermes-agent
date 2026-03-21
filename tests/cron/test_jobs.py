@@ -199,6 +199,13 @@ class TestJobCRUD:
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
 
+    def test_get_job_accepts_unique_prefix(self, tmp_cron_dir):
+        job = create_job(prompt="Check server status", schedule="30m")
+
+        fetched = get_job(job["id"][:8])
+        assert fetched is not None
+        assert fetched["id"] == job["id"]
+
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")
         create_job(prompt="Job 2", schedule="every 2h")
@@ -208,6 +215,11 @@ class TestJobCRUD:
     def test_remove_job(self, tmp_cron_dir):
         job = create_job(prompt="Temp job", schedule="30m")
         assert remove_job(job["id"]) is True
+        assert get_job(job["id"]) is None
+
+    def test_remove_job_accepts_unique_prefix(self, tmp_cron_dir):
+        job = create_job(prompt="Temp job", schedule="30m")
+        assert remove_job(job["id"][:8]) is True
         assert get_job(job["id"]) is None
 
     def test_remove_nonexistent_returns_false(self, tmp_cron_dir):

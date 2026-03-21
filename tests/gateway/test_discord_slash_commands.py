@@ -22,6 +22,7 @@ def _ensure_discord_mock():
     discord_mod.app_commands = SimpleNamespace(
         describe=lambda **kwargs: (lambda fn: fn),
         choices=lambda **kwargs: (lambda fn: fn),
+        autocomplete=lambda **kwargs: (lambda fn: fn),
         Choice=lambda **kwargs: SimpleNamespace(**kwargs),
     )
 
@@ -136,6 +137,22 @@ async def test_run_post_ready_startup_syncs_commands_and_registers_persistent_li
     view_cls.assert_called_once_with(adapter)
     adapter._client.add_view.assert_called_once_with(sentinel_view)
     assert adapter._listen_view_registered is True
+
+
+@pytest.mark.asyncio
+async def test_cron_job_autocomplete_returns_matching_jobs(adapter, monkeypatch):
+    jobs = [
+        {"id": "20e9d96eabcd", "name": "Run the heartbeat workflow", "state": "scheduled", "schedule_display": "every 30m", "enabled": True},
+        {"id": "98af12bb3344", "name": "Nightly cleanup", "state": "paused", "schedule_display": "every 1d", "enabled": False},
+    ]
+
+    with patch("cron.jobs.list_jobs", return_value=jobs):
+        choices = await adapter._cron_job_autocomplete(SimpleNamespace(), "heart")
+
+    assert len(choices) == 1
+    assert choices[0].value == "20e9d96eabcd"
+    assert "Run the heartbeat workflow" in choices[0].name
+    assert "20e9d96eabcd" in choices[0].name
 
 
 # ------------------------------------------------------------------
