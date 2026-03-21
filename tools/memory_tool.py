@@ -23,7 +23,6 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
-import fcntl
 import json
 import logging
 import os
@@ -34,6 +33,16 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
+
+try:
+    import fcntl
+except Exception:
+    fcntl = None
+
+try:
+    import msvcrt
+except Exception:
+    msvcrt = None
 
 # Where memory files live
 MEMORY_DIR = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "memories"
@@ -144,12 +153,30 @@ class MemoryStore:
         """
         lock_path = path.with_suffix(path.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = open(lock_path, "w")
+        if fcntl is None and msvcrt is None:
+            yield
+            return
+
+        if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+            lock_path.write_text(" ", encoding="utf-8")
+
+        fd = open(lock_path, "r+" if msvcrt else "w")
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            else:
+                fd.seek(0)
+                msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                try:
+                    fd.seek(0)
+                    msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
             fd.close()
 
     @staticmethod
@@ -167,6 +194,7 @@ class MemoryStore:
         fresh = list(dict.fromkeys(fresh))  # deduplicate
         self._set_entries(target, fresh)
 
+    @staticmethod
     def _is_dynamic_shell_context_entry(entry: str) -> bool:
         text = (entry or "").strip()
         if not text:
