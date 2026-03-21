@@ -134,6 +134,22 @@ body {
   font-weight: 600;
 }
 
+.session-meta-row {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.session-meta-text {
+  color: var(--theme-text-muted);
+  flex: 1;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 10px;
+  margin: 0;
+  word-break: break-all;
+}
+
 .session-history-select {
   flex: 1;
   min-width: 170px;

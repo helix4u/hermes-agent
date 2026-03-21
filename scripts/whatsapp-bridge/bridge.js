@@ -18,12 +18,13 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'fs';
+import { randomBytes } from 'crypto';
 import qrcode from 'qrcode-terminal';
 
 // Parse CLI args
@@ -33,19 +34,54 @@ function getArg(name, defaultVal) {
   return idx !== -1 && args[idx + 1] ? args[idx + 1] : defaultVal;
 }
 
+const WHATSAPP_DEBUG =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_DEBUG === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
+
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = (process.env.WHATSAPP_ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean);
+const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
+const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
+  ? DEFAULT_REPLY_PREFIX
+  : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
+
+function formatOutgoingMessage(message) {
+  return REPLY_PREFIX ? `${REPLY_PREFIX}${message}` : message;
+}
 
 mkdirSync(SESSION_DIR, { recursive: true });
+
+// Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
+function buildLidMap() {
+  const map = {};
+  try {
+    for (const f of readdirSync(SESSION_DIR)) {
+      const m = f.match(/^lid-mapping-(\d+)\.json$/);
+      if (!m) continue;
+      const phone = m[1];
+      const lid = JSON.parse(readFileSync(path.join(SESSION_DIR, f), 'utf8'));
+      if (lid) map[String(lid)] = phone;
+    }
+  } catch {}
+  return map;
+}
+let lidToPhone = buildLidMap();
 
 const logger = pino({ level: 'warn' });
 
 // Message queue for polling
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
+
+// Track recently sent message IDs to prevent echo-back loops with media
+const recentlySentIds = new Set();
+const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
@@ -62,9 +98,16 @@ async function startSocket() {
     browser: ['Hermes Agent', 'Chrome', '120.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
+    // Required for Baileys 7.x: without this, incoming messages that need
+    // E2EE session re-establishment are silently dropped (msg.message === null)
+    getMessage: async (key) => {
+      // We don't maintain a message store, so return a placeholder.
+      // This is enough for Baileys to complete the retry handshake.
+      return { conversation: '' };
+    },
   });
 
-  sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -102,13 +145,25 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.upsert', ({ messages, type }) => {
-    if (type !== 'notify') return;
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    // In self-chat mode, your own messages commonly arrive as 'append' rather
+    // than 'notify'. Accept both and filter agent echo-backs below.
+    if (type !== 'notify' && type !== 'append') return;
 
     for (const msg of messages) {
       if (!msg.message) continue;
 
       const chatId = msg.key.remoteJid;
+      if (WHATSAPP_DEBUG) {
+        try {
+          console.log(JSON.stringify({
+            event: 'upsert', type,
+            fromMe: !!msg.key.fromMe, chatId,
+            senderId: msg.key.participant || chatId,
+            messageKeys: Object.keys(msg.message || {}),
+          }));
+        } catch {}
+      }
       const senderId = msg.key.participant || chatId;
       const isGroup = chatId.endsWith('@g.us');
       const senderNumber = senderId.replace(/@.*/, '');
@@ -123,15 +178,20 @@ async function startSocket() {
         }
 
         // Self-chat mode: only allow messages in the user's own self-chat
+        // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
+        // AND classic format: 34652029134@s.whatsapp.net
+        // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
         const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+        const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
         const chatNumber = chatId.replace(/@.*/, '');
-        const isSelfChat = myNumber && chatNumber === myNumber;
+        const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
         if (!isSelfChat) continue;
       }
 
-      // Check allowlist for messages from others
-      if (!msg.key.fromMe && ALLOWED_USERS.length > 0 && !ALLOWED_USERS.includes(senderNumber)) {
-        continue;
+      // Check allowlist for messages from others (resolve LID → phone if needed)
+      if (!msg.key.fromMe && ALLOWED_USERS.length > 0) {
+        const resolvedNumber = lidToPhone[senderNumber] || senderNumber;
+        if (!ALLOWED_USERS.includes(resolvedNumber)) continue;
       }
 
       // Extract message body
@@ -148,6 +208,18 @@ async function startSocket() {
         body = msg.message.imageMessage.caption || '';
         hasMedia = true;
         mediaType = 'image';
+        try {
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const mime = msg.message.imageMessage.mimetype || 'image/jpeg';
+          const extMap = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
+          const ext = extMap[mime] || '.jpg';
+          mkdirSync(IMAGE_CACHE_DIR, { recursive: true });
+          const filePath = path.join(IMAGE_CACHE_DIR, `img_${randomBytes(6).toString('hex')}${ext}`);
+          writeFileSync(filePath, buf);
+          mediaUrls.push(filePath);
+        } catch (err) {
+          console.error('[bridge] Failed to download image:', err.message);
+        }
       } else if (msg.message.videoMessage) {
         body = msg.message.videoMessage.caption || '';
         hasMedia = true;
@@ -161,8 +233,30 @@ async function startSocket() {
         mediaType = 'document';
       }
 
+      // For media without caption, use a placeholder so the API message is never empty
+      if (hasMedia && !body) {
+        body = `[${mediaType} received]`;
+      }
+
+      // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
+      if (msg.key.fromMe && ((REPLY_PREFIX && body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
+        if (WHATSAPP_DEBUG) {
+          try { console.log(JSON.stringify({ event: 'ignored', reason: 'agent_echo', chatId, messageId: msg.key.id })); } catch {}
+        }
+        continue;
+      }
+
       // Skip empty messages
-      if (!body && !hasMedia) continue;
+      if (!body && !hasMedia) {
+        if (WHATSAPP_DEBUG) {
+          try { 
+            console.log(JSON.stringify({ event: 'ignored', reason: 'empty', chatId, messageKeys: Object.keys(msg.message || {}) })); 
+          } catch (err) {
+            console.error('Failed to log empty message event:', err);
+          }
+        }
+        continue;
+      }
 
       const event = {
         messageId: msg.key.id,
@@ -208,10 +302,16 @@ app.post('/send', async (req, res) => {
   }
 
   try {
-    // Prefix responses so the user can distinguish agent replies from their
-    // own messages (especially in self-chat / "Message Yourself").
-    const prefixed = `⚕ *Hermes Agent*\n────────────\n${message}`;
-    const sent = await sock.sendMessage(chatId, { text: prefixed });
+    const sent = await sock.sendMessage(chatId, { text: formatOutgoingMessage(message) });
+
+    // Track sent message ID to prevent echo-back loops
+    if (sent?.key?.id) {
+      recentlySentIds.add(sent.key.id);
+      if (recentlySentIds.size > MAX_RECENT_IDS) {
+        recentlySentIds.delete(recentlySentIds.values().next().value);
+      }
+    }
+
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -230,9 +330,8 @@ app.post('/edit', async (req, res) => {
   }
 
   try {
-    const prefixed = `⚕ *Hermes Agent*\n────────────\n${message}`;
     const key = { id: messageId, fromMe: true, remoteJid: chatId };
-    await sock.sendMessage(chatId, { text: prefixed, edit: key });
+    await sock.sendMessage(chatId, { text: formatOutgoingMessage(message), edit: key });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -303,6 +402,15 @@ app.post('/send-media', async (req, res) => {
     }
 
     const sent = await sock.sendMessage(chatId, msgPayload);
+
+    // Track sent message ID to prevent echo-back loops
+    if (sent?.key?.id) {
+      recentlySentIds.add(sent.key.id);
+      if (recentlySentIds.size > MAX_RECENT_IDS) {
+        recentlySentIds.delete(recentlySentIds.values().next().value);
+      }
+    }
+
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -368,7 +476,7 @@ if (PAIR_ONLY) {
   console.log();
   startSocket();
 } else {
-  app.listen(PORT, () => {
+  app.listen(PORT, '127.0.0.1', () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
     if (ALLOWED_USERS.length > 0) {

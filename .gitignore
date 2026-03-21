@@ -51,6 +51,19 @@ skills/media/plex-dj-playlists/local/
 ignored/
 .worktrees/
 environments/benchmarks/evals/
+*.mp3
+*.ogg
+agents/memories/
+agents/memory.md
+agents/worldview.md
+audio_cache/
+cache/
+cron/output/
+cron/jobs.json
+cron/.tick.lock
+hermes-agent/
+memories/
+upstream/
 
 # Release script temp files
 .release_notes.md

@@ -438,6 +438,43 @@ def get_windows_hermes_command() -> list[str]:
     return [sys.executable, "-m", "hermes_cli.main"]
 
 
+def build_windows_gateway_shell_launch() -> list[str]:
+    """Launch gateway run through a real interactive shell on Windows.
+
+    Running the Hermes executable directly with ``CREATE_NEW_CONSOLE`` produces
+    a bare console host window without the normal shell affordances users expect.
+    Instead, open a real shell session and run ``hermes gateway run`` inside it.
+    """
+    hermes_cmd = subprocess.list2cmdline([*get_windows_hermes_command(), "gateway", "run"])
+    shell_command = (
+        f'set "HERMES_GATEWAY_DETACHED=1" && '
+        f'cd /d "{PROJECT_ROOT}" && '
+        f"{hermes_cmd}"
+    )
+
+    wt_exe = shutil.which("wt")
+    if wt_exe:
+        return [
+            wt_exe,
+            "new-tab",
+            "--title",
+            "Hermes Gateway",
+            "cmd.exe",
+            "/k",
+            shell_command,
+        ]
+
+    return [
+        "cmd.exe",
+        "/c",
+        "start",
+        "\"Hermes Gateway\"",
+        "cmd.exe",
+        "/k",
+        shell_command,
+    ]
+
+
 def get_gateway_log_paths() -> tuple[Path, Path]:
     """Return stdout/stderr gateway log paths."""
     log_dir = get_hermes_home() / "logs"
@@ -644,6 +681,26 @@ def stream_gateway_startup_logs(
             print(f"    {line}")
 
     print("Tip: run `hermes gateway logs -f` for full output.")
+
+
+def wait_for_gateway_pid(
+    timeout_seconds: float = 8.0,
+    *,
+    poll_interval: float = 0.25,
+) -> int | None:
+    """Wait briefly for the detached gateway PID file to appear."""
+    from gateway.status import get_running_pid
+
+    deadline = time.time() + max(0.5, float(timeout_seconds))
+    sleep_interval = max(0.05, float(poll_interval))
+
+    while time.time() < deadline:
+        gateway_pid = get_running_pid()
+        if gateway_pid:
+            return gateway_pid
+        time.sleep(sleep_interval)
+
+    return get_running_pid()
 
 
 # =============================================================================
@@ -1365,50 +1422,41 @@ def windows_start_detached_gateway(*, stream_startup: bool = True) -> None:
             print("✓ Gateway is already running")
         return
 
-    command = [*get_windows_hermes_command(), "gateway", "run"]
+    command = build_windows_gateway_shell_launch()
     stdout_log, stderr_log = reset_gateway_logs()
     flags = 0
     flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-    flags |= getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+    child_env = os.environ.copy()
+    # Detached gateway instances should ignore stray task cancellations
+    # (for example unexpected SIGINT delivery) unless shutdown is requested.
+    child_env["HERMES_GATEWAY_DETACHED"] = "1"
+    proc = subprocess.Popen(
+        command,
+        cwd=str(PROJECT_ROOT),
+        env=child_env,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=flags,
+    )
 
-    stderr_handle = open(stderr_log, "a", encoding="utf-8", errors="replace")
-    try:
-        child_env = os.environ.copy()
-        # Detached gateway instances should ignore stray task cancellations
-        # (for example unexpected SIGINT delivery) unless shutdown is requested.
-        child_env["HERMES_GATEWAY_DETACHED"] = "1"
-        proc = subprocess.Popen(
-            command,
-            cwd=str(PROJECT_ROOT),
-            env=child_env,
-            stdin=subprocess.DEVNULL,
-            stderr=stderr_handle,
-            close_fds=True,
-            creationflags=flags,
-        )
-    finally:
-        # Child inherits duplicated handle; parent should close its copy.
-        stderr_handle.close()
-
-    time.sleep(1.5)
-    gateway_pid = get_running_pid()
+    gateway_pid = wait_for_gateway_pid()
     if gateway_pid:
-        print(f"✓ Gateway started in its own window (PID: {gateway_pid})")
-        print("  Live status updates should appear in the Hermes Gateway console.")
+        print(f"✓ Gateway started in an interactive terminal window (PID: {gateway_pid})")
+        print("  Live status updates should appear in the Hermes Gateway shell.")
         print(f"  Logs were reset at startup: {stdout_log}")
         if stream_startup:
             stream_gateway_startup_logs()
         return
 
     if proc.poll() is None:
-        print(f"✓ Gateway launch requested in a new window (PID: {proc.pid})")
-        print("  Waiting for PID file; watch the Hermes Gateway console window.")
+        print(f"✓ Gateway launch requested in an interactive terminal window (PID: {proc.pid})")
+        print("  Waiting for PID file; watch the Hermes Gateway shell window.")
         if stream_startup:
             stream_gateway_startup_logs()
         return
 
     print("✗ Gateway failed to stay running")
-    print("  Check the Hermes Gateway console window for output.")
+    print("  Check the Hermes Gateway shell window for output.")
     sys.exit(1)
 
 

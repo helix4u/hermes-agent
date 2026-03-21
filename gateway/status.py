@@ -106,6 +106,7 @@ def _looks_like_gateway_process(pid: int) -> bool:
 
     patterns = (
         "hermes_cli.main gateway",
+        "hermes_cli/main.py gateway",
         "hermes gateway",
         "gateway run",
         "gateway/run.py",
@@ -125,11 +126,47 @@ def _record_looks_like_gateway(record: dict[str, Any]) -> bool:
     cmdline = " ".join(str(part) for part in argv)
     patterns = (
         "hermes_cli.main gateway",
+        "hermes_cli/main.py gateway",
         "hermes gateway",
         "gateway run",
         "gateway/run.py",
     )
     return any(pattern in cmdline for pattern in patterns)
+
+
+def _extract_live_gateway_pid(
+    record: Optional[dict[str, Any]],
+    *,
+    allow_runtime_fallback: bool = False,
+) -> Optional[int]:
+    """Return a validated live gateway PID from persisted metadata."""
+    if not record:
+        return None
+
+    try:
+        pid = int(record["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if pid <= 0 or not _is_process_alive(pid):
+        return None
+
+    recorded_start = record.get("start_time")
+    current_start = _get_process_start_time(pid)
+    if recorded_start is not None and current_start is not None and current_start != recorded_start:
+        return None
+
+    if _looks_like_gateway_process(pid):
+        return pid
+    if _record_looks_like_gateway(record):
+        return pid
+
+    if allow_runtime_fallback:
+        gateway_state = str(record.get("gateway_state") or "").strip().lower()
+        if record.get("kind") == _GATEWAY_KIND and gateway_state in {"starting", "running"}:
+            return pid
+
+    return None
 
 
 def _build_pid_record() -> dict:
@@ -216,8 +253,9 @@ def write_runtime_status(
     payload = _read_json_file(path) or _build_runtime_status_record()
     payload.setdefault("platforms", {})
     payload.setdefault("kind", _GATEWAY_KIND)
-    payload.setdefault("pid", os.getpid())
-    payload.setdefault("start_time", _get_process_start_time(os.getpid()))
+    payload.setdefault("argv", list(sys.argv))
+    payload["pid"] = os.getpid()
+    payload["start_time"] = _get_process_start_time(os.getpid())
     payload["updated_at"] = _utc_now_iso()
 
     if gateway_state is not None:
@@ -338,31 +376,27 @@ def get_running_pid() -> Optional[int]:
     Cleans up stale PID files automatically.
     """
     record = _read_pid_record()
-    if not record:
+    pid = _extract_live_gateway_pid(record)
+    if pid is not None:
+        return pid
+    if record:
         remove_pid_file()
+
+    runtime_status = read_runtime_status()
+    pid = _extract_live_gateway_pid(runtime_status, allow_runtime_fallback=True)
+    if pid is None:
         return None
 
+    repaired_record = {
+        "pid": pid,
+        "kind": runtime_status.get("kind", _GATEWAY_KIND),
+        "argv": runtime_status.get("argv") or [],
+        "start_time": runtime_status.get("start_time"),
+    }
     try:
-        pid = int(record["pid"])
-    except (KeyError, TypeError, ValueError):
-        remove_pid_file()
-        return None
-
-    if pid <= 0 or not _is_process_alive(pid):
-        remove_pid_file()
-        return None
-
-    recorded_start = record.get("start_time")
-    current_start = _get_process_start_time(pid)
-    if recorded_start is not None and current_start is not None and current_start != recorded_start:
-        remove_pid_file()
-        return None
-
-    if not _looks_like_gateway_process(pid):
-        if not _record_looks_like_gateway(record):
-            remove_pid_file()
-            return None
-
+        _write_json_file(_get_pid_path(), repaired_record)
+    except OSError:
+        pass
     return pid
 
 

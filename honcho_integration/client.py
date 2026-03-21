@@ -69,6 +69,8 @@ class HonchoClientConfig:
     workspace_id: str = "hermes"
     api_key: str | None = None
     environment: str = "production"
+    # Optional base URL for self-hosted Honcho (overrides environment mapping)
+    base_url: str | None = None
     # Identity
     peer_name: str | None = None
     ai_peer: str = "hermes"
@@ -114,11 +116,14 @@ class HonchoClientConfig:
     @classmethod
     def from_env(cls, workspace_id: str = "hermes") -> HonchoClientConfig:
         """Create config from environment variables (fallback)."""
+        api_key = os.environ.get("HONCHO_API_KEY")
+        base_url = os.environ.get("HONCHO_BASE_URL", "").strip() or None
         return cls(
             workspace_id=workspace_id,
-            api_key=os.environ.get("HONCHO_API_KEY"),
+            api_key=api_key,
             environment=os.environ.get("HONCHO_ENVIRONMENT", "production"),
-            enabled=True,
+            base_url=base_url,
+            enabled=bool(api_key or base_url),
         )
 
     @classmethod
@@ -168,8 +173,14 @@ class HonchoClientConfig:
             or raw.get("environment", "production")
         )
 
-        # Auto-enable when API key is present (unless explicitly disabled)
-        # Host-level enabled wins, then root-level, then auto-enable if key exists.
+        base_url = (
+            raw.get("baseUrl")
+            or os.environ.get("HONCHO_BASE_URL", "").strip()
+            or None
+        )
+
+        # Auto-enable when API key or base_url is present (unless explicitly disabled)
+        # Host-level enabled wins, then root-level, then auto-enable if key/url exists.
         host_enabled = host_block.get("enabled")
         root_enabled = raw.get("enabled")
         if host_enabled is not None:
@@ -177,8 +188,8 @@ class HonchoClientConfig:
         elif root_enabled is not None:
             enabled = root_enabled
         else:
-            # Not explicitly set anywhere -> auto-enable if API key exists
-            enabled = bool(api_key)
+            # Not explicitly set anywhere -> auto-enable if API key or base_url exists
+            enabled = bool(api_key or base_url)
 
         # write_frequency: accept int or string
         raw_wf = (
@@ -211,6 +222,7 @@ class HonchoClientConfig:
             workspace_id=workspace,
             api_key=api_key,
             environment=environment,
+            base_url=base_url,
             peer_name=host_block.get("peerName") or raw.get("peerName"),
             ai_peer=ai_peer,
             linked_hosts=linked_hosts,
@@ -345,11 +357,12 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
     if config is None:
         config = HonchoClientConfig.from_global_config()
 
-    if not config.api_key:
+    if not config.api_key and not config.base_url:
         raise ValueError(
             "Honcho API key not found. "
             "Get your API key at https://app.honcho.dev, "
-            "then run 'hermes honcho setup' or set HONCHO_API_KEY."
+            "then run 'hermes honcho setup' or set HONCHO_API_KEY. "
+            "For local instances, set HONCHO_BASE_URL instead."
         )
 
     try:
@@ -360,13 +373,34 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
             "Install it with: pip install honcho-ai"
         )
 
-    logger.info("Initializing Honcho client (host: %s, workspace: %s)", config.host, config.workspace_id)
+    # Allow config.yaml honcho.base_url to override the SDK's environment
+    # mapping, enabling remote self-hosted Honcho deployments without
+    # requiring the server to live on localhost.
+    resolved_base_url = config.base_url
+    if not resolved_base_url:
+        try:
+            from hermes_cli.config import load_config
+            hermes_cfg = load_config()
+            honcho_cfg = hermes_cfg.get("honcho", {})
+            if isinstance(honcho_cfg, dict):
+                resolved_base_url = honcho_cfg.get("base_url", "").strip() or None
+        except Exception:
+            pass
 
-    _honcho_client = Honcho(
-        workspace_id=config.workspace_id,
-        api_key=config.api_key,
-        environment=config.environment,
-    )
+    if resolved_base_url:
+        logger.info("Initializing Honcho client (base_url: %s, workspace: %s)", resolved_base_url, config.workspace_id)
+    else:
+        logger.info("Initializing Honcho client (host: %s, workspace: %s)", config.host, config.workspace_id)
+
+    kwargs: dict = {
+        "workspace_id": config.workspace_id,
+        "api_key": config.api_key,
+        "environment": config.environment,
+    }
+    if resolved_base_url:
+        kwargs["base_url"] = resolved_base_url
+
+    _honcho_client = Honcho(**kwargs)
 
     return _honcho_client
 

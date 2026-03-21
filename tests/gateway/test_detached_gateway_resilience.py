@@ -7,6 +7,21 @@ import asyncio
 import pytest
 
 
+def test_build_windows_gateway_shell_launch_prefers_windows_terminal(monkeypatch):
+    import hermes_cli.gateway as gateway_cli
+
+    monkeypatch.setattr(gateway_cli, "get_windows_hermes_command", lambda: ["hermes.exe"])
+    monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: "C:\\wt.exe" if name == "wt" else None)
+
+    command = gateway_cli.build_windows_gateway_shell_launch()
+
+    assert command[:4] == ["C:\\wt.exe", "new-tab", "--title", "Hermes Gateway"]
+    assert command[4:6] == ["cmd.exe", "/k"]
+    assert 'set "HERMES_GATEWAY_DETACHED=1"' in command[6]
+    assert 'cd /d "' in command[6]
+    assert "hermes.exe gateway run" in command[6]
+
+
 def test_windows_detached_gateway_sets_detached_env_flag(monkeypatch, tmp_path):
     """Detached gateway launches should mark child env for cancel resilience."""
     import hermes_cli.gateway as gateway_cli
@@ -26,7 +41,11 @@ def test_windows_detached_gateway_sets_detached_env_flag(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gateway_status, "is_gateway_running", lambda: False)
     monkeypatch.setattr(gateway_status, "get_running_pid", lambda: None)
-    monkeypatch.setattr(gateway_cli, "get_windows_hermes_command", lambda: ["hermes"])
+    monkeypatch.setattr(
+        gateway_cli,
+        "build_windows_gateway_shell_launch",
+        lambda: ["cmd.exe", "/k", "echo hello"],
+    )
     monkeypatch.setattr(
         gateway_cli,
         "reset_gateway_logs",
@@ -39,6 +58,41 @@ def test_windows_detached_gateway_sets_detached_env_flag(monkeypatch, tmp_path):
     gateway_cli.windows_start_detached_gateway(stream_startup=False)
 
     assert captured_env.get("HERMES_GATEWAY_DETACHED") == "1"
+
+
+def test_windows_detached_gateway_waits_for_real_gateway_pid(monkeypatch, tmp_path, capsys):
+    """A fast-exiting Windows Terminal wrapper should not be treated as failure."""
+    import hermes_cli.gateway as gateway_cli
+    import gateway.status as gateway_status
+
+    class _WrapperProc:
+        pid = 54321
+
+        def poll(self):
+            return 0
+
+    pid_checks = iter([None, None, 67890])
+
+    monkeypatch.setattr(gateway_status, "is_gateway_running", lambda: False)
+    monkeypatch.setattr(gateway_status, "get_running_pid", lambda: next(pid_checks, 67890))
+    monkeypatch.setattr(
+        gateway_cli,
+        "build_windows_gateway_shell_launch",
+        lambda: ["C:\\wt.exe", "new-tab"],
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "reset_gateway_logs",
+        lambda: (tmp_path / "gateway.log", tmp_path / "gateway-error.log"),
+    )
+    monkeypatch.setattr(gateway_cli.subprocess, "Popen", lambda *args, **kwargs: _WrapperProc())
+    monkeypatch.setattr(gateway_cli.time, "sleep", lambda _secs: None)
+    monkeypatch.setattr(gateway_cli, "stream_gateway_startup_logs", lambda: None)
+
+    gateway_cli.windows_start_detached_gateway(stream_startup=False)
+
+    output = capsys.readouterr().out
+    assert "Gateway started in an interactive terminal window (PID: 67890)" in output
 
 
 @pytest.mark.asyncio

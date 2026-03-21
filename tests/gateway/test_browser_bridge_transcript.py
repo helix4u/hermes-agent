@@ -1,6 +1,7 @@
 import builtins
 import subprocess
 import sys
+import types
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,6 +16,16 @@ def _make_runner():
     runner = object.__new__(GatewayRunner)
     runner.session_store = MagicMock()
     return runner
+
+
+def test_extract_youtube_video_id_handles_nested_watch_urls():
+    nested_url = "https://www.youtube.com/watch?v=https://www.youtube.com/watch?v=abc123xyz98"
+
+    assert GatewayRunner._extract_youtube_video_id(nested_url) == "abc123xyz98"
+
+
+def test_extract_youtube_video_id_returns_empty_for_unparseable_value():
+    assert GatewayRunner._extract_youtube_video_id("https://www.youtube.com/watch?v=https://www.youtube.com/") == ""
 
 
 @pytest.mark.asyncio
@@ -166,3 +177,26 @@ def test_ensure_gateway_python_package_bootstraps_pip_when_uv_missing(monkeypatc
         ("-m", "ensurepip", "--upgrade"),
         ("-m", "pip", "install", "--disable-pip-version-check", "youtube-transcript-api>=1.2.0"),
     ]
+
+
+def test_fetch_bridge_youtube_transcript_wraps_list_errors(monkeypatch):
+    module = types.ModuleType("youtube_transcript_api")
+
+    class _FailingApi:
+        def list(self, _video_id):
+            raise RuntimeError("Transcript disabled")
+
+    module.YouTubeTranscriptApi = _FailingApi
+    monkeypatch.setitem(sys.modules, "youtube_transcript_api", module)
+
+    with pytest.raises(BrowserBridgeTranscriptUnavailable) as excinfo:
+        GatewayRunner._fetch_bridge_youtube_transcript(
+            "https://www.youtube.com/watch?v=abc123xyz98",
+            "en",
+        )
+
+    exc = excinfo.value
+    assert exc.video_id == "abc123xyz98"
+    assert exc.requested_language == "en"
+    assert exc.available_languages == []
+    assert "Transcript disabled" in str(exc)

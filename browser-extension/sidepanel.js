@@ -23,6 +23,8 @@ const resetChatButton = document.getElementById("reset-chat-button");
 const activityPanel = document.getElementById("activity-panel");
 const sessionHistorySelect = document.getElementById("session-history-select");
 const refreshSessionsButton = document.getElementById("refresh-sessions-button");
+const sessionMetaText = document.getElementById("session-meta-text");
+const copySessionIdButton = document.getElementById("copy-session-id-button");
 const quickPromptsLabel = document.getElementById("quick-prompts-label");
 const challengeModeButton = document.getElementById("challenge-mode-button");
 const bundlePanel = document.getElementById("bundle-panel");
@@ -1324,6 +1326,39 @@ function formatSessionLabel(session) {
   return `${title}${countPart}${updatedPart}${running}`;
 }
 
+function getSelectedSessionInfo() {
+  if (!selectedSessionKey) {
+    return null;
+  }
+  return sessionHistoryByKey.get(selectedSessionKey) || null;
+}
+
+function renderSelectedSessionMeta(session = null) {
+  if (!sessionMetaText || !copySessionIdButton) {
+    return;
+  }
+
+  const selected = session || getSelectedSessionInfo();
+  const sessionId = String(selected?.session_id || "").trim();
+  if (!sessionId) {
+    sessionMetaText.textContent = "Session ID unavailable.";
+    copySessionIdButton.disabled = true;
+    copySessionIdButton.dataset.sessionId = "";
+    copySessionIdButton.title = "Copy the selected Hermes session ID";
+    return;
+  }
+
+  const source = String(selected?.source || "").trim();
+  const sourceLabel = source ? source.replace(/_/g, " ") : "";
+  const accessLabel = selected?.can_send === false ? "read-only here" : "sendable here";
+  sessionMetaText.textContent = sourceLabel
+    ? `Session ID: ${sessionId} \u00b7 ${sourceLabel} \u00b7 ${accessLabel}`
+    : `Session ID: ${sessionId} \u00b7 ${accessLabel}`;
+  copySessionIdButton.disabled = false;
+  copySessionIdButton.dataset.sessionId = sessionId;
+  copySessionIdButton.title = `Copy session ID ${sessionId}`;
+}
+
 function renderSessionHistory(sessions, activeSessionKey = "") {
   if (!sessionHistorySelect) {
     return;
@@ -1360,6 +1395,7 @@ function renderSessionHistory(sessions, activeSessionKey = "") {
     isApplyingSessionSelection = false;
     selectedSessionKey = "";
     selectedSessionCanSend = true;
+    renderSelectedSessionMeta(null);
     updateComposerAvailability();
     return;
   }
@@ -1368,6 +1404,9 @@ function renderSessionHistory(sessions, activeSessionKey = "") {
     const option = document.createElement("option");
     option.value = session.session_key || "";
     option.textContent = formatSessionLabel(session);
+    option.title = String(session.session_id || "").trim()
+      ? `Session ID: ${session.session_id}`
+      : option.textContent;
     sessionHistorySelect.appendChild(option);
   }
 
@@ -1379,6 +1418,7 @@ function renderSessionHistory(sessions, activeSessionKey = "") {
   }
   isApplyingSessionSelection = false;
   selectedSessionCanSend = sessionHistoryByKey.get(nextSelected)?.can_send !== false;
+  renderSelectedSessionMeta(sessionHistoryByKey.get(nextSelected) || null);
   updateComposerAvailability();
 }
 
@@ -1399,6 +1439,7 @@ function renderSessionHistoryUnavailable(message = "") {
   selectedSessionKey = "";
   expectedSessionKey = "";
   selectedSessionCanSend = true;
+  renderSelectedSessionMeta(null);
   updateComposerAvailability();
 
   if (message) {
@@ -1864,6 +1905,11 @@ async function loadChatSession({ quiet = false, sessionKey = "" } = {}) {
     expectedSessionKey = incomingSessionKey;
     selectedSessionKey = incomingSessionKey;
     selectedSessionCanSend = response.result?.can_send !== false;
+    const mergedSession = {
+      ...(sessionHistoryByKey.get(incomingSessionKey) || {}),
+      ...(response.result || {})
+    };
+    sessionHistoryByKey.set(incomingSessionKey, mergedSession);
     if (sessionHistorySelect && !isApplyingSessionSelection) {
       const hasOption = Array.from(sessionHistorySelect.options).some((option) => option.value === incomingSessionKey);
       if (hasOption) {
@@ -1872,6 +1918,7 @@ async function loadChatSession({ quiet = false, sessionKey = "" } = {}) {
         isApplyingSessionSelection = false;
       }
     }
+    renderSelectedSessionMeta(mergedSession);
   }
 
   currentMessages = incomingMessages;
@@ -2278,10 +2325,27 @@ if (sessionHistorySelect) {
     expectedSessionKey = selectedSessionKey;
     pendingUserMessage = null;
     pendingQueuedAt = 0;
+    renderSelectedSessionMeta();
     loadChatSession({ sessionKey: selectedSessionKey }).catch((error) => {
       renderChatNotice("Unable to load this sidecar session right now.");
       setStatus(explainBackgroundMismatch(error), { openActivity: true });
     });
+  });
+}
+
+if (copySessionIdButton) {
+  copySessionIdButton.addEventListener("click", async () => {
+    const sessionId = String(copySessionIdButton.dataset.sessionId || "").trim();
+    if (!sessionId) {
+      setStatus("No Hermes session ID is available for the current selection.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(sessionId);
+      setStatus(`Copied session ID: ${sessionId}`);
+    } catch (_error) {
+      setStatus("Could not copy the session ID. You can still select and copy it from the row above.");
+    }
   });
 }
 

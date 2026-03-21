@@ -8,7 +8,6 @@ Compatibility wrappers remain for direct Python callers and legacy tests.
 import json
 import os
 import re
-import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -337,11 +336,9 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
 If skill or skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
 On update, passing skills=[] clears attached skills.
 
-NOTE: The agent's final response is auto-delivered to the target — do NOT use
-send_message in the prompt for that same destination. Same-target send_message
-calls are skipped to avoid duplicate cron deliveries. Put the primary
-user-facing content in the final response, and use send_message only for
-additional or different targets.
+NOTE: The agent's final response is auto-delivered to the target. Put the primary
+user-facing content in the final response. Cron jobs run autonomously with no user
+present — they cannot ask questions or request clarification.
 
 Important safety rule: cron-run sessions should not recursively schedule more cron jobs.""",
     "parameters": {
@@ -373,7 +370,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "deliver": {
                 "type": "string",
-                "description": "Delivery target: origin, local, telegram, discord, signal, or platform:chat_id"
+                "description": "Delivery target: origin, local, telegram, discord, slack, whatsapp, signal, matrix, mattermost, homeassistant, dingtalk, email, sms, or platform:chat_id"
             },
             "model": {
                 "type": "string",
@@ -414,13 +411,10 @@ def check_cronjob_requirements() -> bool:
     """
     Check if cronjob tools can be used.
 
-    Requires 'crontab' executable to be present in the system PATH.
     Available in interactive CLI mode and gateway/messaging platforms.
+    The cron system is internal (JSON file-based scheduler ticked by the gateway),
+    so no external crontab executable is required.
     """
-    # Ensure the system can actually install and manage cron entries.
-    if not shutil.which("crontab"):
-        return False
-
     return bool(
         os.getenv("HERMES_INTERACTIVE")
         or os.getenv("HERMES_GATEWAY_SESSION")

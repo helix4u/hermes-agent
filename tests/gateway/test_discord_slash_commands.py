@@ -51,6 +51,15 @@ class FakeTree:
 
         return decorator
 
+    def add_command(self, command):
+        self.commands[command.name] = command
+
+    def get_commands(self):
+        return list(self.commands.values())
+
+    async def sync(self):
+        return self.get_commands()
+
 
 @pytest.fixture
 def adapter():
@@ -84,6 +93,49 @@ async def test_registers_native_thread_slash_command(adapter):
 
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
     adapter._handle_thread_create_slash.assert_awaited_once_with(interaction, "Planning", "", 1440)
+
+
+def test_flatten_slash_command_names_includes_grouped_commands(adapter):
+    commands = [
+        SimpleNamespace(name="ask"),
+        SimpleNamespace(
+            name="cron",
+            commands=[
+                SimpleNamespace(name="list"),
+                SimpleNamespace(name="run"),
+            ],
+        ),
+    ]
+
+    flattened = adapter._flatten_slash_command_names(commands)
+
+    assert flattened == ["ask", "cron list", "cron run"]
+
+
+@pytest.mark.asyncio
+async def test_run_post_ready_startup_syncs_commands_and_registers_persistent_listen_view(adapter):
+    adapter._allowed_user_ids = {"friendlyname"}
+    adapter._resolve_allowed_usernames = AsyncMock()
+    adapter._client.add_view = MagicMock()
+    adapter._client.tree.commands = {
+        "ask": SimpleNamespace(name="ask"),
+        "cron": SimpleNamespace(
+            name="cron",
+            commands=[
+                SimpleNamespace(name="list"),
+                SimpleNamespace(name="run"),
+            ],
+        ),
+    }
+
+    sentinel_view = object()
+    with patch("gateway.platforms.discord.PersistentListenButtonView", return_value=sentinel_view) as view_cls:
+        await adapter._run_post_ready_startup(members=True)
+
+    adapter._resolve_allowed_usernames.assert_awaited_once()
+    view_cls.assert_called_once_with(adapter)
+    adapter._client.add_view.assert_called_once_with(sentinel_view)
+    assert adapter._listen_view_registered is True
 
 
 # ------------------------------------------------------------------
