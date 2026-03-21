@@ -20,13 +20,14 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 
 DEFAULT_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -76,10 +77,34 @@ CREATE TABLE IF NOT EXISTS messages (
     finish_reason TEXT
 );
 
+CREATE TABLE IF NOT EXISTS session_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    seq INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    kind TEXT NOT NULL,
+    phase TEXT,
+    span_id TEXT,
+    parent_span_id TEXT,
+    tool_name TEXT,
+    status TEXT,
+    duration_ms INTEGER,
+    is_error INTEGER DEFAULT 0,
+    title TEXT,
+    preview TEXT,
+    payload_json TEXT,
+    source_platform TEXT,
+    source_surface TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_session_events_session_seq ON session_events(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_session_events_session_ts ON session_events(session_id, ts, id);
+CREATE INDEX IF NOT EXISTS idx_session_events_kind ON session_events(kind, ts);
 """
 
 FTS_SQL = """
@@ -102,6 +127,58 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
 END;
 """
+
+_REDACT_EVENT_KEYS = {
+    "chat_id",
+    "thread_id",
+    "user_id",
+    "user_name",
+    "chat_name",
+    "session_key",
+}
+
+
+def _normalize_preview(text: Any, limit: int = 180) -> Optional[str]:
+    if text is None:
+        return None
+    preview = str(text).replace("\r", " ").replace("\n", " ").strip()
+    if not preview:
+        return None
+    if len(preview) > limit:
+        return preview[: limit - 3] + "..."
+    return preview
+
+
+def _redact_event_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, inner in value.items():
+            if key in _REDACT_EVENT_KEYS:
+                sanitized[key] = "[redacted]"
+            else:
+                sanitized[key] = _redact_event_payload(inner)
+        return sanitized
+    if isinstance(value, list):
+        return [_redact_event_payload(item) for item in value]
+    return value
+
+
+def _event_scope(kind: str, is_error: bool) -> str:
+    if is_error:
+        return "errors"
+    if kind == "thinking":
+        return "thinking"
+    if kind in {"tool_start", "tool_finish"}:
+        return "tools"
+    if kind == "message":
+        return "results"
+    if kind == "system":
+        return "system"
+    if kind == "cron":
+        return "cron"
+    if kind == "delivery":
+        return "delivery"
+    return kind or "other"
 
 
 class SessionDB:
@@ -189,6 +266,36 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass
                 cursor.execute("UPDATE schema_version SET version = 5")
+                current_version = 5
+            if current_version < 6:
+                cursor.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS session_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT NOT NULL UNIQUE,
+                        session_id TEXT NOT NULL REFERENCES sessions(id),
+                        seq INTEGER NOT NULL,
+                        ts REAL NOT NULL,
+                        kind TEXT NOT NULL,
+                        phase TEXT,
+                        span_id TEXT,
+                        parent_span_id TEXT,
+                        tool_name TEXT,
+                        status TEXT,
+                        duration_ms INTEGER,
+                        is_error INTEGER DEFAULT 0,
+                        title TEXT,
+                        preview TEXT,
+                        payload_json TEXT,
+                        source_platform TEXT,
+                        source_surface TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_session_events_session_seq ON session_events(session_id, seq);
+                    CREATE INDEX IF NOT EXISTS idx_session_events_session_ts ON session_events(session_id, ts, id);
+                    CREATE INDEX IF NOT EXISTS idx_session_events_kind ON session_events(kind, ts);
+                    """
+                )
+                cursor.execute("UPDATE schema_version SET version = 6")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -653,6 +760,446 @@ class SessionDB:
             result.append(msg)
         return result
 
+    # =========================================================================
+    # Audit event storage
+    # =========================================================================
+
+    def append_event(
+        self,
+        session_id: str,
+        *,
+        kind: str,
+        phase: str = None,
+        span_id: str = None,
+        parent_span_id: str = None,
+        tool_name: str = None,
+        status: str = None,
+        duration_ms: int = None,
+        is_error: bool = False,
+        title: str = None,
+        preview: str = None,
+        payload: Any = None,
+        source_platform: str = None,
+        source_surface: str = None,
+        ts: float = None,
+        event_id: str = None,
+    ) -> Dict[str, Any]:
+        """Append an auditable event to the session event stream."""
+        when = float(ts if ts is not None else time.time())
+        payload_clean = _redact_event_payload(payload) if payload is not None else None
+        with self._lock:
+            seq_cursor = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM session_events WHERE session_id = ?",
+                (session_id,),
+            )
+            seq = int(seq_cursor.fetchone()[0])
+            resolved_event_id = event_id or f"evt_{session_id}_{seq}_{uuid.uuid4().hex[:8]}"
+            self._conn.execute(
+                """INSERT INTO session_events (
+                    event_id, session_id, seq, ts, kind, phase, span_id, parent_span_id,
+                    tool_name, status, duration_ms, is_error, title, preview,
+                    payload_json, source_platform, source_surface
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    resolved_event_id,
+                    session_id,
+                    seq,
+                    when,
+                    kind,
+                    phase,
+                    span_id,
+                    parent_span_id,
+                    tool_name,
+                    status,
+                    int(duration_ms) if duration_ms is not None else None,
+                    1 if is_error else 0,
+                    _normalize_preview(title, 120),
+                    _normalize_preview(preview, 220),
+                    json.dumps(payload_clean, ensure_ascii=False) if payload_clean is not None else None,
+                    source_platform,
+                    source_surface,
+                ),
+            )
+            self._conn.commit()
+        return {
+            "event_id": resolved_event_id,
+            "session_id": session_id,
+            "seq": seq,
+            "ts": when,
+            "kind": kind,
+            "phase": phase,
+            "span_id": span_id,
+            "parent_span_id": parent_span_id,
+            "tool_name": tool_name,
+            "status": status,
+            "duration_ms": int(duration_ms) if duration_ms is not None else None,
+            "is_error": bool(is_error),
+            "title": _normalize_preview(title, 120),
+            "preview": _normalize_preview(preview, 220),
+            "payload": payload_clean,
+            "source_platform": source_platform,
+            "source_surface": source_surface,
+            "scope": _event_scope(kind, bool(is_error)),
+            "synthetic": False,
+        }
+
+    def get_events(
+        self,
+        session_id: str,
+        *,
+        kinds: Optional[List[str]] = None,
+        tool_name: Optional[str] = None,
+        status: Optional[str] = None,
+        text: Optional[str] = None,
+        min_duration_ms: Optional[int] = None,
+        after_id: Optional[int] = None,
+        since_ts: Optional[float] = None,
+        until_ts: Optional[float] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Return persisted audit events for a session, newest-first limited by filters."""
+        where_clauses = ["session_id = ?"]
+        params: List[Any] = [session_id]
+
+        if kinds:
+            placeholders = ",".join("?" for _ in kinds)
+            where_clauses.append(f"kind IN ({placeholders})")
+            params.extend(kinds)
+        if tool_name:
+            where_clauses.append("tool_name = ?")
+            params.append(tool_name)
+        if status:
+            if status == "error":
+                where_clauses.append("(status = ? OR is_error = 1)")
+            elif status == "running":
+                where_clauses.append("status = ?")
+            else:
+                where_clauses.append("status = ?")
+            params.append(status)
+        if text:
+            where_clauses.append("(COALESCE(title, '') LIKE ? OR COALESCE(preview, '') LIKE ? OR COALESCE(payload_json, '') LIKE ?)")
+            like = f"%{text}%"
+            params.extend([like, like, like])
+        if min_duration_ms is not None:
+            where_clauses.append("COALESCE(duration_ms, 0) >= ?")
+            params.append(int(min_duration_ms))
+        if after_id is not None:
+            where_clauses.append("id > ?")
+            params.append(int(after_id))
+        if since_ts is not None:
+            where_clauses.append("ts >= ?")
+            params.append(float(since_ts))
+        if until_ts is not None:
+            where_clauses.append("ts <= ?")
+            params.append(float(until_ts))
+
+        params.append(max(1, int(limit)))
+        sql = (
+            "SELECT * FROM session_events WHERE "
+            + " AND ".join(where_clauses)
+            + " ORDER BY ts ASC, id ASC LIMIT ?"
+        )
+        with self._lock:
+            cursor = self._conn.execute(sql, params)
+            rows = cursor.fetchall()
+        return [self._decode_event_row(dict(row)) for row in rows]
+
+    def get_events_since(self, after_id: int = 0, limit: int = 200, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Return new events after the given autoincrement row id."""
+        params: List[Any] = [int(after_id)]
+        where_sql = "id > ?"
+        if session_id:
+            where_sql += " AND session_id = ?"
+            params.append(session_id)
+        params.append(max(1, int(limit)))
+        with self._lock:
+            cursor = self._conn.execute(
+                f"SELECT * FROM session_events WHERE {where_sql} ORDER BY id ASC LIMIT ?",
+                params,
+            )
+            rows = cursor.fetchall()
+        return [self._decode_event_row(dict(row)) for row in rows]
+
+    def get_session_metrics(self, session_id: str) -> Dict[str, Any]:
+        """Compute audit-oriented metrics for a session."""
+        session = self.get_session(session_id) or {}
+        events = self.get_audit_events(session_id, limit=5000)
+        transcript = self.get_messages(session_id)
+        tool_finish = [event for event in events if event["kind"] == "tool_finish"]
+        errors = [event for event in events if event.get("is_error")]
+        durations = [event.get("duration_ms") or 0 for event in tool_finish if event.get("duration_ms") is not None]
+        runtime_ms = None
+        if events:
+            runtime_ms = max(0, int((events[-1]["ts"] - events[0]["ts"]) * 1000))
+        elif session.get("ended_at") and session.get("started_at"):
+            runtime_ms = max(0, int((session["ended_at"] - session["started_at"]) * 1000))
+
+        tool_stats: Dict[str, Dict[str, Any]] = {}
+        for event in tool_finish:
+            name = event.get("tool_name") or "tool"
+            stat = tool_stats.setdefault(
+                name,
+                {"tool_name": name, "count": 0, "error_count": 0, "max_duration_ms": 0, "total_duration_ms": 0},
+            )
+            stat["count"] += 1
+            if event.get("is_error"):
+                stat["error_count"] += 1
+            dur = int(event.get("duration_ms") or 0)
+            stat["total_duration_ms"] += dur
+            stat["max_duration_ms"] = max(stat["max_duration_ms"], dur)
+        slowest_tools = sorted(
+            [
+                {
+                    **stat,
+                    "avg_duration_ms": int(stat["total_duration_ms"] / stat["count"]) if stat["count"] else 0,
+                }
+                for stat in tool_stats.values()
+            ],
+            key=lambda item: (item["max_duration_ms"], item["count"]),
+            reverse=True,
+        )[:5]
+
+        last_status = "running"
+        if session.get("ended_at"):
+            last_status = "ok" if not errors else "error"
+        elif any(event.get("status") == "running" for event in events):
+            last_status = "running"
+        elif errors:
+            last_status = "error"
+
+        return {
+            "session_id": session_id,
+            "runtime_ms": runtime_ms,
+            "message_count": len(transcript),
+            "tool_count": len(tool_finish),
+            "error_count": len(errors),
+            "last_status": last_status,
+            "slowest_tools": slowest_tools,
+            "first_event_ts": events[0]["ts"] if events else session.get("started_at"),
+            "last_event_ts": events[-1]["ts"] if events else session.get("ended_at") or session.get("started_at"),
+        }
+
+    def get_transcript_rows(self, session_id: str) -> List[Dict[str, Any]]:
+        """Return transcript rows normalized for audit UI consumption."""
+        messages = self.get_messages(session_id)
+        rows: List[Dict[str, Any]] = []
+        for msg in messages:
+            content = msg.get("content")
+            if msg.get("role") == "assistant" and not content and msg.get("tool_calls"):
+                content = json.dumps(msg.get("tool_calls"), ensure_ascii=False)
+            rows.append(
+                {
+                    "id": msg.get("id"),
+                    "kind": "transcript",
+                    "role": msg.get("role"),
+                    "tool_name": msg.get("tool_name"),
+                    "tool_call_id": msg.get("tool_call_id"),
+                    "content": content,
+                    "preview": _normalize_preview(content, 220),
+                    "ts": msg.get("timestamp"),
+                    "finish_reason": msg.get("finish_reason"),
+                    "tool_calls": msg.get("tool_calls"),
+                }
+            )
+        return rows
+
+    def get_audit_events(self, session_id: str, **kwargs) -> List[Dict[str, Any]]:
+        """Return persisted audit events, or synthesized ones for older sessions."""
+        events = self.get_events(session_id, **kwargs)
+        if events:
+            return events
+        synthetic = self._synthesize_events_from_messages(session_id)
+        tool_name = kwargs.get("tool_name")
+        status = kwargs.get("status")
+        text = kwargs.get("text")
+        min_duration_ms = kwargs.get("min_duration_ms")
+        since_ts = kwargs.get("since_ts")
+        until_ts = kwargs.get("until_ts")
+        kinds = set(kwargs.get("kinds") or [])
+        filtered = []
+        for event in synthetic:
+            if kinds and event.get("kind") not in kinds:
+                continue
+            if tool_name and event.get("tool_name") != tool_name:
+                continue
+            if status == "error" and not event.get("is_error"):
+                continue
+            if status and status not in {"error"} and event.get("status") != status:
+                continue
+            if text:
+                haystack = " ".join(
+                    str(event.get(key) or "")
+                    for key in ("title", "preview", "tool_name", "payload")
+                ).lower()
+                if text.lower() not in haystack:
+                    continue
+            if min_duration_ms is not None and (event.get("duration_ms") or 0) < int(min_duration_ms):
+                continue
+            if since_ts is not None and (event.get("ts") or 0) < float(since_ts):
+                continue
+            if until_ts is not None and (event.get("ts") or 0) > float(until_ts):
+                continue
+            filtered.append(event)
+        return filtered[: max(1, int(kwargs.get("limit", 200)))]
+
+    def get_audit_session_summary(
+        self,
+        *,
+        source: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        text: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return sessions enriched with audit-oriented metrics for the audit viewer."""
+        sessions = self.list_sessions_rich(source=source, limit=limit, offset=offset)
+        results = []
+        for session in sessions:
+            if text:
+                haystack = " ".join(
+                    str(session.get(key) or "")
+                    for key in ("id", "title", "preview", "source", "model")
+                ).lower()
+                if text.lower() not in haystack:
+                    continue
+            metrics = self.get_session_metrics(session["id"])
+            results.append({**session, "metrics": metrics})
+        return results
+
+    def _decode_event_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        payload = None
+        if row.get("payload_json"):
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                payload = row["payload_json"]
+        return {
+            "id": row.get("id"),
+            "event_id": row.get("event_id"),
+            "session_id": row.get("session_id"),
+            "seq": row.get("seq"),
+            "ts": row.get("ts"),
+            "kind": row.get("kind"),
+            "phase": row.get("phase"),
+            "span_id": row.get("span_id"),
+            "parent_span_id": row.get("parent_span_id"),
+            "tool_name": row.get("tool_name"),
+            "status": row.get("status"),
+            "duration_ms": row.get("duration_ms"),
+            "is_error": bool(row.get("is_error")),
+            "title": row.get("title"),
+            "preview": row.get("preview"),
+            "payload": payload,
+            "source_platform": row.get("source_platform"),
+            "source_surface": row.get("source_surface"),
+            "scope": _event_scope(row.get("kind"), bool(row.get("is_error"))),
+            "synthetic": False,
+        }
+
+    def _synthesize_events_from_messages(self, session_id: str) -> List[Dict[str, Any]]:
+        """Best-effort event timeline for older sessions with no persisted events."""
+        messages = self.get_messages(session_id)
+        session = self.get_session(session_id) or {}
+        source_platform = session.get("source")
+        pending_calls: List[Dict[str, Any]] = []
+        events: List[Dict[str, Any]] = []
+        seq = 0
+
+        for msg in messages:
+            msg_ts = float(msg.get("timestamp") or session.get("started_at") or time.time())
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tool_call in msg["tool_calls"]:
+                    seq += 1
+                    function = tool_call.get("function") or {}
+                    tool_name = function.get("name") or "tool"
+                    preview = _normalize_preview(function.get("arguments"), 180) or tool_name
+                    span_id = tool_call.get("id") or f"synthetic_{session_id}_{seq}"
+                    pending_calls.append({"span_id": span_id, "tool_name": tool_name})
+                    events.append(
+                        {
+                            "id": None,
+                            "event_id": f"synthetic:{session_id}:{seq}",
+                            "session_id": session_id,
+                            "seq": seq,
+                            "ts": msg_ts,
+                            "kind": "tool_start",
+                            "phase": "tool",
+                            "span_id": span_id,
+                            "parent_span_id": None,
+                            "tool_name": tool_name,
+                            "status": "running",
+                            "duration_ms": None,
+                            "is_error": False,
+                            "title": f"{tool_name} started",
+                            "preview": preview,
+                            "payload": {
+                                "tool_call": _redact_event_payload(tool_call),
+                            },
+                            "source_platform": source_platform,
+                            "source_surface": source_platform,
+                            "scope": "tools",
+                            "synthetic": True,
+                        }
+                    )
+            elif msg.get("role") == "tool":
+                seq += 1
+                pending = pending_calls.pop(0) if pending_calls else {}
+                tool_name = msg.get("tool_name") or pending.get("tool_name") or "tool"
+                content = msg.get("content") or ""
+                status = "error" if "[error" in content.lower() or "error" in content.lower() else "ok"
+                events.append(
+                    {
+                        "id": None,
+                        "event_id": f"synthetic:{session_id}:{seq}",
+                        "session_id": session_id,
+                        "seq": seq,
+                        "ts": msg_ts,
+                        "kind": "tool_finish",
+                        "phase": "tool",
+                        "span_id": pending.get("span_id"),
+                        "parent_span_id": None,
+                        "tool_name": tool_name,
+                        "status": status,
+                        "duration_ms": None,
+                        "is_error": status == "error",
+                        "title": f"{tool_name} finished",
+                        "preview": _normalize_preview(content, 220),
+                        "payload": {"result": _normalize_preview(content, 1000)},
+                        "source_platform": source_platform,
+                        "source_surface": source_platform,
+                        "scope": "errors" if status == "error" else "tools",
+                        "synthetic": True,
+                    }
+                )
+            elif msg.get("role") == "assistant" and msg.get("content"):
+                seq += 1
+                content = msg.get("content") or ""
+                events.append(
+                    {
+                        "id": None,
+                        "event_id": f"synthetic:{session_id}:{seq}",
+                        "session_id": session_id,
+                        "seq": seq,
+                        "ts": msg_ts,
+                        "kind": "message",
+                        "phase": "done",
+                        "span_id": None,
+                        "parent_span_id": None,
+                        "tool_name": None,
+                        "status": "ok",
+                        "duration_ms": None,
+                        "is_error": False,
+                        "title": "Assistant response",
+                        "preview": _normalize_preview(content, 220),
+                        "payload": {"content": _normalize_preview(content, 2000)},
+                        "source_platform": source_platform,
+                        "source_surface": source_platform,
+                        "scope": "results",
+                        "synthetic": True,
+                    }
+                )
+
+        return events
+
     def get_messages_as_conversation(self, session_id: str) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -904,6 +1451,9 @@ class SessionDB:
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
             self._conn.execute(
+                "DELETE FROM session_events WHERE session_id = ?", (session_id,)
+            )
+            self._conn.execute(
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
@@ -917,6 +1467,7 @@ class SessionDB:
             )
             if cursor.fetchone()[0] == 0:
                 return False
+            self._conn.execute("DELETE FROM session_events WHERE session_id = ?", (session_id,))
             self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._conn.commit()
@@ -945,8 +1496,28 @@ class SessionDB:
             session_ids = [row["id"] for row in cursor.fetchall()]
 
             for sid in session_ids:
+                self._conn.execute("DELETE FROM session_events WHERE session_id = ?", (sid,))
                 self._conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 self._conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
 
             self._conn.commit()
         return len(session_ids)
+
+
+class AuditEventStore:
+    """Small helper wrapper around SessionDB for writing/querying audit events."""
+
+    def __init__(self, db: SessionDB):
+        self.db = db
+
+    def append(self, session_id: str, **kwargs) -> Dict[str, Any]:
+        return self.db.append_event(session_id, **kwargs)
+
+    def list(self, session_id: str, **kwargs) -> List[Dict[str, Any]]:
+        return self.db.get_events(session_id, **kwargs)
+
+    def since(self, after_id: int = 0, **kwargs) -> List[Dict[str, Any]]:
+        return self.db.get_events_since(after_id=after_id, **kwargs)
+
+    def metrics(self, session_id: str) -> Dict[str, Any]:
+        return self.db.get_session_metrics(session_id)

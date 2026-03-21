@@ -3011,6 +3011,7 @@ Examples:
     hermes -s hermes-agent-dev,github-auth
     hermes -w                     Start in isolated git worktree
     hermes gateway install        Install gateway background service
+    hermes audit serve           Start the local audit viewer
     hermes sessions list          List past sessions
     hermes sessions browse        Interactive session picker
     hermes sessions rename ID T   Rename/title a session
@@ -3223,6 +3224,30 @@ For more help on a command:
     gateway_setup = gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 
     gateway_parser.set_defaults(func=cmd_gateway)
+
+    # =========================================================================
+    # audit command
+    # =========================================================================
+    audit_parser = subparsers.add_parser(
+        "audit",
+        help="Run the local audit viewer for sessions and tool/runtime logs",
+        description="Serve a localhost-only web viewer for Hermes session transcripts and audit events",
+    )
+    audit_subparsers = audit_parser.add_subparsers(dest="audit_command")
+
+    audit_serve = audit_subparsers.add_parser("serve", help="Start the audit web server")
+    audit_serve.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1)")
+    audit_serve.add_argument("--port", type=int, default=8646, help="Port to bind (default: 8646)")
+    audit_serve.add_argument("--open", action="store_true", help="Open the audit viewer in the default browser")
+
+    def cmd_audit(args):
+        if args.audit_command != "serve":
+            audit_parser.print_help()
+            return
+        from hermes_cli.audit_server import serve_audit_viewer
+        serve_audit_viewer(host=args.host, port=args.port, open_browser=bool(args.open))
+
+    audit_parser.set_defaults(func=cmd_audit)
     
     # =========================================================================
     # setup command

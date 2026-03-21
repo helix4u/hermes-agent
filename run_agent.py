@@ -891,6 +891,7 @@ class AIAgent:
         
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
+        self._audit_store = None
         self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
         if self._session_db:
             try:
@@ -907,6 +908,23 @@ class AIAgent:
                 )
             except Exception as e:
                 logger.debug("Session DB create_session failed: %s", e)
+            try:
+                from hermes_state import AuditEventStore
+                self._audit_store = AuditEventStore(self._session_db)
+                self._audit_emit(
+                    kind="system",
+                    phase="starting",
+                    status="ok",
+                    title="Session started",
+                    preview=f"model={self.model}",
+                    payload={
+                        "model": self.model,
+                        "provider": self.provider,
+                        "platform": self.platform or "cli",
+                    },
+                )
+            except Exception as e:
+                logger.debug("Audit event store setup failed: %s", e)
         
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
@@ -1519,6 +1537,125 @@ class AIAgent:
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
             logger.debug("Session DB append_message failed: %s", e)
+
+    def _audit_emit(
+        self,
+        *,
+        kind: str,
+        phase: str = None,
+        span_id: str = None,
+        parent_span_id: str = None,
+        tool_name: str = None,
+        status: str = None,
+        duration_ms: int = None,
+        is_error: bool = False,
+        title: str = None,
+        preview: str = None,
+        payload: Any = None,
+    ) -> None:
+        """Persist an audit event when session DB logging is available."""
+        if not self._audit_store or not self.session_id:
+            return
+        try:
+            self._audit_store.append(
+                self.session_id,
+                kind=kind,
+                phase=phase,
+                span_id=span_id,
+                parent_span_id=parent_span_id,
+                tool_name=tool_name,
+                status=status,
+                duration_ms=duration_ms,
+                is_error=is_error,
+                title=title,
+                preview=preview,
+                payload=payload,
+                source_platform=self.platform or "cli",
+                source_surface=self.platform or "cli",
+            )
+        except Exception as e:
+            logger.debug("Audit event append failed: %s", e)
+
+    def _audit_emit_thinking(self, text: str) -> None:
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return
+        self._audit_emit(
+            kind="thinking",
+            phase="thinking",
+            status="running",
+            title="Thinking",
+            preview=cleaned,
+            payload={"text": cleaned},
+        )
+
+    def _audit_emit_tool_start(self, tool_name: str, tool_args: Dict[str, Any], span_id: str) -> None:
+        preview = _build_tool_preview(tool_name, tool_args) or tool_name
+        self._audit_emit(
+            kind="tool_start",
+            phase="tool",
+            span_id=span_id,
+            tool_name=tool_name,
+            status="running",
+            title=f"{tool_name} started",
+            preview=preview,
+            payload={"args": tool_args},
+        )
+
+    def _audit_emit_tool_finish(
+        self,
+        tool_name: str,
+        tool_result: str,
+        duration_seconds: float,
+        span_id: str,
+        *,
+        is_error: bool,
+        status_suffix: str = "",
+    ) -> None:
+        status = "error" if is_error else "ok"
+        preview = tool_result[:400] if isinstance(tool_result, str) else str(tool_result)
+        if status_suffix:
+            preview = f"{status_suffix.strip()} {preview}".strip()
+        self._audit_emit(
+            kind="tool_finish",
+            phase="tool",
+            span_id=span_id,
+            tool_name=tool_name,
+            status=status,
+            duration_ms=max(0, int((duration_seconds or 0.0) * 1000)),
+            is_error=is_error,
+            title=f"{tool_name} finished",
+            preview=preview,
+            payload={
+                "result": tool_result[:4000] if isinstance(tool_result, str) else str(tool_result),
+                "status_suffix": status_suffix.strip(),
+            },
+        )
+
+    def _audit_emit_message(self, content: str, *, status: str = "ok") -> None:
+        text = (content or "").strip()
+        if not text:
+            return
+        self._audit_emit(
+            kind="message",
+            phase="done",
+            status=status,
+            is_error=status == "error",
+            title="Assistant response" if status == "ok" else "Assistant error response",
+            preview=text[:220],
+            payload={"content": text[:4000]},
+        )
+
+    def _audit_emit_error(self, title: str, error_text: str, *, payload: Any = None) -> None:
+        self._audit_emit(
+            kind="error",
+            phase="finalizing",
+            status="error",
+            is_error=True,
+            title=title,
+            preview=(error_text or "")[:220],
+            payload=payload or {"error": error_text},
+        )
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -4775,7 +4912,11 @@ class AIAgent:
                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
                     print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
-        for _, name, args in parsed_calls:
+        tool_span_ids = []
+        for tc, name, args in parsed_calls:
+            span_id = getattr(tc, "id", None) or f"{name}_{len(tool_span_ids) + 1}"
+            tool_span_ids.append(span_id)
+            self._audit_emit_tool_start(name, args, span_id)
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
@@ -4827,6 +4968,7 @@ class AIAgent:
         # ── Post-execution: display per-tool results ─────────────────────
         for i, (tc, name, args) in enumerate(parsed_calls):
             r = results[i]
+            span_id = tool_span_ids[i] if i < len(tool_span_ids) else getattr(tc, "id", None) or f"{name}_{i + 1}"
             if r is None:
                 # Shouldn't happen, but safety fallback
                 function_result = f"Error executing tool '{name}': thread did not return a result"
@@ -4862,6 +5004,14 @@ class AIAgent:
                     )
                 except Exception:
                     logging.debug("Tool progress completion callback failed for %s", name, exc_info=True)
+            self._audit_emit_tool_finish(
+                name,
+                function_result,
+                tool_duration,
+                span_id,
+                is_error=is_error,
+                status_suffix=status_suffix,
+            )
 
             # Print cute message per tool
             if self.quiet_mode:
@@ -4947,6 +5097,8 @@ class AIAgent:
                 function_args = {}
             if not isinstance(function_args, dict):
                 function_args = {}
+            span_id = getattr(tool_call, "id", None) or f"{function_name}_{i}"
+            self._audit_emit_tool_start(function_name, function_args, span_id)
 
             if not self.quiet_mode:
                 args_str = json.dumps(function_args, ensure_ascii=False)
@@ -5139,6 +5291,14 @@ class AIAgent:
                     )
                 except Exception:
                     logging.debug("Tool progress completion callback failed for %s", function_name, exc_info=True)
+            self._audit_emit_tool_finish(
+                function_name,
+                function_result,
+                tool_duration,
+                span_id,
+                is_error=_is_error_result,
+                status_suffix=_status_suffix,
+            )
 
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
@@ -5828,7 +5988,9 @@ class AIAgent:
                 if self.thinking_callback:
                     # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
                     # (works in both streaming and non-streaming modes)
-                    self.thinking_callback(f"{face} {verb}...")
+                    thinking_text = f"{face} {verb}..."
+                    self._audit_emit_thinking(thinking_text)
+                    self.thinking_callback(thinking_text)
                 elif not self._has_stream_consumers():
                     # Raw KawaiiSpinner only when no streaming consumers
                     # (would conflict with streamed token output)
@@ -6215,6 +6377,11 @@ class AIAgent:
                     self._persist_session(messages, conversation_history)
                     interrupted = True
                     final_response = f"Operation interrupted: waiting for model response ({api_elapsed:.1f}s elapsed)."
+                    self._audit_emit_error(
+                        "Conversation interrupted",
+                        final_response,
+                        payload={"api_elapsed_seconds": round(api_elapsed, 2)},
+                    )
                     break
 
                 except Exception as api_error:
@@ -6646,6 +6813,7 @@ class AIAgent:
                     ).strip()
                     first_line = _think_text.split('\n')[0][:80] if _think_text else ""
                     if first_line:
+                        self._audit_emit_thinking(first_line)
                         try:
                             self.tool_progress_callback("_thinking", first_line)
                         except Exception:
@@ -7054,6 +7222,11 @@ class AIAgent:
 
                             self._cleanup_task_resources(effective_task_id)
                             self._persist_session(messages, conversation_history)
+                            self._audit_emit_error(
+                                "Model returned only thinking blocks",
+                                "Model generated only think blocks with no actual response after 3 retries",
+                                payload={"api_calls": api_call_count},
+                            )
 
                             return {
                                 "final_response": final_response or None,
@@ -7107,6 +7280,7 @@ class AIAgent:
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
                     
                     messages.append(final_msg)
+                    self._audit_emit_message(final_response, status="ok")
                     
                     if not self.quiet_mode:
                         self._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
@@ -7163,6 +7337,11 @@ class AIAgent:
                 # If we're near the limit, break to avoid infinite loops
                 if api_call_count >= self.max_iterations - 1:
                     final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
+                    self._audit_emit_error(
+                        "API loop error",
+                        error_msg,
+                        payload={"api_call_count": api_call_count},
+                    )
                     break
         
         if final_response is None and (
@@ -7172,6 +7351,11 @@ class AIAgent:
             if self.iteration_budget.remaining <= 0 and not self.quiet_mode:
                 print(f"\n⚠️  Session iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} used, including subagents)")
             final_response = self._handle_max_iterations(messages, api_call_count)
+            self._audit_emit_error(
+                "Iteration limit reached",
+                final_response,
+                payload={"api_call_count": api_call_count},
+            )
         
         # Determine if conversation completed successfully
         completed = final_response is not None and api_call_count < self.max_iterations
@@ -7184,6 +7368,19 @@ class AIAgent:
 
         # Persist session to both JSON log and SQLite
         self._persist_session(messages, conversation_history)
+        self._audit_emit(
+            kind="system",
+            phase="done",
+            status="error" if interrupted or not completed else "ok",
+            is_error=bool(interrupted or not completed),
+            title="Conversation finished",
+            preview=(final_response or "")[:220] if final_response else None,
+            payload={
+                "completed": completed,
+                "interrupted": interrupted,
+                "api_calls": api_call_count,
+            },
+        )
 
         # Sync conversation to Honcho for user modeling
         if final_response and not interrupted and sync_honcho:

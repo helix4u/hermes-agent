@@ -50,6 +50,20 @@ _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
 
 
+def _emit_audit_event(audit_store, session_id: Optional[str], **kwargs) -> None:
+    if not audit_store or not session_id:
+        return
+    try:
+        audit_store.append(
+            session_id,
+            source_platform="cron",
+            source_surface="cron",
+            **kwargs,
+        )
+    except Exception as e:
+        logger.debug("Cron audit event failed: %s", e)
+
+
 def _resolve_origin(job: dict) -> Optional[dict]:
     """Extract origin info from a job, preserving any extra routing metadata."""
     origin = job.get("origin")
@@ -106,7 +120,7 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     }
 
 
-def _deliver_result(job: dict, content: str) -> None:
+def _deliver_result(job: dict, content: str, *, session_id: Optional[str] = None, audit_store=None) -> None:
     """
     Deliver job output to the configured target (origin chat, specific platform, etc.).
 
@@ -120,6 +134,17 @@ def _deliver_result(job: dict, content: str) -> None:
                 "Job '%s' deliver=%s but no concrete delivery target could be resolved",
                 job["id"],
                 job.get("deliver", "local"),
+            )
+            _emit_audit_event(
+                audit_store,
+                session_id,
+                kind="delivery",
+                phase="finalizing",
+                status="error",
+                is_error=True,
+                title="Delivery target unresolved",
+                preview=f"deliver={job.get('deliver', 'local')}",
+                payload={"job_id": job["id"], "deliver": job.get("deliver", "local")},
             )
         return
 
@@ -158,11 +183,37 @@ def _deliver_result(job: dict, content: str) -> None:
         job.get("deliver", "local"),
         len(str(content or "")),
     )
+    _emit_audit_event(
+        audit_store,
+        session_id,
+        kind="delivery",
+        phase="finalizing",
+        status="running",
+        title="Delivery attempt",
+        preview=f"{platform_name} delivery",
+        payload={
+            "job_id": job["id"],
+            "platform": platform_name,
+            "deliver": job.get("deliver", "local"),
+            "content_chars": len(str(content or "")),
+        },
+    )
 
     try:
         config = load_gateway_config()
     except Exception as e:
         logger.error("Job '%s': failed to load gateway config for delivery: %s", job["id"], e)
+        _emit_audit_event(
+            audit_store,
+            session_id,
+            kind="delivery",
+            phase="finalizing",
+            status="error",
+            is_error=True,
+            title="Delivery config load failed",
+            preview=str(e),
+            payload={"job_id": job["id"], "error": str(e)},
+        )
         return
 
     pconfig = config.platforms.get(platform)
@@ -173,6 +224,17 @@ def _deliver_result(job: dict, content: str) -> None:
             platform_name,
             bool(pconfig and pconfig.enabled),
             bool(getattr(pconfig, "token", None)),
+        )
+        _emit_audit_event(
+            audit_store,
+            session_id,
+            kind="delivery",
+            phase="finalizing",
+            status="error",
+            is_error=True,
+            title="Delivery platform unavailable",
+            preview=platform_name,
+            payload={"job_id": job["id"], "platform": platform_name},
         )
         return
 
@@ -188,12 +250,44 @@ def _deliver_result(job: dict, content: str) -> None:
             result = future.result(timeout=30)
     except Exception as e:
         logger.error("Job '%s': delivery to %s failed: %s", job["id"], target_label, e)
+        _emit_audit_event(
+            audit_store,
+            session_id,
+            kind="delivery",
+            phase="finalizing",
+            status="error",
+            is_error=True,
+            title="Delivery send failed",
+            preview=str(e),
+            payload={"job_id": job["id"], "platform": platform_name, "error": str(e)},
+        )
         return
 
     if result and result.get("error"):
         logger.error("Job '%s': delivery error to %s: %s", job["id"], target_label, result["error"])
+        _emit_audit_event(
+            audit_store,
+            session_id,
+            kind="delivery",
+            phase="finalizing",
+            status="error",
+            is_error=True,
+            title="Delivery error",
+            preview=str(result["error"]),
+            payload={"job_id": job["id"], "platform": platform_name, "error": result["error"]},
+        )
     else:
         logger.info("Job '%s': delivered to %s", job["id"], target_label)
+        _emit_audit_event(
+            audit_store,
+            session_id,
+            kind="delivery",
+            phase="done",
+            status="ok",
+            title="Delivered result",
+            preview=f"{platform_name} delivery succeeded",
+            payload={"job_id": job["id"], "platform": platform_name},
+        )
         # Mirror the delivered content into the target's gateway session
         try:
             from gateway.mirror import mirror_to_session
@@ -281,9 +375,11 @@ def run_job(
     # Initialize SQLite session store so cron job messages are persisted
     # and discoverable via session_search (same pattern as gateway/run.py).
     _session_db = None
+    audit_store = None
     try:
-        from hermes_state import SessionDB
+        from hermes_state import AuditEventStore, SessionDB
         _session_db = SessionDB()
+        audit_store = AuditEventStore(_session_db)
     except Exception as e:
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
     
@@ -292,8 +388,26 @@ def run_job(
     prompt = _build_job_prompt(job)
     origin = _resolve_origin(job)
 
+    effective_session_id = session_id or f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    job["__last_session_id"] = effective_session_id
+
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
+    _emit_audit_event(
+        audit_store,
+        effective_session_id,
+        kind="cron",
+        phase="starting",
+        status="running",
+        title="Cron job triggered",
+        preview=job_name,
+        payload={
+            "job_id": job_id,
+            "name": job_name,
+            "schedule": job.get("schedule_display"),
+            "deliver": job.get("deliver", "local"),
+        },
+    )
 
     # Inject origin context so the agent's send_message tool knows the chat
     if origin:
@@ -422,7 +536,7 @@ def run_job(
             disabled_toolsets=["cronjob", "messaging", "clarify"],
             quiet_mode=True,
             platform=platform,
-            session_id=session_id or f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}",
+            session_id=effective_session_id,
             session_db=_session_db,
             tool_progress_callback=tool_progress_callback,
             thinking_callback=thinking_callback,
@@ -450,11 +564,32 @@ def run_job(
 """
         
         logger.info("Job '%s' completed successfully", job_name)
+        _emit_audit_event(
+            audit_store,
+            effective_session_id,
+            kind="cron",
+            phase="done",
+            status="ok",
+            title="Cron job completed",
+            preview=final_response[:220] if final_response else job_name,
+            payload={"job_id": job_id, "success": True},
+        )
         return True, output, final_response, None
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.error("Job '%s' failed: %s", job_name, error_msg)
+        _emit_audit_event(
+            audit_store,
+            effective_session_id,
+            kind="cron",
+            phase="done",
+            status="error",
+            is_error=True,
+            title="Cron job failed",
+            preview=error_msg[:220],
+            payload={"job_id": job_id, "error": error_msg},
+        )
         
         output = f"""# Cron Job: {job_name} (FAILED)
 
@@ -549,16 +684,63 @@ def tick(verbose: bool = True) -> int:
                 should_deliver = bool(deliver_content)
                 if should_deliver and success and deliver_content.strip().upper().startswith(SILENT_MARKER):
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                    try:
+                        from hermes_state import AuditEventStore, SessionDB
+                        _db = SessionDB()
+                        _emit_audit_event(
+                            AuditEventStore(_db),
+                            job.get("__last_session_id"),
+                            kind="delivery",
+                            phase="finalizing",
+                            status="skipped",
+                            title="Delivery suppressed",
+                            preview=SILENT_MARKER,
+                            payload={"job_id": job["id"], "reason": "silent_marker"},
+                        )
+                        _db.close()
+                    except Exception:
+                        pass
                     should_deliver = False
                 elif not should_deliver:
                     logger.info(
                         "Job '%s': no delivery attempted because final response was empty",
                         job["id"],
                     )
+                    try:
+                        from hermes_state import AuditEventStore, SessionDB
+                        _db = SessionDB()
+                        _emit_audit_event(
+                            AuditEventStore(_db),
+                            job.get("__last_session_id"),
+                            kind="delivery",
+                            phase="finalizing",
+                            status="skipped",
+                            title="No delivery attempted",
+                            preview="final response was empty",
+                            payload={"job_id": job["id"], "reason": "empty_response"},
+                        )
+                        _db.close()
+                    except Exception:
+                        pass
 
                 if should_deliver:
                     try:
-                        _deliver_result(job, deliver_content)
+                        delivery_session_id = job.get("__last_session_id")
+                        audit_store = None
+                        try:
+                            from hermes_state import AuditEventStore, SessionDB
+                            delivery_db = SessionDB()
+                            audit_store = AuditEventStore(delivery_db)
+                        except Exception:
+                            delivery_db = None
+                        try:
+                            _deliver_result(job, deliver_content, session_id=delivery_session_id, audit_store=audit_store)
+                        finally:
+                            if 'delivery_db' in locals() and delivery_db is not None:
+                                try:
+                                    delivery_db.close()
+                                except Exception:
+                                    pass
                     except Exception as de:
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
 

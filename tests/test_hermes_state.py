@@ -178,6 +178,64 @@ class TestMessageStorage:
         assert messages[0]["finish_reason"] == "stop"
 
 
+class TestAuditEvents:
+    def test_append_and_query_session_events(self, db):
+        db.create_session(session_id="s1", source="cli")
+
+        event = db.append_event(
+            "s1",
+            kind="tool_finish",
+            phase="tool",
+            tool_name="terminal",
+            status="ok",
+            duration_ms=420,
+            title="terminal finished",
+            preview="python script.py",
+            payload={"chat_id": "123", "result": "done"},
+            source_platform="cli",
+            source_surface="cli",
+        )
+
+        events = db.get_events("s1")
+        assert len(events) == 1
+        assert events[0]["event_id"] == event["event_id"]
+        assert events[0]["tool_name"] == "terminal"
+        assert events[0]["duration_ms"] == 420
+        assert events[0]["payload"]["chat_id"] == "[redacted]"
+        assert events[0]["scope"] == "tools"
+
+    def test_audit_metrics_use_persisted_events(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="hello")
+        db.append_event("s1", kind="tool_start", phase="tool", tool_name="terminal", status="running")
+        db.append_event("s1", kind="tool_finish", phase="tool", tool_name="terminal", status="ok", duration_ms=500)
+        db.append_event("s1", kind="delivery", phase="done", status="error", is_error=True, title="Delivery error")
+
+        metrics = db.get_session_metrics("s1")
+
+        assert metrics["tool_count"] == 1
+        assert metrics["error_count"] == 1
+        assert metrics["last_status"] in {"running", "error"}
+        assert metrics["slowest_tools"][0]["tool_name"] == "terminal"
+
+    def test_synthesizes_audit_events_for_older_sessions(self, db):
+        db.create_session(session_id="s1", source="cli")
+        tool_calls = [
+            {"id": "call_1", "function": {"name": "web_search", "arguments": "{\"query\":\"hermes\"}"}},
+        ]
+        db.append_message("s1", role="user", content="search")
+        db.append_message("s1", role="assistant", content="", tool_calls=tool_calls)
+        db.append_message("s1", role="tool", content="results", tool_name="web_search")
+        db.append_message("s1", role="assistant", content="Done.")
+
+        events = db.get_audit_events("s1")
+
+        assert any(event["kind"] == "tool_start" for event in events)
+        assert any(event["kind"] == "tool_finish" for event in events)
+        assert any(event["kind"] == "message" for event in events)
+        assert all(event["synthetic"] for event in events)
+
+
 # =========================================================================
 # FTS5 search
 # =========================================================================
@@ -737,7 +795,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 5
+        assert version == 6
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -793,12 +851,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v5
+        # Open with SessionDB — should migrate to v6
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 5
+        assert cursor.fetchone()[0] == 6
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")

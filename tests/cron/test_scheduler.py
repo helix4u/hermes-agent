@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, run_job, SILENT_MARKER, _build_job_prompt
+from hermes_state import SessionDB
 
 
 class TestResolveOrigin:
@@ -214,6 +215,38 @@ class TestDeliverResultMirrorLogging:
             "delivery error to discord:123456789012345678: Discord API error (403): Missing Access" in msg
             for msg in messages
         )
+
+    def test_delivery_writes_audit_events(self, tmp_path):
+        from gateway.config import Platform
+        from hermes_state import AuditEventStore
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="cron")
+        audit_store = AuditEventStore(db)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.token = "***"
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        job = {
+            "id": "test-job",
+            "deliver": "origin",
+            "origin": {"platform": "discord", "chat_id": "123456789012345678"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.mirror.mirror_to_session"):
+            _deliver_result(job, "hello from cron", session_id="sess-1", audit_store=audit_store)
+
+        events = db.get_events("sess-1")
+        assert len(events) == 2
+        assert events[0]["kind"] == "delivery"
+        assert events[0]["status"] == "running"
+        assert events[1]["status"] == "ok"
+        db.close()
 
 
 class TestRunJobSessionPersistence:
@@ -462,6 +495,7 @@ class TestRunJobPerJobOverrides:
         runtime_mock.assert_called_once_with(
             requested="custom",
             explicit_base_url="http://127.0.0.1:4000/v1",
+            allow_device_auth=False,
         )
         assert mock_agent_cls.call_args.kwargs["model"] == "perplexity/sonar-pro"
         fake_db.close.assert_called_once()
