@@ -28,6 +28,7 @@ import threading
 import time
 import uuid
 import webbrowser
+import ssl
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -199,9 +200,9 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     "opencode-go": ProviderConfig(
         id="opencode-go",
         name="OpenCode Go",
-        auth_type="***",
+        auth_type="api_key",
         inference_base_url="https://opencode.ai/zen/go/v1",
-        api_key_env_vars=("OPEN...",),
+        api_key_env_vars=("OPENCODE_GO_API_KEY",),
         base_url_env_var="OPENCODE_GO_BASE_URL",
     ),
     "kilocode": ProviderConfig(
@@ -278,6 +279,33 @@ def _try_gh_cli_token() -> Optional[str]:
     return None
 
 
+_PLACEHOLDER_SECRET_VALUES = {
+    "*",
+    "**",
+    "***",
+    "changeme",
+    "your_api_key",
+    "your-api-key",
+    "placeholder",
+    "example",
+    "dummy",
+    "null",
+    "none",
+}
+
+
+def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
+    """Return True when a configured secret looks usable, not empty/placeholder."""
+    if not isinstance(value, str):
+        return False
+    cleaned = value.strip()
+    if len(cleaned) < min_length:
+        return False
+    if cleaned.lower() in _PLACEHOLDER_SECRET_VALUES:
+        return False
+    return True
+
+
 def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
 ) -> tuple[str, str]:
@@ -297,7 +325,7 @@ def _resolve_api_key_provider_secret(
 
     for env_var in pconfig.api_key_env_vars:
         val = os.getenv(env_var, "").strip()
-        if val:
+        if has_usable_secret(val):
             return val, env_var
 
     return "", ""
@@ -668,8 +696,10 @@ def resolve_provider(
     }
     normalized = _PROVIDER_ALIASES.get(normalized, normalized)
 
-    if normalized in {"openrouter", "custom"}:
+    if normalized == "openrouter":
         return "openrouter"
+    if normalized == "custom":
+        return "custom"
     if normalized in PROVIDER_REGISTRY:
         return normalized
     if normalized != "auto":
@@ -693,7 +723,7 @@ def resolve_provider(
     except Exception as e:
         logger.debug("Could not detect active auth provider: %s", e)
 
-    if os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY"):
+    if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
         return "openrouter"
 
     # Auto-detect API-key providers by checking their env vars
@@ -706,7 +736,7 @@ def resolve_provider(
         if pid == "copilot":
             continue
         for env_var in pconfig.api_key_env_vars:
-            if os.getenv(env_var, "").strip():
+            if has_usable_secret(os.getenv(env_var, "")):
                 return pid
 
     return "openrouter"
@@ -1122,6 +1152,13 @@ def _resolve_verify(
     return True
 
 
+def _httpx_verify_arg(verify: bool | str) -> bool | ssl.SSLContext:
+    """Convert persisted TLS settings into the form preferred by httpx."""
+    if isinstance(verify, str):
+        return ssl.create_default_context(cafile=verify)
+    return verify
+
+
 # =============================================================================
 # OAuth Device Code Flow — generic, parameterized by provider
 # =============================================================================
@@ -1283,7 +1320,11 @@ def fetch_nous_models(
 ) -> List[str]:
     """Fetch available model IDs from the Nous inference API."""
     timeout = httpx.Timeout(timeout_seconds)
-    with httpx.Client(timeout=timeout, headers={"Accept": "application/json"}, verify=verify) as client:
+    with httpx.Client(
+        timeout=timeout,
+        headers={"Accept": "application/json"},
+        verify=_httpx_verify_arg(verify),
+    ) as client:
         response = client.get(
             f"{inference_base_url.rstrip('/')}/models",
             headers={"Authorization": f"Bearer {api_key}"},
@@ -1410,7 +1451,11 @@ def resolve_nous_runtime_credentials(
             refresh_token_fp=_token_fingerprint(state.get("refresh_token")),
         )
 
-        with httpx.Client(timeout=timeout, headers={"Accept": "application/json"}, verify=verify) as client:
+        with httpx.Client(
+            timeout=timeout,
+            headers={"Accept": "application/json"},
+            verify=_httpx_verify_arg(verify),
+        ) as client:
             access_token = state.get("access_token")
             refresh_token = state.get("refresh_token")
 
@@ -2245,7 +2290,11 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
         print(f"TLS verification: custom CA bundle ({ca_bundle})")
 
     try:
-        with httpx.Client(timeout=timeout, headers={"Accept": "application/json"}, verify=verify) as client:
+        with httpx.Client(
+            timeout=timeout,
+            headers={"Accept": "application/json"},
+            verify=_httpx_verify_arg(verify),
+        ) as client:
             device_data = _request_device_code(
                 client=client, portal_base_url=portal_base_url,
                 client_id=client_id, scope=scope,

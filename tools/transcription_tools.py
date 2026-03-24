@@ -200,10 +200,20 @@ def _get_provider(stt_config: dict) -> str:
         or os.getenv("HERMES_STT_STRICT_PROVIDER", "")
     ).strip().lower() in {"1", "true", "yes", "on"}
     if provider == "local":
+        if provider_is_explicit:
+            if _HAS_FASTER_WHISPER:
+                return "local"
+            if _has_local_command():
+                logger.info("faster-whisper not installed, falling back to local STT command")
+                return "local_command"
+            if strict_provider:
+                return "none"
+            if _HAS_OPENAI and os.getenv("GROQ_API_KEY"):
+                logger.info("faster-whisper not installed, falling back to Groq Whisper API")
+                return "groq"
+            return "none"
         if _HAS_FASTER_WHISPER:
             return "local"
-        if provider_is_explicit and strict_provider:
-            return "none"
         if _HAS_OPENAI and os.getenv("GROQ_API_KEY"):
             logger.info("faster-whisper not installed, falling back to Groq Whisper API")
             return "groq"
@@ -474,12 +484,12 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
 
 def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
     """Transcribe using OpenAI Whisper API (paid)."""
-    api_key = _resolve_openai_api_key()
+    api_key = os.getenv("VOICE_TOOLS_OPENAI_KEY", "").strip()
     if not api_key:
         return {
             "success": False,
             "transcript": "",
-            "error": "Neither VOICE_TOOLS_OPENAI_KEY nor OPENAI_API_KEY is set",
+            "error": "VOICE_TOOLS_OPENAI_KEY not set",
         }
 
     if not _HAS_OPENAI:

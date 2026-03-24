@@ -67,11 +67,15 @@ from typing import Dict, Any, Optional, List
 from pathlib import Path
 from urllib.parse import urlparse
 from agent.auxiliary_client import call_llm
+from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
 
-# Standard PATH entries for environments with minimal PATH (e.g. systemd services)
+# Standard PATH entries for environments with minimal PATH (e.g. systemd services).
+# Includes macOS Homebrew paths (/opt/homebrew/* for Apple Silicon).
 _SANE_PATH_DIRS = (
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
     "/usr/local/sbin",
     "/usr/local/bin",
     "/usr/sbin",
@@ -79,6 +83,32 @@ _SANE_PATH_DIRS = (
     "/sbin",
     "/bin",
 )
+
+# Backward-compatible string form used by older tests/helpers.
+_SANE_PATH = os.pathsep.join(_SANE_PATH_DIRS)
+
+
+def _discover_homebrew_node_dirs() -> list[str]:
+    """Find Homebrew versioned Node.js bin directories (e.g. node@20, node@24).
+
+    When Node is installed via ``brew install node@24`` and NOT linked into
+    /opt/homebrew/bin, the binary lives only in /opt/homebrew/opt/node@24/bin/.
+    This function discovers those paths so they can be added to subprocess PATH.
+    """
+    dirs: list[str] = []
+    homebrew_opt = "/opt/homebrew/opt"
+    if not os.path.isdir(homebrew_opt):
+        return dirs
+    try:
+        for entry in os.listdir(homebrew_opt):
+            if entry.startswith("node") and entry != "node":
+                # e.g. node@20, node@24
+                bin_dir = os.path.join(homebrew_opt, entry, "bin")
+                if os.path.isdir(bin_dir):
+                    dirs.append(bin_dir)
+    except OSError:
+        pass
+    return dirs
 
 # Throttle screenshot cleanup to avoid repeated full directory scans.
 _last_screenshot_cleanup_by_dir: dict[str, float] = {}
@@ -95,6 +125,27 @@ DEFAULT_SESSION_TIMEOUT = 300
 
 # Max tokens for snapshot content before summarization
 SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
+
+
+def _get_command_timeout() -> int:
+    """Return the configured browser command timeout from config.yaml.
+
+    Reads ``config["browser"]["command_timeout"]`` and falls back to
+    ``DEFAULT_COMMAND_TIMEOUT`` (30s) if unset or unreadable.
+    """
+    try:
+        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        config_path = hermes_home / "config.yaml"
+        if config_path.exists():
+            import yaml
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            val = cfg.get("browser", {}).get("command_timeout")
+            if val is not None:
+                return max(int(val), 5)  # Floor at 5s to avoid instant kills
+    except Exception as e:
+        logger.debug("Could not read command_timeout from config: %s", e)
+    return DEFAULT_COMMAND_TIMEOUT
 
 
 def _get_vision_model() -> Optional[str]:
@@ -161,6 +212,43 @@ def _read_shared_cdp_url() -> str:
     return str(raw.get("cdp_url") or "").strip()
 
 
+def _resolve_cdp_override(cdp_url: str) -> str:
+    """Normalize a user-supplied CDP endpoint into a concrete connectable URL."""
+    raw = (cdp_url or "").strip()
+    if not raw:
+        return ""
+
+    lowered = raw.lower()
+    if "/devtools/browser/" in lowered:
+        return raw
+
+    discovery_url = raw
+    if lowered.startswith(("ws://", "wss://")):
+        scheme, _, remainder = raw.partition("://")
+        host_port = remainder.rstrip("/")
+        if "/" not in host_port and host_port.rsplit(":", 1)[-1].isdigit():
+            discovery_scheme = "http" if scheme.lower() == "ws" else "https"
+            discovery_url = f"{discovery_scheme}://{host_port}"
+        else:
+            return raw
+
+    version_url = (
+        discovery_url
+        if discovery_url.lower().endswith("/json/version")
+        else discovery_url.rstrip("/") + "/json/version"
+    )
+    try:
+        response = requests.get(version_url, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        logger.warning("Failed to resolve CDP endpoint %s via %s: %s", raw, version_url, exc)
+        return raw
+
+    ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
+    return ws_url or raw
+
+
 def _get_cdp_override() -> str:
     """Return a user-supplied CDP URL override, or empty string.
 
@@ -170,8 +258,8 @@ def _get_cdp_override() -> str:
     """
     direct = os.environ.get("BROWSER_CDP_URL", "").strip()
     if direct:
-        return direct
-    return _read_shared_cdp_url()
+        return _resolve_cdp_override(direct)
+    return _resolve_cdp_override(_read_shared_cdp_url())
 
 
 def _normalize_agent_browser_cdp_arg(cdp_url: str) -> str:
@@ -844,19 +932,6 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     return session_info
 
 
-def _get_session_name(task_id: Optional[str] = None) -> str:
-    """
-    Get the session name for agent-browser CLI.
-    
-    Args:
-        task_id: Unique identifier for the task
-        
-    Returns:
-        Session name for agent-browser
-    """
-    session_info = _get_session_info(task_id)
-    return session_info["session_name"]
-
 
 def _get_browserbase_config() -> Dict[str, str]:
     """
@@ -883,14 +958,15 @@ def _get_browserbase_config() -> Dict[str, str]:
     }
 
 
-def _find_agent_browser() -> List[str]:
+def _find_agent_browser() -> str:
     """
     Find the agent-browser CLI executable.
     
-    Checks in order: PATH, local node_modules/.bin/, npx fallback.
+    Checks in order: current PATH, Homebrew/common bin dirs, Hermes-managed
+    node, local node_modules/.bin/, npx fallback.
     
     Returns:
-        Base command parts for invoking agent-browser
+        Base command for invoking agent-browser
         
     Raises:
         FileNotFoundError: If agent-browser is not installed
@@ -899,27 +975,57 @@ def _find_agent_browser() -> List[str]:
     # Check if it's in PATH (global install)
     which_result = shutil.which("agent-browser")
     if which_result:
-        return [which_result]
-    
+        return which_result
+
+    # Build an extended search PATH including Homebrew and Hermes-managed dirs.
+    # This covers macOS where the process PATH may not include Homebrew paths.
+    extra_dirs: list[str] = []
+    for d in _SANE_PATH_DIRS:
+        if os.path.isdir(d):
+            extra_dirs.append(d)
+    extra_dirs.extend(_discover_homebrew_node_dirs())
+
+    hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    hermes_node_bin = str(hermes_home / "node" / "bin")
+    if os.path.isdir(hermes_node_bin):
+        extra_dirs.append(hermes_node_bin)
+
+    if extra_dirs:
+        extended_path = os.pathsep.join(extra_dirs)
+        which_result = shutil.which("agent-browser", path=extended_path)
+        if which_result:
+            return which_result
+
     # Check local node_modules/.bin/ (npm install in repo root)
     repo_root = Path(__file__).parent.parent
     local_bin = repo_root / "node_modules" / ".bin" / "agent-browser"
     local_bin_cmd = repo_root / "node_modules" / ".bin" / "agent-browser.cmd"
     if local_bin.exists():
-        return [str(local_bin)]
+        return str(local_bin)
     if local_bin_cmd.exists():
-        return [str(local_bin_cmd)]
+        return str(local_bin_cmd)
     
-    # Check common npx locations
+    # Check common npx locations (also search extended dirs)
     npx_path = shutil.which("npx")
+    if not npx_path and extra_dirs:
+        npx_path = shutil.which("npx", path=os.pathsep.join(extra_dirs))
     if npx_path:
-        return [npx_path, "agent-browser"]
+        return "npx agent-browser"
     
     raise FileNotFoundError(
         "agent-browser CLI not found. Install it with: npm install -g agent-browser\n"
         "Or run 'npm install' in the repo root to install locally.\n"
         "Or ensure npx is available in your PATH."
     )
+
+
+def _agent_browser_command_parts(browser_cmd: str | List[str]) -> List[str]:
+    """Normalize legacy string and newer list browser commands to argv parts."""
+    if isinstance(browser_cmd, list):
+        return browser_cmd
+    if browser_cmd == "npx agent-browser":
+        return ["npx", "agent-browser"]
+    return [browser_cmd]
 
 
 def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
@@ -1092,7 +1198,7 @@ def _run_browser_command(
     task_id: str,
     command: str,
     args: List[str] = None,
-    timeout: int = DEFAULT_COMMAND_TIMEOUT
+    timeout: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run an agent-browser CLI command using our pre-created Browserbase session.
@@ -1101,11 +1207,14 @@ def _run_browser_command(
         task_id: Task identifier to get the right session
         command: The command to run (e.g., "open", "click")
         args: Additional arguments for the command
-        timeout: Command timeout in seconds
+        timeout: Command timeout in seconds.  ``None`` reads
+                 ``browser.command_timeout`` from config (default 30s).
         
     Returns:
         Parsed JSON response from agent-browser
     """
+    if timeout is None:
+        timeout = _get_command_timeout()
     args = args or []
 
     from tools.interrupt import is_interrupted
@@ -1134,7 +1243,7 @@ def _run_browser_command(
 
     # Build the command
     try:
-        browser_cmd_parts = _find_agent_browser()
+        browser_cmd_parts = _agent_browser_command_parts(_find_agent_browser())
     except FileNotFoundError as e:
         logger.warning("agent-browser CLI not found: %s", e)
         return {"success": False, "error": str(e)}
@@ -1174,14 +1283,15 @@ def _run_browser_command(
         
         browser_env = {**os.environ}
 
-        # Ensure PATH includes Hermes-managed Node first, then standard system dirs.
+        # Ensure PATH includes Hermes-managed Node first, Homebrew versioned
+        # node dirs (for macOS ``brew install node@24``), then standard system dirs.
         hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
         hermes_node_bin = str(hermes_home / "node" / "bin")
 
         existing_path = browser_env.get("PATH", "")
         path_parts = [p for p in existing_path.split(os.pathsep) if p]
         seen_parts = {os.path.normcase(os.path.normpath(p)) for p in path_parts}
-        candidate_dirs = [hermes_node_bin] + list(_SANE_PATH_DIRS)
+        candidate_dirs = [hermes_node_bin] + _discover_homebrew_node_dirs() + list(_SANE_PATH_DIRS)
 
         for part in reversed(candidate_dirs):
             normalized = os.path.normcase(os.path.normpath(part))
@@ -1444,6 +1554,18 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with navigation result (includes stealth features info on first nav)
     """
+    blocked = check_website_access(url)
+    if blocked:
+        return json.dumps({
+            "success": False,
+            "error": blocked["message"],
+            "blocked_by_policy": {
+                "host": blocked["host"],
+                "rule": blocked["rule"],
+                "source": blocked["source"],
+            },
+        })
+
     effective_task_id = task_id or "default"
     
     # Get session info to check if this is a new session
@@ -1456,8 +1578,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         session_info["_first_nav"] = False
         _maybe_start_recording(effective_task_id)
     
-    # Keep navigation responsive; Windows CDP retries have their own short caps.
-    result = _run_browser_command(effective_task_id, "open", [url], timeout=30)
+    result = _run_browser_command(effective_task_id, "open", [url], timeout=max(_get_command_timeout(), 60))
     
     if result.get("success"):
         data = result.get("data", {})
@@ -1932,7 +2053,6 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             effective_task_id, 
             "screenshot", 
             screenshot_args,
-            timeout=30
         )
         
         if not result.get("success"):
@@ -2139,7 +2259,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         
         # Try to close via agent-browser first (needs session in _active_sessions)
         try:
-            _run_browser_command(task_id, "close", [], timeout=4)
+            _run_browser_command(task_id, "close", [], timeout=10)
             logger.debug("agent-browser close command completed for task %s", task_id)
         except BaseException as e:
             logger.debug("agent-browser close interrupted for task %s: %s", task_id, e)

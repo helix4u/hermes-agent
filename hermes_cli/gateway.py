@@ -202,6 +202,8 @@ def get_systemd_unit_path(system: bool = False) -> Path:
 
 
 def _systemctl_cmd(system: bool = False) -> list[str]:
+    if not system:
+        _ensure_user_systemd_env()
     return ["systemctl"] if system else ["systemctl", "--user"]
 
 
@@ -393,20 +395,58 @@ def print_systemd_linger_guidance() -> None:
         print("  If you want the gateway user service to survive logout, run:")
         print("  sudo loginctl enable-linger $USER")
 
+
+def _ensure_user_systemd_env() -> None:
+    """Populate systemd user-session env vars when they are missing."""
+    if not is_linux():
+        return
+
+    if not os.environ.get("XDG_RUNTIME_DIR"):
+        runtime_dir = Path("/run/user") / str(os.getuid())
+        if runtime_dir.exists():
+            os.environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
+
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+        if runtime_dir:
+            bus_socket = Path(runtime_dir) / "bus"
+            if bus_socket.exists():
+                os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_socket}"
+
 def get_launchd_plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / "ai.hermes.gateway.plist"
 
+def _detect_venv_dir() -> Path | None:
+    """Detect the active virtualenv directory.
+
+    Checks ``sys.prefix`` first (works regardless of the directory name),
+    then falls back to probing common directory names under PROJECT_ROOT.
+    Returns ``None`` when no virtualenv can be found.
+    """
+    # If we're running inside a virtualenv, sys.prefix points to it.
+    if sys.prefix != sys.base_prefix:
+        venv = Path(sys.prefix)
+        if venv.is_dir():
+            return venv
+
+    # Fallback: check common virtualenv directory names under the project root.
+    for candidate in (".venv", "venv"):
+        venv = PROJECT_ROOT / candidate
+        if venv.is_dir():
+            return venv
+
+    return None
+
+
 def get_python_path() -> str:
-    if is_windows():
-        venv_python = PROJECT_ROOT / "venv" / "Scripts" / "python.exe"
-        if not venv_python.exists():
-            venv_python = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
-    else:
-        venv_python = PROJECT_ROOT / "venv" / "bin" / "python"
-        if not venv_python.exists():
-            venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
-    if venv_python.exists():
-        return str(venv_python)
+    venv = _detect_venv_dir()
+    if venv is not None:
+        if is_windows():
+            venv_python = venv / "Scripts" / "python.exe"
+        else:
+            venv_python = venv / "bin" / "python"
+        if venv_python.exists():
+            return str(venv_python)
     return sys.executable
 
 def get_hermes_cli_path() -> str:
@@ -703,6 +743,35 @@ def wait_for_gateway_pid(
     return get_running_pid()
 
 
+def _wait_for_gateway_exit(
+    timeout: float = 10.0,
+    *,
+    force_after: float = 5.0,
+    poll_interval: float = 0.25,
+) -> None:
+    """Wait for the gateway PID file to disappear, force-killing if needed."""
+    from gateway.status import get_running_pid
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    force_deadline = time.monotonic() + max(0.0, float(force_after))
+    sleep_interval = max(0.05, float(poll_interval))
+    killed = False
+
+    while time.monotonic() < deadline:
+        pid = get_running_pid()
+        if not pid:
+            return
+
+        if not killed and time.monotonic() >= force_deadline:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            killed = True
+
+        time.sleep(sleep_interval)
+
+
 # =============================================================================
 # Systemd (Linux)
 # =============================================================================
@@ -710,12 +779,19 @@ def wait_for_gateway_pid(
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
     python_path = get_python_path()
     working_dir = str(PROJECT_ROOT)
-    venv_dir = str(PROJECT_ROOT / "venv")
-    venv_bin = str(PROJECT_ROOT / "venv" / "bin")
+    detected_venv = _detect_venv_dir()
+    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    venv_bin = str(detected_venv / "bin") if detected_venv else str(PROJECT_ROOT / "venv" / "bin")
     node_bin = str(PROJECT_ROOT / "node_modules" / ".bin")
 
-    # Build a PATH that includes the venv, node_modules, and standard system dirs
-    sane_path = f"{venv_bin}:{node_bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    path_entries = [venv_bin, node_bin]
+    resolved_node = shutil.which("node")
+    if resolved_node:
+        resolved_node_dir = str(Path(resolved_node).resolve().parent)
+        if resolved_node_dir not in path_entries:
+            path_entries.append(resolved_node_dir)
+    path_entries.extend(["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"])
+    sane_path = ":".join(path_entries)
 
     hermes_home = str(Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")).resolve())
 
@@ -725,6 +801,8 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -739,7 +817,7 @@ Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=on-failure
-RestartSec=10
+RestartSec=30
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=60
@@ -753,6 +831,8 @@ WantedBy=multi-user.target
     return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -762,7 +842,7 @@ Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=on-failure
-RestartSec=10
+RestartSec=30
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=60
@@ -875,9 +955,11 @@ def systemd_install(force: bool = False, system: bool = False, run_as_user: str 
     scope_flag = " --system" if system else ""
 
     if unit_path.exists() and not force:
-        print(f"Service already installed at: {unit_path}")
-        print("Use --force to reinstall")
-        return
+        if systemd_unit_is_current(system=system):
+            print(f"Service already installed at: {unit_path}")
+            print("Use --force to reinstall")
+            return
+        print(f"Refreshing outdated {_service_scope_label(system)} systemd service at: {unit_path}")
 
     unit_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Installing {_service_scope_label(system)} systemd service to: {unit_path}")
@@ -1042,6 +1124,7 @@ def generate_launchd_plist() -> str:
         <string>hermes_cli.main</string>
         <string>gateway</string>
         <string>run</string>
+        <string>--replace</string>
     </array>
     
     <key>WorkingDirectory</key>
@@ -1065,18 +1148,48 @@ def generate_launchd_plist() -> str:
 </plist>
 """
 
+
+def refresh_launchd_plist_if_needed() -> bool:
+    """Rewrite the installed launchd plist when the generated definition changes."""
+    plist_path = get_launchd_plist_path()
+    if not plist_path.exists():
+        return False
+
+    generated = generate_launchd_plist()
+    if (
+        _normalize_service_definition(plist_path.read_text(encoding="utf-8"))
+        == _normalize_service_definition(generated)
+    ):
+        return False
+
+    plist_path.write_text(generated, encoding="utf-8")
+    subprocess.run(["launchctl", "unload", str(plist_path)], check=False)
+    subprocess.run(["launchctl", "load", str(plist_path)], check=True)
+    print("↻ Updated gateway launchd plist to match the current Hermes install")
+    return True
+
 def launchd_install(force: bool = False):
     plist_path = get_launchd_plist_path()
-    
-    if plist_path.exists() and not force:
+
+    generated = generate_launchd_plist()
+    plist_is_current = (
+        plist_path.exists()
+        and _normalize_service_definition(plist_path.read_text(encoding="utf-8"))
+        == _normalize_service_definition(generated)
+    )
+    if plist_path.exists() and not force and plist_is_current:
         print(f"Service already installed at: {plist_path}")
         print("Use --force to reinstall")
         return
-    
+
     plist_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Installing launchd service to: {plist_path}")
-    plist_path.write_text(generate_launchd_plist())
-    
+    if plist_path.exists():
+        print(f"Refreshing launchd service at: {plist_path}")
+        subprocess.run(["launchctl", "unload", str(plist_path)], check=False)
+    else:
+        print(f"Installing launchd service to: {plist_path}")
+    plist_path.write_text(generated, encoding="utf-8")
+
     subprocess.run(["launchctl", "load", str(plist_path)], check=True)
     
     print()
@@ -1097,7 +1210,18 @@ def launchd_uninstall():
     print("✓ Service uninstalled")
 
 def launchd_start():
-    subprocess.run(["launchctl", "start", "ai.hermes.gateway"], check=True)
+    refresh_launchd_plist_if_needed()
+    try:
+        subprocess.run(["launchctl", "start", "ai.hermes.gateway"], check=True)
+    except subprocess.CalledProcessError as exc:
+        error_text = f"{exc.stderr or exc.stdout or exc}"
+        if "Could not find service" not in error_text:
+            raise
+        plist_path = get_launchd_plist_path()
+        if not plist_path.exists():
+            raise
+        subprocess.run(["launchctl", "load", str(plist_path)], check=True)
+        subprocess.run(["launchctl", "start", "ai.hermes.gateway"], check=True)
     print("✓ Service started")
 
 def launchd_stop():
@@ -1109,6 +1233,7 @@ def launchd_restart():
     launchd_start()
 
 def launchd_status(deep: bool = False):
+    plist_path = get_launchd_plist_path()
     result = subprocess.run(
         ["launchctl", "list", "ai.hermes.gateway"],
         capture_output=True,
@@ -1120,7 +1245,9 @@ def launchd_status(deep: bool = False):
         print(result.stdout)
     else:
         print("✗ Gateway service is not loaded")
-    
+        if plist_path.exists():
+            print(f"  Local plist exists but appears stale or not loaded: {plist_path}")
+
     if deep:
         log_file = get_hermes_home() / "logs" / "gateway.log"
         if log_file.exists():
@@ -2012,14 +2139,16 @@ def gateway_command(args):
             try:
                 systemd_restart(system=system)
                 service_available = True
-            except subprocess.CalledProcessError:
-                pass
+            except subprocess.CalledProcessError as e:
+                print_error(f"Gateway service restart failed: {e}")
+                sys.exit(1)
         elif is_macos() and get_launchd_plist_path().exists():
             try:
                 launchd_restart()
                 service_available = True
-            except subprocess.CalledProcessError:
-                pass
+            except subprocess.CalledProcessError as e:
+                print_error(f"Gateway service restart failed: {e}")
+                sys.exit(1)
         
         if not service_available:
             # Manual restart: kill existing processes

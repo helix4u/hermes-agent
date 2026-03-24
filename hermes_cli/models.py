@@ -31,19 +31,20 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("anthropic/claude-haiku-4.5",      ""),
     ("openai/gpt-5.4",                  ""),
     ("openai/gpt-5.4-mini",             ""),
-    ("openrouter/hunter-alpha",          "free"),
-    ("openrouter/healer-alpha",          "free"),
+    ("xiaomi/mimo-v2-pro",               ""),
     ("openai/gpt-5.3-codex",            ""),
     ("google/gemini-3-pro-preview",     ""),
     ("google/gemini-3-flash-preview",   ""),
     ("qwen/qwen3.5-plus-02-15",         ""),
     ("qwen/qwen3.5-35b-a3b",            ""),
     ("stepfun/step-3.5-flash",          ""),
+    ("minimax/minimax-m2.7",            ""),
     ("minimax/minimax-m2.5",            ""),
     ("z-ai/glm-5",                      ""),
     ("z-ai/glm-5-turbo",                ""),
     ("moonshotai/kimi-k2.5",            ""),
     ("x-ai/grok-4.20-beta",             ""),
+    ("nvidia/nemotron-3-super-120b-a12b",      ""),
     ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
     ("arcee-ai/trinity-large-preview:free", "free"),
     ("openai/gpt-5.4-pro",              ""),
@@ -152,6 +153,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3.1-pro",
         "gemini-3-pro",
         "gemini-3-flash",
+        "minimax-m2.7",
         "minimax-m2.5",
         "minimax-m2.5-free",
         "minimax-m2.1",
@@ -302,12 +304,15 @@ def list_available_providers() -> list[dict[str, str]]:
         # Check if this provider has credentials available
         has_creds = False
         try:
+            from hermes_cli.auth import get_auth_status, has_usable_secret
             if pid == "custom":
-                has_creds = bool(_get_custom_base_url())
+                custom_base_url = _get_custom_base_url() or os.getenv("OPENAI_BASE_URL", "")
+                has_creds = bool(custom_base_url.strip())
+            elif pid == "openrouter":
+                has_creds = has_usable_secret(os.getenv("OPENROUTER_API_KEY", ""))
             else:
-                from hermes_cli.runtime_provider import resolve_runtime_provider
-                runtime = resolve_runtime_provider(requested=pid)
-                has_creds = bool(runtime.get("api_key"))
+                status = get_auth_status(pid)
+                has_creds = bool(status.get("logged_in") or status.get("configured"))
         except Exception:
             pass
         result.append({
@@ -342,6 +347,15 @@ def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
         provider_part = stripped[:colon].strip().lower()
         model_part = stripped[colon + 1:].strip()
         if provider_part and model_part and provider_part in _KNOWN_PROVIDER_NAMES:
+            # Support custom:name:model triple syntax for named custom
+            # providers.  ``custom:local:qwen`` → ("custom:local", "qwen").
+            # Single colon ``custom:qwen`` → ("custom", "qwen") as before.
+            if provider_part == "custom" and ":" in model_part:
+                second_colon = model_part.find(":")
+                custom_name = model_part[:second_colon].strip()
+                actual_model = model_part[second_colon + 1:].strip()
+                if custom_name and actual_model:
+                    return (f"custom:{custom_name}", actual_model)
             return (normalize_provider(provider_part), model_part)
     return (current_provider, stripped)
 
@@ -435,6 +449,10 @@ def detect_provider_for_model(
             break
 
     if direct_match:
+        resolved_direct_name = name
+        if "." in name and "/" not in name:
+            resolved_direct_name = _find_openrouter_slug(name) or f"{direct_match}/{name}"
+
         # Check if we have credentials for this provider
         has_creds = False
         try:
@@ -450,15 +468,15 @@ def detect_provider_for_model(
             pass
 
         if has_creds:
-            return (direct_match, name)
+            return (direct_match, resolved_direct_name)
 
         # No direct creds — try to find this model on OpenRouter instead
         or_slug = _find_openrouter_slug(name)
         if or_slug:
             return ("openrouter", or_slug)
         # Still return the direct provider — credential resolution will
-        # give a clear error rather than silently using the wrong provider
-        return (direct_match, name)
+        # give a clear error rather than silently using the wrong provider.
+        return (direct_match, resolved_direct_name)
 
     # --- Step 2: check OpenRouter catalog ---
     # First try exact match (handles provider/model format)

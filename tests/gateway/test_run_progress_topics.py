@@ -84,7 +84,7 @@ class TransientEditFailureAdapter(ProgressCaptureAdapter):
 
 class FakeAgent:
     def __init__(self, **kwargs):
-        self.tool_progress_callback = kwargs["tool_progress_callback"]
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.thinking_callback = kwargs.get("thinking_callback")
         self.tools = []
 

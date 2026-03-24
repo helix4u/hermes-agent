@@ -44,10 +44,17 @@ SILENT_MARKER = "[SILENT]"
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+_initial_hermes_home = _hermes_home
 
-# File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
-_LOCK_DIR = _hermes_home / "cron"
-_LOCK_FILE = _LOCK_DIR / ".tick.lock"
+
+def _get_hermes_home() -> Path:
+    """Resolve Hermes home lazily so tests and long-lived processes see env changes."""
+    if _hermes_home != _initial_hermes_home:
+        return _hermes_home
+    env_home = os.getenv("HERMES_HOME")
+    if env_home:
+        return Path(env_home).expanduser()
+    return _hermes_home
 
 
 def _emit_audit_event(audit_store, session_id: Optional[str], **kwargs) -> None:
@@ -94,11 +101,16 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
         }
 
     if ":" in deliver:
-        platform_name, chat_id = deliver.split(":", 1)
+        platform_name, rest = deliver.split(":", 1)
+        # Check for thread_id suffix (e.g. "telegram:-1003724596514:17")
+        if ":" in rest:
+            chat_id, thread_id = rest.split(":", 1)
+        else:
+            chat_id, thread_id = rest, None
         return {
             "platform": platform_name,
             "chat_id": chat_id,
-            "thread_id": None,
+            "thread_id": thread_id,
         }
 
     platform_name = deliver
@@ -238,15 +250,29 @@ def _deliver_result(job: dict, content: str, *, session_id: Optional[str] = None
         )
         return
 
+    # Wrap the content so the user knows this is a cron delivery and that
+    # the interactive agent has no visibility into it.
+    task_name = job.get("name", job["id"])
+    wrapped = (
+        f"Cronjob Response: {task_name}\n"
+        f"-------------\n\n"
+        f"{content}\n\n"
+        f"Note: The agent cannot see this message, and therefore cannot respond to it."
+    )
+
     # Run the async send in a fresh event loop (safe from any thread)
+    coro = _send_to_platform(platform, pconfig, chat_id, wrapped, thread_id=thread_id)
     try:
-        result = asyncio.run(_send_to_platform(platform, pconfig, chat_id, content, thread_id=thread_id))
+        result = asyncio.run(coro)
     except RuntimeError:
-        # asyncio.run() fails if there's already a running loop in this thread;
-        # spin up a new thread to avoid that.
+        # asyncio.run() checks for a running loop before awaiting the coroutine;
+        # when it raises, the original coro was never started — close it to
+        # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
+        # fresh thread that has no running loop.
+        coro.close()
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, content, thread_id=thread_id))
+            future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, wrapped, thread_id=thread_id))
             result = future.result(timeout=30)
     except Exception as e:
         logger.error("Job '%s': delivery to %s failed: %s", job["id"], target_label, e)
@@ -288,12 +314,6 @@ def _deliver_result(job: dict, content: str, *, session_id: Optional[str] = None
             preview=f"{platform_name} delivery succeeded",
             payload={"job_id": job["id"], "platform": platform_name},
         )
-        # Mirror the delivered content into the target's gateway session
-        try:
-            from gateway.mirror import mirror_to_session
-            mirror_to_session(platform_name, chat_id, content, source_label="cron", thread_id=thread_id)
-        except Exception as e:
-            logger.warning("Job '%s': mirror_to_session failed: %s", job["id"], e)
 
 
 def _build_job_prompt(job: dict) -> str:
@@ -419,11 +439,12 @@ def run_job(
     try:
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart.
+        hermes_home = _get_hermes_home()
         from dotenv import load_dotenv
         try:
-            load_dotenv(str(_hermes_home / ".env"), override=True, encoding="utf-8")
+            load_dotenv(str(hermes_home / ".env"), override=True, encoding="utf-8")
         except UnicodeDecodeError:
-            load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
+            load_dotenv(str(hermes_home / ".env"), override=True, encoding="latin-1")
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
@@ -438,7 +459,7 @@ def run_job(
         _cfg = {}
         try:
             import yaml
-            _cfg_path = str(_hermes_home / "config.yaml")
+            _cfg_path = str(hermes_home / "config.yaml")
             if os.path.exists(_cfg_path):
                 with open(_cfg_path, encoding="utf-8") as _f:
                     _cfg = yaml.safe_load(_f) or {}
@@ -470,7 +491,7 @@ def run_job(
             import json as _json
             pfpath = Path(prefill_file).expanduser()
             if not pfpath.is_absolute():
-                pfpath = _hermes_home / pfpath
+                pfpath = hermes_home / pfpath
             if pfpath.exists():
                 try:
                     with open(pfpath, "r", encoding="utf-8") as _pf:
@@ -498,7 +519,12 @@ def run_job(
             }
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
-            runtime = resolve_runtime_provider(**runtime_kwargs, allow_device_auth=False)
+            try:
+                runtime = resolve_runtime_provider(**runtime_kwargs, allow_device_auth=False)
+            except TypeError as exc:
+                if "allow_device_auth" not in str(exc):
+                    raise
+                runtime = resolve_runtime_provider(**runtime_kwargs)
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
@@ -544,9 +570,10 @@ def run_job(
         
         result = agent.run_conversation(prompt)
         
-        final_response = result.get("final_response", "")
-        if not final_response:
-            final_response = "(No response generated)"
+        final_response = result.get("final_response", "") or ""
+        # Use a separate variable for log display; keep final_response clean
+        # for delivery logic (empty response = no delivery).
+        logged_response = final_response if final_response else "(No response generated)"
         
         output = f"""# Cron Job: {job_name}
 
@@ -560,7 +587,7 @@ def run_job(
 
 ## Response
 
-{final_response}
+{logged_response}
 """
         
         logger.info("Job '%s' completed successfully", job_name)
@@ -642,12 +669,15 @@ def tick(verbose: bool = True) -> int:
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
-    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    hermes_home = _get_hermes_home()
+    lock_dir = hermes_home / "cron"
+    lock_file = lock_dir / ".tick.lock"
+    lock_dir.mkdir(parents=True, exist_ok=True)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
     lock_fd = None
     try:
-        lock_fd = open(_LOCK_FILE, "w")
+        lock_fd = open(lock_file, "w")
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:

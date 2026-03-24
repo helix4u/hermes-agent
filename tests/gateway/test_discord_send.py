@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import sys
@@ -85,3 +86,21 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
     assert channel.send.await_count == 2
     assert send_calls[0]["reference"] is ref_msg
     assert send_calls[1]["reference"] is None
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_persistent_typing_tasks():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        http=SimpleNamespace(request=AsyncMock(return_value=None)),
+        close=AsyncMock(return_value=None),
+    )
+
+    await adapter.send_typing("555")
+    await asyncio.sleep(0)
+
+    assert "555" in adapter._typing_tasks
+
+    await adapter.disconnect()
+
+    assert adapter._typing_tasks == {}

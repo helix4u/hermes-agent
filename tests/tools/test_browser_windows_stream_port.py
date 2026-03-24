@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import types
-from pathlib import Path
+from pathlib import Path, PosixPath
 from unittest.mock import patch
 
 
@@ -44,7 +44,7 @@ def test_windows_sets_stream_port_zero_when_missing():
         patch("tools.browser_tool._get_session_info", return_value={"session_name": "win_sess"}),
         patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
         patch("tools.browser_tool.os.name", "nt"),
-        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch("tools.browser_tool.Path", PosixPath),
         patch.dict(
             "tools.browser_tool.os.environ",
             {
@@ -95,7 +95,7 @@ def test_windows_retries_bind_10013_with_safe_stream_port():
         patch("tools.browser_tool._get_session_info", return_value={"session_name": "win_retry"}),
         patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
         patch("tools.browser_tool.os.name", "nt"),
-        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch("tools.browser_tool.Path", PosixPath),
         patch.dict(
             "tools.browser_tool.os.environ",
             {
@@ -149,7 +149,7 @@ def test_windows_retries_bind_10048_with_safe_stream_port():
         patch("tools.browser_tool._get_session_info", return_value={"session_name": "win_retry_10048"}),
         patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
         patch("tools.browser_tool.os.name", "nt"),
-        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch("tools.browser_tool.Path", PosixPath),
         patch.dict(
             "tools.browser_tool.os.environ",
             {
@@ -202,9 +202,10 @@ def test_windows_retries_after_stale_daemon_cleanup_when_bind_persists():
         patch("tools.browser_tool._get_session_info", return_value={"session_name": "win_retry_cleanup"}),
         patch("tools.browser_tool._kill_daemon_pid_from_socket_dir", return_value=True) as kill_pid,
         patch("tools.browser_tool._kill_windows_agent_browser_processes", return_value=1) as kill_taskkill,
+        patch("tools.browser_tool._allocate_free_tcp_port", return_value="48231"),
         patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
         patch("tools.browser_tool.os.name", "nt"),
-        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch("tools.browser_tool.Path", PosixPath),
         patch.dict(
             "tools.browser_tool.os.environ",
             {
@@ -261,9 +262,10 @@ def test_windows_retries_cleanup_after_persistent_bind_10048():
         patch("tools.browser_tool._get_session_info", return_value={"session_name": "win_retry_cleanup_10048"}),
         patch("tools.browser_tool._kill_daemon_pid_from_socket_dir", return_value=True) as kill_pid,
         patch("tools.browser_tool._kill_windows_agent_browser_processes", return_value=1) as kill_taskkill,
+        patch("tools.browser_tool._allocate_free_tcp_port", return_value="48232"),
         patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
         patch("tools.browser_tool.os.name", "nt"),
-        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch("tools.browser_tool.Path", PosixPath),
         patch.dict(
             "tools.browser_tool.os.environ",
             {
@@ -302,7 +304,7 @@ def test_windows_cdp_mode_includes_session_arg_for_stability():
         ),
         patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
         patch("tools.browser_tool.os.name", "nt"),
-        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch("tools.browser_tool.Path", PosixPath),
         patch.dict(
             "tools.browser_tool.os.environ",
             {
@@ -354,7 +356,7 @@ def test_windows_cdp_mode_skips_custom_socket_dir_env():
         ),
         patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
         patch("tools.browser_tool.os.name", "nt"),
-        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch("tools.browser_tool.Path", PosixPath),
         patch.dict(
             "tools.browser_tool.os.environ",
             {
@@ -409,9 +411,10 @@ def test_windows_cdp_mode_uses_isolated_session_recovery_after_persistent_bind()
             return_value={"session_name": "cdp_bind_retry", "cdp_url": "ws://localhost:9222"},
         ),
         patch("tools.browser_tool._kill_windows_agent_browser_processes", return_value=1) as kill_taskkill,
+        patch("tools.browser_tool._allocate_free_tcp_port", side_effect=["48233", "48234", "48235"]),
         patch("tools.browser_tool._run_agent_browser_subprocess", side_effect=_fake_run),
         patch("tools.browser_tool.os.name", "nt"),
-        patch("tools.browser_tool.Path.home", return_value=Path("C:/Users/btgil")),
+        patch("tools.browser_tool.Path", PosixPath),
         patch.dict(
             "tools.browser_tool.os.environ",
             {
