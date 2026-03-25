@@ -27,7 +27,7 @@ def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
     clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
     if env_overrides:
         clean_env.update(env_overrides)
-    prompt_toolkit_stubs = {
+    module_stubs = {
         "prompt_toolkit": MagicMock(),
         "prompt_toolkit.history": MagicMock(),
         "prompt_toolkit.styles": MagicMock(),
@@ -43,11 +43,32 @@ def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
         "prompt_toolkit.completion": MagicMock(),
         "prompt_toolkit.formatted_text": MagicMock(),
         "prompt_toolkit.auto_suggest": MagicMock(),
+        "run_agent": MagicMock(AIAgent=MagicMock()),
+        "model_tools": MagicMock(
+            get_tool_definitions=MagicMock(return_value=[]),
+            get_toolset_for_tool=MagicMock(return_value=None),
+        ),
+        "toolsets": MagicMock(
+            get_all_toolsets=MagicMock(return_value=[]),
+            get_toolset_info=MagicMock(return_value={}),
+            validate_toolset=MagicMock(return_value=True),
+        ),
+        "tools.terminal_tool": MagicMock(
+            cleanup_all_environments=MagicMock(),
+            set_sudo_password_callback=MagicMock(),
+            set_approval_callback=MagicMock(),
+        ),
+        "tools.skills_tool": MagicMock(set_secret_capture_callback=MagicMock()),
+        "tools.browser_tool": MagicMock(_emergency_cleanup_all_sessions=MagicMock()),
     }
-    with patch.dict(sys.modules, prompt_toolkit_stubs), \
+    with patch.dict(sys.modules, module_stubs), \
          patch.dict("os.environ", clean_env, clear=False):
         import cli as _cli_mod
-        _cli_mod = importlib.reload(_cli_mod)
+        for key, value in clean_env.items():
+            if value:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
         with patch.object(_cli_mod, "get_tool_definitions", return_value=[]), \
              patch.dict(_cli_mod.__dict__, {"CLI_CONFIG": _clean_config}):
             return _cli_mod.HermesCLI(**kwargs)

@@ -518,7 +518,13 @@ def _get_env_config() -> Dict[str, Any]:
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
         docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
-        candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
+        candidate = os.path.expanduser(docker_cwd_source)
+        # Preserve POSIX-looking host paths as entered so cross-platform config
+        # checks can distinguish them from native Windows paths. The Docker
+        # backend normalizes native mount paths later when it actually prepares
+        # the bind mount.
+        if not candidate.startswith(("/Users/", "/home/")):
+            candidate = os.path.abspath(candidate)
         if (
             any(candidate.startswith(p) for p in host_prefixes)
             or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))

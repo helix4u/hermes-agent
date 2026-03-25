@@ -310,6 +310,20 @@ class TestWorkingDirResolution:
         result = mgr.get_working_dir_for_path(str(filepath))
         assert result == str(filepath.parent)
 
+    def test_ignores_home_markers(self, tmp_path, monkeypatch):
+        mgr = CheckpointManager(enabled=True)
+        fake_home = tmp_path / "fake-home"
+        fake_home.mkdir()
+        (fake_home / "package.json").write_text("{}\\n")
+        nested = fake_home / "tmp" / "random" / "file.py"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("x\\n")
+
+        monkeypatch.setattr("tools.checkpoint_manager.Path.home", lambda: fake_home)
+
+        result = mgr.get_working_dir_for_path(str(nested))
+        assert result == str(nested.parent)
+
 
 # =========================================================================
 # Git env isolation

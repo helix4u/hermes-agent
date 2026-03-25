@@ -36,6 +36,15 @@ _SENSITIVE_HOME_FILES = (
 )
 
 
+def _user_home_dir() -> Path:
+    """Resolve the user's home directory with env overrides first."""
+    for key in ("HOME", "USERPROFILE"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return Path(value).expanduser().resolve()
+    return Path(os.path.expanduser("~")).resolve()
+
+
 @dataclass(frozen=True)
 class ContextReference:
     raw: str
@@ -339,7 +348,7 @@ def _resolve_path(cwd: Path, target: str, *, allowed_root: Path | None = None) -
 
 
 def _ensure_reference_path_allowed(path: Path) -> None:
-    home = Path(os.path.expanduser("~")).resolve()
+    home = _user_home_dir()
     hermes_home = Path(
         os.getenv("HERMES_HOME", str(home / ".hermes"))
     ).expanduser().resolve()

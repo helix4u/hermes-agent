@@ -401,6 +401,12 @@ def relative_label(path: Path, root: Path) -> str:
         return str(path)
 
 
+def normalize_report_path(value: Optional[Path | str]) -> Optional[str]:
+    if value is None:
+        return None
+    return str(value).replace("\\", "/")
+
+
 def write_report(output_dir: Path, report: Dict[str, Any]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "report.json").write_text(
@@ -501,8 +507,8 @@ class Migrator:
         self.items.append(
             ItemResult(
                 kind=kind,
-                source=str(source) if source else None,
-                destination=str(destination) if destination else None,
+                source=normalize_report_path(source),
+                destination=normalize_report_path(destination),
                 status=status,
                 reason=reason,
                 details=details,
@@ -601,10 +607,10 @@ class Migrator:
         report = {
             "timestamp": self.timestamp,
             "mode": "execute" if self.execute else "dry-run",
-            "source_root": str(self.source_root),
-            "target_root": str(self.target_root),
-            "workspace_target": str(self.workspace_target) if self.workspace_target else None,
-            "output_dir": str(self.output_dir) if self.output_dir else None,
+            "source_root": normalize_report_path(self.source_root),
+            "target_root": normalize_report_path(self.target_root),
+            "workspace_target": normalize_report_path(self.workspace_target),
+            "output_dir": normalize_report_path(self.output_dir),
             "migrate_secrets": self.migrate_secrets,
             "preset": self.preset_name or None,
             "skill_conflict_mode": self.skill_conflict_mode,
@@ -660,7 +666,13 @@ class Migrator:
             backup_path = self.maybe_backup(destination)
             ensure_parent(destination)
             shutil.copy2(source, destination)
-            self.record(kind, source, destination, "migrated", backup=str(backup_path) if backup_path else None)
+            self.record(
+                kind,
+                source,
+                destination,
+                "migrated",
+                backup=normalize_report_path(backup_path),
+            )
         else:
             self.record(kind, source, destination, "migrated", "Would copy")
 
@@ -707,7 +719,7 @@ class Migrator:
         }
         overflow_file = self.write_overflow_entries(kind, overflowed)
         if overflow_file is not None:
-            details["overflow_file"] = str(overflow_file)
+            details["overflow_file"] = normalize_report_path(overflow_file)
 
         if self.execute:
             if stats["added"] == 0 and not overflowed:
@@ -721,7 +733,7 @@ class Migrator:
                 source,
                 destination,
                 "migrated",
-                backup=str(backup_path) if backup_path else "",
+                backup=normalize_report_path(backup_path) or "",
                 overflow_preview=overflowed[:5],
                 **details,
             )
@@ -781,7 +793,7 @@ class Migrator:
                 source,
                 destination,
                 "migrated",
-                backup=str(backup_path) if backup_path else "",
+                backup=normalize_report_path(backup_path) or "",
                 added_patterns=added,
             )
         else:
@@ -828,7 +840,7 @@ class Migrator:
                 source,
                 destination,
                 "migrated",
-                backup=str(backup_path) if backup_path else "",
+                backup=normalize_report_path(backup_path) or "",
                 added_keys=sorted(added.keys()),
                 conflicting_keys=conflicts,
             )
@@ -1118,7 +1130,14 @@ class Migrator:
             backup_path = self.maybe_backup(destination)
             hermes_config["model"] = model_str
             dump_yaml_file(destination, hermes_config)
-            self.record("model-config", source_path, destination, "migrated", backup=str(backup_path) if backup_path else "", model=model_str)
+            self.record(
+                "model-config",
+                source_path,
+                destination,
+                "migrated",
+                backup=normalize_report_path(backup_path) or "",
+                model=model_str,
+            )
         else:
             self.record("model-config", source_path, destination, "migrated", "Would set model", model=model_str)
 
@@ -1191,7 +1210,14 @@ class Migrator:
                     merged_tts[key] = value
             hermes_config["tts"] = merged_tts
             dump_yaml_file(destination, hermes_config)
-            self.record("tts-config", source_path, destination, "migrated", backup=str(backup_path) if backup_path else "", settings=list(tts_data.keys()))
+            self.record(
+                "tts-config",
+                source_path,
+                destination,
+                "migrated",
+                backup=normalize_report_path(backup_path) or "",
+                settings=list(tts_data.keys()),
+            )
         else:
             self.record("tts-config", source_path, destination, "migrated", "Would set TTS config", settings=list(tts_data.keys()))
 
@@ -1224,9 +1250,9 @@ class Migrator:
                 if final_destination == destination and destination.exists():
                     shutil.rmtree(destination)
                 shutil.copytree(skill_dir, final_destination)
-                details: Dict[str, Any] = {"backup": str(backup_path) if backup_path else ""}
+                details: Dict[str, Any] = {"backup": normalize_report_path(backup_path) or ""}
                 if final_destination != destination:
-                    details["renamed_from"] = str(destination)
+                    details["renamed_from"] = normalize_report_path(destination) or ""
                 self.record("shared-skill", skill_dir, final_destination, "migrated", **details)
             else:
                 if final_destination != destination:
@@ -1236,7 +1262,7 @@ class Migrator:
                         final_destination,
                         "migrated",
                         "Would copy shared skill directory under a renamed folder",
-                        renamed_from=str(destination),
+                        renamed_from=normalize_report_path(destination) or "",
                     )
                 else:
                     self.record("shared-skill", skill_dir, final_destination, "migrated", "Would copy shared skill directory")
@@ -1283,7 +1309,7 @@ class Migrator:
         }
         overflow_file = self.write_overflow_entries("daily-memory", overflowed)
         if overflow_file is not None:
-            details["overflow_file"] = str(overflow_file)
+            details["overflow_file"] = normalize_report_path(overflow_file)
 
         if self.execute:
             if stats["added"] == 0 and not overflowed:
@@ -1297,7 +1323,7 @@ class Migrator:
                 source_dir,
                 destination,
                 "migrated",
-                backup=str(backup_path) if backup_path else "",
+                backup=normalize_report_path(backup_path) or "",
                 overflow_preview=overflowed[:5],
                 **details,
             )
@@ -1333,9 +1359,9 @@ class Migrator:
                 if final_destination == destination and destination.exists():
                     shutil.rmtree(destination)
                 shutil.copytree(skill_dir, final_destination)
-                details: Dict[str, Any] = {"backup": str(backup_path) if backup_path else ""}
+                details: Dict[str, Any] = {"backup": normalize_report_path(backup_path) or ""}
                 if final_destination != destination:
-                    details["renamed_from"] = str(destination)
+                    details["renamed_from"] = normalize_report_path(destination) or ""
                 self.record("skill", skill_dir, final_destination, "migrated", **details)
             else:
                 if final_destination != destination:
@@ -1345,7 +1371,7 @@ class Migrator:
                         final_destination,
                         "migrated",
                         "Would copy skill directory under a renamed folder",
-                        renamed_from=str(destination),
+                        renamed_from=normalize_report_path(destination) or "",
                     )
                 else:
                     self.record("skill", skill_dir, final_destination, "migrated", "Would copy skill directory")

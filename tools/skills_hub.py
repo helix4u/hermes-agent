@@ -31,6 +31,7 @@ from urllib.parse import urlparse, urlunparse
 import httpx
 import yaml
 
+from tools.file_operations import BINARY_EXTENSIONS
 from tools.skills_guard import (
     ScanResult, scan_skill, should_allow_install, content_hash, TRUSTED_REPOS,
 )
@@ -1984,9 +1985,16 @@ class OptionalSkillSource(SkillSource):
                 and "__pycache__" not in f.parts
                 and f.suffix != ".pyc"
             ):
-                rel_path = str(f.relative_to(skill_dir))
+                rel_path = f.relative_to(skill_dir).as_posix()
                 try:
-                    files[rel_path] = f.read_bytes()
+                    if rel_path.startswith("assets/"):
+                        if f.suffix.lower() in BINARY_EXTENSIONS:
+                            files[rel_path] = f.read_bytes()
+                        else:
+                            text = f.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+                            files[rel_path] = text.encode("utf-8")
+                    else:
+                        files[rel_path] = f.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
                 except OSError:
                     continue
 
@@ -2367,9 +2375,17 @@ def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
 
 def bundle_content_hash(bundle: SkillBundle) -> str:
     """Compute a deterministic hash for an in-memory skill bundle."""
+    def _normalized_bytes(content: Union[str, bytes]) -> bytes:
+        if isinstance(content, bytes):
+            try:
+                content = content.decode("utf-8")
+            except UnicodeDecodeError:
+                return content
+        return content.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
     h = hashlib.sha256()
     for rel_path in sorted(bundle.files):
-        h.update(bundle.files[rel_path].encode("utf-8"))
+        h.update(_normalized_bytes(bundle.files[rel_path]))
     return f"sha256:{h.hexdigest()[:16]}"
 
 

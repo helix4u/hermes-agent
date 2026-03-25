@@ -104,7 +104,8 @@ class TestGetProviderFallbackPriority:
         """When only groq key available, falls back to groq."""
         monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
-             patch("tools.transcription_tools._HAS_OPENAI", True):
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._has_local_command", return_value=False):
             from tools.transcription_tools import _get_provider
             assert _get_provider({"provider": "local"}) == "groq"
 
@@ -154,7 +155,8 @@ class TestExplicitProviderRespected:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-real-key-here")
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
-             patch("tools.transcription_tools._HAS_OPENAI", True):
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._has_local_command", return_value=False):
             from tools.transcription_tools import _get_provider
             result = _get_provider({"provider": "local", "strict_provider": True})
             assert result == "none", f"Expected 'none' but got {result!r}"
@@ -162,7 +164,8 @@ class TestExplicitProviderRespected:
     def test_explicit_local_no_fallback_to_groq(self, monkeypatch):
         monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
-             patch("tools.transcription_tools._HAS_OPENAI", True):
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._has_local_command", return_value=False):
             from tools.transcription_tools import _get_provider
             result = _get_provider({"provider": "local", "strict_provider": True})
             assert result == "none"

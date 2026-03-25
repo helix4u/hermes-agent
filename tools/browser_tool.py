@@ -53,6 +53,7 @@ import atexit
 import json
 import logging
 import os
+import posixpath
 import re
 import signal
 import subprocess
@@ -103,7 +104,8 @@ def _discover_homebrew_node_dirs() -> list[str]:
         for entry in os.listdir(homebrew_opt):
             if entry.startswith("node") and entry != "node":
                 # e.g. node@20, node@24
-                bin_dir = os.path.join(homebrew_opt, entry, "bin")
+                # Homebrew paths are macOS/POSIX paths even when tests run on Windows.
+                bin_dir = posixpath.join(homebrew_opt, entry, "bin")
                 if os.path.isdir(bin_dir):
                     dirs.append(bin_dir)
     except OSError:
@@ -127,6 +129,27 @@ DEFAULT_SESSION_TIMEOUT = 300
 SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
 
 
+def _get_hermes_home_path() -> Path:
+    """Return Hermes home without eagerly evaluating ``Path.home()``.
+
+    Avoid passing ``Path.home() / ".hermes"`` as the default value to
+    ``os.environ.get`` because that expression is evaluated even when
+    ``HERMES_HOME`` is set. Some tests monkeypatch ``Path`` to ``PosixPath``
+    on Windows, which makes eager ``Path.home()`` resolution explode before
+    the configured Hermes home can be used.
+    """
+    import pathlib
+    import tempfile
+
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    if hermes_home:
+        return pathlib.Path(hermes_home)
+    try:
+        return pathlib.Path.home() / ".hermes"
+    except RuntimeError:
+        return pathlib.Path(tempfile.gettempdir()) / ".hermes"
+
+
 def _get_command_timeout() -> int:
     """Return the configured browser command timeout from config.yaml.
 
@@ -134,7 +157,7 @@ def _get_command_timeout() -> int:
     ``DEFAULT_COMMAND_TIMEOUT`` (30s) if unset or unreadable.
     """
     try:
-        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        hermes_home = _get_hermes_home_path()
         config_path = hermes_home / "config.yaml"
         if config_path.exists():
             import yaml
@@ -160,7 +183,7 @@ def _get_extraction_model() -> Optional[str]:
 
 def _get_shared_cdp_state_path() -> Path:
     """Path for cross-process CDP runtime state shared between CLI and gateway."""
-    hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    hermes_home = _get_hermes_home_path()
     return hermes_home / "runtime" / "browser_cdp_state.json"
 
 
@@ -212,6 +235,20 @@ def _read_shared_cdp_url() -> str:
     return str(raw.get("cdp_url") or "").strip()
 
 
+def _get_raw_cdp_override() -> str:
+    """Return a configured CDP override without probing the endpoint.
+
+    This is intentionally cheap and side-effect free so startup-time
+    availability checks do not perform live network discovery against stale
+    CDP endpoints. Real browser actions should still use ``_get_cdp_override``
+    so they can resolve host:port discovery URLs into websocket targets.
+    """
+    direct = os.environ.get("BROWSER_CDP_URL", "").strip()
+    if direct:
+        return direct
+    return _read_shared_cdp_url()
+
+
 def _resolve_cdp_override(cdp_url: str) -> str:
     """Normalize a user-supplied CDP endpoint into a concrete connectable URL."""
     raw = (cdp_url or "").strip()
@@ -256,10 +293,7 @@ def _get_cdp_override() -> str:
     both Browserbase and the local headless launcher and connect directly to
     the supplied Chrome DevTools Protocol endpoint.
     """
-    direct = os.environ.get("BROWSER_CDP_URL", "").strip()
-    if direct:
-        return _resolve_cdp_override(direct)
-    return _resolve_cdp_override(_read_shared_cdp_url())
+    return _resolve_cdp_override(_get_raw_cdp_override())
 
 
 def _normalize_agent_browser_cdp_arg(cdp_url: str) -> str:
@@ -294,7 +328,7 @@ def _is_local_mode() -> bool:
     ``agent-browser --session`` instead of connecting to a remote Browserbase
     session via ``--cdp``.
     """
-    if _get_cdp_override():
+    if _get_raw_cdp_override():
         return False  # CDP override takes priority
     return not (os.environ.get("BROWSERBASE_API_KEY") and os.environ.get("BROWSERBASE_PROJECT_ID"))
 
@@ -985,7 +1019,7 @@ def _find_agent_browser() -> str:
             extra_dirs.append(d)
     extra_dirs.extend(_discover_homebrew_node_dirs())
 
-    hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    hermes_home = _get_hermes_home_path()
     hermes_node_bin = str(hermes_home / "node" / "bin")
     if os.path.isdir(hermes_node_bin):
         extra_dirs.append(hermes_node_bin)
@@ -1285,7 +1319,7 @@ def _run_browser_command(
 
         # Ensure PATH includes Hermes-managed Node first, Homebrew versioned
         # node dirs (for macOS ``brew install node@24``), then standard system dirs.
-        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        hermes_home = _get_hermes_home_path()
         hermes_node_bin = str(hermes_home / "node" / "bin")
 
         existing_path = browser_env.get("PATH", "")
@@ -1906,7 +1940,7 @@ def _maybe_start_recording(task_id: str):
     if task_id in _recording_sessions:
         return
     try:
-        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        hermes_home = _get_hermes_home_path()
         config_path = hermes_home / "config.yaml"
         record_enabled = False
         if config_path.exists():
@@ -2033,7 +2067,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     effective_task_id = task_id or "default"
     
     # Save screenshot to persistent location so it can be shared with users
-    hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    hermes_home = _get_hermes_home_path()
     screenshots_dir = hermes_home / "browser_screenshots"
     screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
     
@@ -2168,7 +2202,7 @@ def _cleanup_old_recordings(max_age_hours=72):
     """Remove browser recordings older than max_age_hours to prevent disk bloat."""
     import time
     try:
-        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        hermes_home = _get_hermes_home_path()
         recordings_dir = hermes_home / "browser_recordings"
         if not recordings_dir.exists():
             return

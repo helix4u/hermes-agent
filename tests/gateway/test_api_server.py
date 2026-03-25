@@ -32,6 +32,17 @@ from gateway.platforms.api_server import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_api_server_env(monkeypatch):
+    for key in (
+        "API_SERVER_HOST",
+        "API_SERVER_PORT",
+        "API_SERVER_KEY",
+        "API_SERVER_CORS_ORIGINS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 # ---------------------------------------------------------------------------
 # check_api_server_requirements
 # ---------------------------------------------------------------------------

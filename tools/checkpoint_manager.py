@@ -422,8 +422,14 @@ class CheckpointManager:
         # Walk up looking for project root markers
         markers = {".git", "pyproject.toml", "package.json", "Cargo.toml",
                     "go.mod", "Makefile", "pom.xml", ".hg", "Gemfile"}
+        home_dir = Path.home().resolve()
         check = candidate
         while check != check.parent:
+            # Never treat the user's home directory as a project root. Users
+            # often keep dotfiles or helper manifests there, and checkpointing
+            # already refuses to snapshot broad directories like home.
+            if check == home_dir:
+                break
             if any((check / m).exists() for m in markers):
                 return str(check)
             check = check.parent

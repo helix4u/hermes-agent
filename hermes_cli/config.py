@@ -52,7 +52,15 @@ from hermes_cli.default_soul import DEFAULT_SOUL_MD
 
 def get_hermes_home() -> Path:
     """Get the Hermes home directory (~/.hermes)."""
-    return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    hermes_home = os.getenv("HERMES_HOME", "").strip()
+    if hermes_home:
+        return Path(hermes_home)
+    try:
+        return Path.home() / ".hermes"
+    except RuntimeError:
+        # Some test and headless environments clear HOME/USERPROFILE entirely.
+        # Fall back to a temp-scoped Hermes home instead of crashing config load.
+        return Path(tempfile.gettempdir()) / ".hermes"
 
 def get_config_path() -> Path:
     """Get the main config file path."""
@@ -251,7 +259,7 @@ DEFAULT_CONFIG = {
     
     # Text-to-speech configuration
     "tts": {
-        # Providers: edge (free), elevenlabs (premium), openai, neutts (local), f5 (local)
+        # Providers: edge (free), elevenlabs (premium), openai, kokoro (local), neutts (local), f5 (local)
         "provider": "edge",
         "edge": {
             "voice": "en-US-AriaNeural",
@@ -265,6 +273,13 @@ DEFAULT_CONFIG = {
             "model": "gpt-4o-mini-tts",
             "voice": "alloy",
             # Voices: alloy, echo, fable, onyx, nova, shimmer
+        },
+        "kokoro": {
+            "base_url": "http://localhost:8880",
+            "model": "kokoro",
+            "voice": "af_sky+af_v0+af_nicole",
+            "speed": 1.75,
+            "request_timeout_seconds": 120,
         },
         "neutts": {
             "ref_audio": "",  # Path to reference voice audio (empty = bundled default)
@@ -385,7 +400,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 10,
+    "_config_version": 11,
 }
 
 # =============================================================================
@@ -401,6 +416,7 @@ ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
         "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"],
     9: ["F5TTS_SECRET_KEY"],
     10: ["TAVILY_API_KEY"],
+    11: [],
 }
 
 # Required environment variables with metadata for migration prompts.

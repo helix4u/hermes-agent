@@ -68,15 +68,20 @@ class TestMemoryInjection:
         tmp_agent = MagicMock()
         memory_dir = tmp_path / "memories"
         memory_dir.mkdir()
-        (memory_dir / "MEMORY.md").write_text("Agent knows Python\n§\nUser prefers dark mode")
-        (memory_dir / "USER.md").write_text("Name: Alice\n§\nTimezone: PST")
+        (memory_dir / "MEMORY.md").write_text(
+            "Agent knows Python\n§\nUser prefers dark mode",
+            encoding="utf-8",
+        )
+        (memory_dir / "USER.md").write_text(
+            "Name: Alice\n§\nTimezone: PST",
+            encoding="utf-8",
+        )
 
         with (
             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "k"}),
             patch("gateway.run._resolve_gateway_model", return_value="test-model"),
             patch("run_agent.AIAgent", return_value=tmp_agent),
-            # Intercept `from tools.memory_tool import MEMORY_DIR` inside the function
-            patch.dict("sys.modules", {"tools.memory_tool": MagicMock(MEMORY_DIR=memory_dir)}),
+            patch("tools.memory_tool.MEMORY_DIR", memory_dir),
         ):
             runner._flush_memories_for_session("session_123")
 
@@ -106,7 +111,7 @@ class TestMemoryInjection:
             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "k"}),
             patch("gateway.run._resolve_gateway_model", return_value="test-model"),
             patch("run_agent.AIAgent", return_value=tmp_agent),
-            patch.dict("sys.modules", {"tools.memory_tool": MagicMock(MEMORY_DIR=empty_dir)}),
+            patch("tools.memory_tool.MEMORY_DIR", empty_dir),
         ):
             runner._flush_memories_for_session("session_456")
 
@@ -124,14 +129,14 @@ class TestMemoryInjection:
         tmp_agent = MagicMock()
         memory_dir = tmp_path / "memories"
         memory_dir.mkdir()
-        (memory_dir / "MEMORY.md").write_text("")
-        (memory_dir / "USER.md").write_text("  \n  ")  # whitespace only
+        (memory_dir / "MEMORY.md").write_text("", encoding="utf-8")
+        (memory_dir / "USER.md").write_text("  \n  ", encoding="utf-8")  # whitespace only
 
         with (
             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "k"}),
             patch("gateway.run._resolve_gateway_model", return_value="test-model"),
             patch("run_agent.AIAgent", return_value=tmp_agent),
-            patch.dict("sys.modules", {"tools.memory_tool": MagicMock(MEMORY_DIR=memory_dir)}),
+            patch("tools.memory_tool.MEMORY_DIR", memory_dir),
         ):
             runner._flush_memories_for_session("session_789")
 
@@ -155,8 +160,7 @@ class TestFlushPromptStructure:
             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "k"}),
             patch("gateway.run._resolve_gateway_model", return_value="test-model"),
             patch("run_agent.AIAgent", return_value=tmp_agent),
-            # Make the import fail gracefully so we test without memory files
-            patch.dict("sys.modules", {"tools.memory_tool": MagicMock(MEMORY_DIR=Path("/nonexistent"))}),
+            patch("tools.memory_tool.MEMORY_DIR", Path("/nonexistent")),
         ):
             runner._flush_memories_for_session("session_struct")
 

@@ -194,6 +194,26 @@ def slack_subcommand_map() -> dict[str, str]:
     return mapping
 
 
+def _user_home_dir() -> str:
+    """Return the preferred home directory for path completion/display."""
+    for key in ("HOME", "USERPROFILE"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return os.path.expanduser("~")
+
+
+def _expand_user_path(path: str) -> str:
+    if path.startswith("~"):
+        home = _user_home_dir()
+        if path == "~":
+            return home
+        if path.startswith("~/") or path.startswith("~\\"):
+            suffix = path[2:].replace("/", os.sep).replace("\\", os.sep)
+            return os.path.join(home, suffix)
+    return os.path.expanduser(path)
+
+
 class SlashCommandCompleter(Completer):
     """Autocomplete for built-in slash commands, subcommands, and skill commands."""
 
@@ -244,14 +264,19 @@ class SlashCommandCompleter(Completer):
         word = text[i + 1:]
         if not word:
             return None
-        if word.startswith(("./", "../", "~/", "/")) or "/" in word:
+        if (
+            word.startswith(("./", "../", "~/", "/", ".\\", "..\\", "~\\", "\\"))
+            or "/" in word
+            or "\\" in word
+            or os.path.isabs(word)
+        ):
             return word
         return None
 
     @staticmethod
     def _path_completions(word: str, limit: int = 30):
-        expanded = os.path.expanduser(word)
-        if expanded.endswith("/"):
+        expanded = _expand_user_path(word)
+        if expanded.endswith(("/", "\\")):
             search_dir = expanded
             prefix = ""
         else:
@@ -273,7 +298,7 @@ class SlashCommandCompleter(Completer):
             full_path = os.path.join(search_dir, entry)
             is_dir = os.path.isdir(full_path)
             if word.startswith("~"):
-                display_path = "~/" + os.path.relpath(full_path, os.path.expanduser("~"))
+                display_path = "~/" + os.path.relpath(full_path, _user_home_dir())
             elif os.path.isabs(word):
                 display_path = full_path
             else:
@@ -316,8 +341,8 @@ class SlashCommandCompleter(Completer):
         for prefix in ("@file:", "@folder:"):
             if word.startswith(prefix):
                 path_part = word[len(prefix):] or "."
-                expanded = os.path.expanduser(path_part)
-                if expanded.endswith("/"):
+                expanded = _expand_user_path(path_part)
+                if expanded.endswith(("/", "\\")):
                     search_dir, match_prefix = expanded, ""
                 else:
                     search_dir = os.path.dirname(expanded) or "."
@@ -351,8 +376,8 @@ class SlashCommandCompleter(Completer):
         if not query:
             search_dir, match_prefix = ".", ""
         else:
-            expanded = os.path.expanduser(query)
-            if expanded.endswith("/"):
+            expanded = _expand_user_path(query)
+            if expanded.endswith(("/", "\\")):
                 search_dir, match_prefix = expanded, ""
             else:
                 search_dir = os.path.dirname(expanded) or "."

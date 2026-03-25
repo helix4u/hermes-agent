@@ -835,7 +835,17 @@ def _cprint(text: str):
     StdoutProxy.  Routing through print_formatted_text(ANSI(...)) lets
     prompt_toolkit parse the escapes and render real colors.
     """
-    _pt_print(_PT_ANSI(text))
+    try:
+        _pt_print(_PT_ANSI(text))
+    except Exception as exc:
+        try:
+            from prompt_toolkit.output.win32 import NoConsoleScreenBufferError
+        except Exception:
+            NoConsoleScreenBufferError = ()  # type: ignore[assignment]
+        if NoConsoleScreenBufferError and isinstance(exc, NoConsoleScreenBufferError):
+            print(text)
+            return
+        raise
 
 
 class ChatConsole:
@@ -3879,13 +3889,14 @@ class HermesCLI:
         user_instruction = parts[1].strip() if len(parts) > 1 else ""
 
         plan_path = build_plan_path(user_instruction)
+        plan_path_text = plan_path.as_posix()
         msg = build_skill_invocation_message(
             "/plan",
             user_instruction,
             task_id=self.session_id,
             runtime_note=(
                 "Save the markdown plan with write_file to this exact relative path "
-                f"inside the active workspace/backend cwd: {plan_path}"
+                f"inside the active workspace/backend cwd: {plan_path_text}"
             ),
         )
 
@@ -3893,7 +3904,7 @@ class HermesCLI:
             self.console.print("[bold red]Failed to load the bundled /plan skill[/]")
             return
 
-        _cprint(f"  📝 Plan mode queued via skill. Markdown plan target: {plan_path}")
+        _cprint(f"  📝 Plan mode queued via skill. Markdown plan target: {plan_path_text}")
         if hasattr(self, '_pending_input'):
             self._pending_input.put(msg)
         else:

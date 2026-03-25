@@ -992,12 +992,15 @@ class GatewayRunner:
             # what's already saved and avoid overwriting newer entries.
             _current_memory = ""
             try:
-                from tools.memory_tool import MEMORY_DIR
+                memory_module = sys.modules.get("tools.memory_tool")
+                if memory_module is None:
+                    from tools import memory_tool as memory_module
+                memory_dir = Path(getattr(memory_module, "MEMORY_DIR"))
                 for fname, label in [
                     ("MEMORY.md", "MEMORY (your personal notes)"),
                     ("USER.md", "USER PROFILE (who the user is)"),
                 ]:
-                    fpath = MEMORY_DIR / fname
+                    fpath = memory_dir / fname
                     if fpath.exists():
                         content = fpath.read_text(encoding="utf-8").strip()
                         if content:
@@ -3474,13 +3477,14 @@ class GatewayRunner:
 
                 user_instruction = event.get_command_args().strip()
                 plan_path = build_plan_path(user_instruction)
+                plan_path_text = plan_path.as_posix()
                 event.text = build_skill_invocation_message(
                     "/plan",
                     user_instruction,
                     task_id=_quick_key,
                     runtime_note=(
                         "Save the markdown plan with write_file to this exact relative path "
-                        f"inside the active workspace/backend cwd: {plan_path}"
+                        f"inside the active workspace/backend cwd: {plan_path_text}"
                     ),
                 )
                 if not event.text:
@@ -3545,18 +3549,40 @@ class GatewayRunner:
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        proc = None
+                        communicate_task = None
                         try:
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
                             )
-                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                            communicate_task = asyncio.create_task(proc.communicate())
+                            stdout, stderr = await asyncio.wait_for(communicate_task, timeout=30)
                             output = (stdout or stderr).decode().strip()
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
+                            if proc is not None and proc.returncode is None:
+                                proc.kill()
+                            if communicate_task is not None:
+                                try:
+                                    await communicate_task
+                                except Exception:
+                                    pass
                             return "Quick command timed out (30s)."
                         except Exception as e:
+                            if communicate_task is not None and not communicate_task.done():
+                                communicate_task.cancel()
+                                try:
+                                    await communicate_task
+                                except Exception:
+                                    pass
+                            elif proc is not None and proc.returncode is None:
+                                proc.kill()
+                                try:
+                                    await proc.communicate()
+                                except Exception:
+                                    pass
                             return f"Quick command error: {e}"
                     else:
                         return f"Quick command '/{command}' has no command defined."
@@ -7747,6 +7773,12 @@ class GatewayRunner:
                 return
             progress_callback("_thinking", cleaned)
 
+        def progress_tool_gen_callback(tool_name: str) -> None:
+            cleaned = str(tool_name or "").strip()
+            if not cleaned:
+                return
+            progress_callback(cleaned)
+
         # Background task to send progress messages.
         _progress_metadata = {"tool_progress": True}
         if source.thread_id:
@@ -8060,6 +8092,7 @@ class GatewayRunner:
                     step_callback=initial_step_callback,
                     status_callback=_status_callback_sync,
                     stream_delta_callback=_stream_delta_cb,
+                    tool_gen_callback=progress_tool_gen_callback if tool_progress_enabled else None,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
@@ -8074,6 +8107,7 @@ class GatewayRunner:
             agent.stream_delta_callback = _stream_delta_cb
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
+            agent.tool_gen_callback = progress_tool_gen_callback if tool_progress_enabled else None
             
             # Store agent reference for interrupt support
             agent_holder[0] = agent
@@ -8245,6 +8279,10 @@ class GatewayRunner:
         # Start progress message sender if enabled
         progress_task = None
         if tool_progress_enabled:
+            _set_progress_state(
+                phase="starting",
+                detail="🚀 starting request: handing message to Hermes...",
+            )
             progress_task = asyncio.create_task(send_progress_messages())
         
         # Track this agent as running for this session (for interrupt support)

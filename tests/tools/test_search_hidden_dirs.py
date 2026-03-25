@@ -18,6 +18,57 @@ import subprocess
 
 import pytest
 
+from tools.file_operations import ShellFileOperations
+
+
+class _WindowsLocalSearchEnv:
+    """Minimal local-backend env stub for Windows-native search tests."""
+
+    __module__ = "tools.environments.local"
+
+    def __init__(self, cwd):
+        self.cwd = str(cwd)
+
+    def execute(self, command, cwd=None, **kwargs):
+        raise AssertionError(
+            "Windows-native search should not shell out through env.execute()"
+        )
+
+
+def _search_files_output(searchable_tree, pattern):
+    """Return file-search output across host OSes."""
+    if os.name == "nt":
+        ops = ShellFileOperations(
+            _WindowsLocalSearchEnv(searchable_tree), cwd=str(searchable_tree)
+        )
+        result = ops.search(pattern, path=str(searchable_tree), target="files")
+        assert result.error is None
+        return "\n".join(result.files or [])
+
+    cmd = f"find {searchable_tree} -not -path '*/.*' -type f -name '{pattern}'"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    assert result.returncode in (0, 1)
+    return result.stdout
+
+
+def _search_content_output(searchable_tree, pattern):
+    """Return content-search output across host OSes."""
+    if os.name == "nt":
+        ops = ShellFileOperations(
+            _WindowsLocalSearchEnv(searchable_tree), cwd=str(searchable_tree)
+        )
+        result = ops.search(pattern, path=str(searchable_tree), target="content")
+        assert result.error is None
+        return "\n".join(
+            f"{match.path}:{match.line_number}:{match.content}"
+            for match in (result.matches or [])
+        )
+
+    cmd = f"grep -rnH --exclude-dir='.*' '{pattern}' {searchable_tree}"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    assert result.returncode in (0, 1)
+    return result.stdout
+
 
 @pytest.fixture
 def searchable_tree(tmp_path):
@@ -43,55 +94,39 @@ def searchable_tree(tmp_path):
 
 
 class TestFindExcludesHiddenDirs:
-    """_search_files uses find, which should exclude hidden directories."""
+    """File search should exclude hidden directories on every host OS."""
 
     def test_find_skips_hub_cache_files(self, searchable_tree):
-        """find should not return files from .hub/ directory."""
-        cmd = (
-            f"find {searchable_tree} -not -path '*/.*' -type f -name '*.json'"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        assert "catalog.json" not in result.stdout
-        assert ".hub" not in result.stdout
+        """Search should not return files from .hub/ directory."""
+        output = _search_files_output(searchable_tree, "*.json")
+        assert "catalog.json" not in output
+        assert ".hub" not in output
 
     def test_find_skips_git_internals(self, searchable_tree):
-        """find should not return files from .git/ directory."""
-        cmd = (
-            f"find {searchable_tree} -not -path '*/.*' -type f -name '*.idx'"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        assert "pack-abc.idx" not in result.stdout
-        assert ".git" not in result.stdout
+        """Search should not return files from .git/ directory."""
+        output = _search_files_output(searchable_tree, "*.idx")
+        assert "pack-abc.idx" not in output
+        assert ".git" not in output
 
     def test_find_still_returns_visible_files(self, searchable_tree):
-        """find should still return files from visible directories."""
-        cmd = (
-            f"find {searchable_tree} -not -path '*/.*' -type f -name '*.md'"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        assert "SKILL.md" in result.stdout
+        """Search should still return files from visible directories."""
+        output = _search_files_output(searchable_tree, "*.md")
+        assert "SKILL.md" in output
 
 
 class TestGrepExcludesHiddenDirs:
-    """_search_with_grep should exclude hidden directories."""
+    """Content search should exclude hidden directories on every host OS."""
 
     def test_grep_skips_hub_cache(self, searchable_tree):
-        """grep --exclude-dir should skip .hub/ directory."""
-        cmd = (
-            f"grep -rnH --exclude-dir='.*' 'ignore' {searchable_tree}"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        # Should NOT find the injection text in .hub/index-cache/catalog.json
-        assert ".hub" not in result.stdout
-        assert "catalog.json" not in result.stdout
+        """Search should skip .hub/ directory."""
+        output = _search_content_output(searchable_tree, "ignore")
+        assert ".hub" not in output
+        assert "catalog.json" not in output
 
     def test_grep_still_finds_visible_content(self, searchable_tree):
-        """grep should still find content in visible directories."""
-        cmd = (
-            f"grep -rnH --exclude-dir='.*' 'real skill' {searchable_tree}"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        assert "SKILL.md" in result.stdout
+        """Search should still find content in visible directories."""
+        output = _search_content_output(searchable_tree, "real skill")
+        assert "SKILL.md" in output
 
 
 class TestRipgrepAlreadyExcludesHidden:

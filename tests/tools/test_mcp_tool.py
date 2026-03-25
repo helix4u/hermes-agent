@@ -4,6 +4,7 @@ All tests use mocks -- no real MCP servers or subprocesses are started.
 """
 
 import asyncio
+import inspect
 import json
 import os
 from types import SimpleNamespace
@@ -1102,13 +1103,20 @@ class TestConfigurableTimeouts:
         try:
             handler = _make_tool_handler("test_srv", "my_tool", 180)
             with patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
-                mock_run.return_value = json.dumps({"result": "ok"})
+                captured = {}
+
+                def fake_run(coro, timeout=30):
+                    captured["coro"] = coro
+                    return json.dumps({"result": "ok"})
+
+                mock_run.side_effect = fake_run
                 handler({})
                 # Verify timeout=180 was passed
                 call_kwargs = mock_run.call_args
                 assert call_kwargs.kwargs.get("timeout") == 180 or \
                        (len(call_kwargs.args) > 1 and call_kwargs.args[1] == 180) or \
                        call_kwargs[1].get("timeout") == 180
+                assert inspect.getcoroutinestate(captured["coro"]) == inspect.CORO_CLOSED
         finally:
             _servers.pop("test_srv", None)
 

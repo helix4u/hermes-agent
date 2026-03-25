@@ -12,7 +12,7 @@ import signal
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
@@ -246,22 +246,45 @@ def print_systemd_scope_conflict_warning() -> None:
     print_info("    sudo hermes gateway uninstall --system")
 
 
+def _effective_uid() -> int | None:
+    geteuid = getattr(os, "geteuid", None)
+    if callable(geteuid):
+        return int(geteuid())
+    return None
+
+
+def _current_uid() -> int | None:
+    getuid = getattr(os, "getuid", None)
+    if callable(getuid):
+        return int(getuid())
+    return None
+
+
 def _require_root_for_system_service(action: str) -> None:
-    if os.geteuid() != 0:
+    if _effective_uid() != 0:
         print(f"System gateway {action} requires root. Re-run with sudo.")
         sys.exit(1)
 
 
 def _system_service_identity(run_as_user: str | None = None) -> tuple[str, str, str]:
     import getpass
-    import grp
-    import pwd
+
+    try:
+        import grp
+        import pwd
+    except ImportError:
+        grp = None
+        pwd = None
 
     username = (run_as_user or os.getenv("SUDO_USER") or os.getenv("USER") or os.getenv("LOGNAME") or getpass.getuser()).strip()
     if not username:
         raise ValueError("Could not determine which user the gateway service should run as")
     if username == "root":
         raise ValueError("Refusing to install the gateway system service as root; pass --run-as USER")
+
+    if pwd is None or grp is None:
+        home_dir = os.getenv("HOME") or os.path.expanduser("~") or str(Path.home())
+        return username, username, home_dir
 
     try:
         user_info = pwd.getpwnam(username)
@@ -310,7 +333,7 @@ def install_linux_gateway_from_setup(force: bool = False) -> tuple[str | None, b
 
     if scope == "system":
         run_as_user = _default_system_service_user()
-        if os.geteuid() != 0:
+        if _effective_uid() != 0:
             print_warning("  System service install requires sudo, so Hermes can't create it from this user session.")
             if run_as_user:
                 print_info(f"  After setup, run: sudo hermes gateway install --system --run-as-user {run_as_user}")
@@ -402,9 +425,11 @@ def _ensure_user_systemd_env() -> None:
         return
 
     if not os.environ.get("XDG_RUNTIME_DIR"):
-        runtime_dir = Path("/run/user") / str(os.getuid())
-        if runtime_dir.exists():
-            os.environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
+        uid = _current_uid()
+        if uid is not None:
+            runtime_dir = Path("/run/user") / str(uid)
+            if runtime_dir.exists():
+                os.environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
 
     if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
@@ -752,6 +777,7 @@ def _wait_for_gateway_exit(
     """Wait for the gateway PID file to disappear, force-killing if needed."""
     from gateway.status import get_running_pid
 
+    force_signal = getattr(signal, "SIGKILL", getattr(signal, "SIGTERM"))
     deadline = time.monotonic() + max(0.0, float(timeout))
     force_deadline = time.monotonic() + max(0.0, float(force_after))
     sleep_interval = max(0.05, float(poll_interval))
@@ -764,7 +790,7 @@ def _wait_for_gateway_exit(
 
         if not killed and time.monotonic() >= force_deadline:
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, force_signal)
             except ProcessLookupError:
                 return
             killed = True
@@ -787,13 +813,16 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     path_entries = [venv_bin, node_bin]
     resolved_node = shutil.which("node")
     if resolved_node:
-        resolved_node_dir = str(Path(resolved_node).resolve().parent)
+        if "/" in resolved_node and "\\" not in resolved_node:
+            resolved_node_dir = str(PurePosixPath(resolved_node).parent)
+        else:
+            resolved_node_dir = str(Path(resolved_node).parent)
         if resolved_node_dir not in path_entries:
             path_entries.append(resolved_node_dir)
     path_entries.extend(["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"])
     sane_path = ":".join(path_entries)
 
-    hermes_home = str(Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")).resolve())
+    hermes_home = str(get_hermes_home().resolve())
 
     if system:
         username, group_name, home_dir = _system_service_identity(run_as_user)

@@ -546,6 +546,27 @@ def test_get_cdp_override_prefers_env_over_shared_runtime_state(tmp_path):
         assert browser_tool._get_cdp_override() == "ws://localhost:9222"
 
 
+def test_is_local_mode_does_not_probe_live_cdp_endpoint():
+    from tools import browser_tool
+
+    with (
+        patch(
+            "tools.browser_tool.requests.get",
+            side_effect=AssertionError("startup should not probe CDP"),
+        ),
+        patch.dict(
+            "tools.browser_tool.os.environ",
+            {
+                "BROWSER_CDP_URL": "ws://localhost:9222",
+                "BROWSERBASE_API_KEY": "",
+                "BROWSERBASE_PROJECT_ID": "",
+            },
+            clear=False,
+        ),
+    ):
+        assert browser_tool._is_local_mode() is False
+
+
 def test_sidecar_can_opt_in_to_headless_live_actions():
     from tools import browser_tool
 

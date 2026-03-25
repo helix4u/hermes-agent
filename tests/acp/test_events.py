@@ -17,6 +17,21 @@ from acp_adapter.events import (
 )
 
 
+def _mock_threadsafe_submit(mock_rcts):
+    """Return a fake Future while consuming the submitted coroutine."""
+    future = MagicMock(spec=Future)
+    future.result.return_value = None
+
+    def _submit(coro, _loop):
+        try:
+            return future
+        finally:
+            coro.close()
+
+    mock_rcts.side_effect = _submit
+    return future
+
+
 @pytest.fixture()
 def mock_conn():
     """Mock ACP Client connection."""
@@ -48,9 +63,7 @@ class TestToolProgressCallback:
 
         # Run callback in the event loop context
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_threadsafe_submit(mock_rcts)
 
             cb("terminal", "$ ls -la", {"command": "ls -la"})
 
@@ -71,9 +84,7 @@ class TestToolProgressCallback:
         cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_threadsafe_submit(mock_rcts)
 
             cb("read_file", "Reading /etc/hosts", '{"path": "/etc/hosts"}')
 
@@ -87,9 +98,7 @@ class TestToolProgressCallback:
         cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_threadsafe_submit(mock_rcts)
 
             cb("terminal", "$ echo hi", None)
 
@@ -104,9 +113,7 @@ class TestToolProgressCallback:
         step_cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_threadsafe_submit(mock_rcts)
 
             progress_cb("terminal", "$ ls", {"command": "ls"})
             progress_cb("terminal", "$ pwd", {"command": "pwd"})
@@ -132,9 +139,7 @@ class TestThinkingCallback:
         cb = make_thinking_cb(mock_conn, "session-1", loop)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_threadsafe_submit(mock_rcts)
 
             cb("Analyzing the code...")
 
@@ -166,9 +171,7 @@ class TestStepCallback:
         cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_threadsafe_submit(mock_rcts)
 
             cb(1, [{"name": "terminal", "result": "success"}])
 
@@ -196,9 +199,7 @@ class TestStepCallback:
         cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_threadsafe_submit(mock_rcts)
 
             cb(2, ["read_file"])
 
@@ -219,9 +220,7 @@ class TestMessageCallback:
         cb = make_message_cb(mock_conn, "session-1", loop)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            future = MagicMock(spec=Future)
-            future.result.return_value = None
-            mock_rcts.return_value = future
+            _mock_threadsafe_submit(mock_rcts)
 
             cb("Here is your answer.")
 

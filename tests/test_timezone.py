@@ -15,9 +15,16 @@ import sys
 import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import hermes_time
+
+
+def _require_zoneinfo(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        pytest.skip(f"ZoneInfo data for {name} is unavailable in this environment")
 
 
 # =========================================================================
@@ -36,6 +43,7 @@ class TestHermesTimeNow:
 
     def test_valid_timezone_applies(self):
         """With a valid IANA timezone, now() returns time in that zone."""
+        _require_zoneinfo("Asia/Kolkata")
         os.environ["HERMES_TIMEZONE"] = "Asia/Kolkata"
         result = hermes_time.now()
         assert result.tzinfo is not None
@@ -51,6 +59,7 @@ class TestHermesTimeNow:
 
     def test_us_eastern(self):
         """US/Eastern timezone works (DST-aware zone)."""
+        _require_zoneinfo("America/New_York")
         os.environ["HERMES_TIMEZONE"] = "America/New_York"
         result = hermes_time.now()
         assert result.tzinfo is not None
@@ -75,6 +84,7 @@ class TestHermesTimeNow:
 
     def test_format_unchanged(self):
         """Timestamp formatting matches original strftime pattern."""
+        _require_zoneinfo("Asia/Kolkata")
         os.environ["HERMES_TIMEZONE"] = "Asia/Kolkata"
         result = hermes_time.now()
         formatted = result.strftime("%A, %B %d, %Y %I:%M %p")
@@ -90,6 +100,7 @@ class TestHermesTimeNow:
         r1 = hermes_time.now()
         assert r1.utcoffset() == timedelta(0)
 
+        _require_zoneinfo("Asia/Kolkata")
         os.environ["HERMES_TIMEZONE"] = "Asia/Kolkata"
         hermes_time.reset_cache()
         r2 = hermes_time.now()
@@ -107,6 +118,7 @@ class TestGetTimezone:
         os.environ.pop("HERMES_TIMEZONE", None)
 
     def test_returns_zoneinfo_for_valid(self):
+        _require_zoneinfo("Europe/London")
         os.environ["HERMES_TIMEZONE"] = "Europe/London"
         tz = hermes_time.get_timezone()
         assert isinstance(tz, ZoneInfo)
@@ -290,7 +302,7 @@ class TestCronTimezone:
         result = _ensure_aware(utc_dt)
 
         # Must be in Hermes tz (Kolkata) but same absolute instant
-        kolkata = ZoneInfo("Asia/Kolkata")
+        kolkata = _require_zoneinfo("Asia/Kolkata")
         assert result.utctimetuple()[:5] == (2026, 3, 11, 15, 0)
         expected_local = utc_dt.astimezone(kolkata)
         assert result == expected_local

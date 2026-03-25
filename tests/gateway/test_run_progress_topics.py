@@ -86,9 +86,12 @@ class FakeAgent:
     def __init__(self, **kwargs):
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.thinking_callback = kwargs.get("thinking_callback")
+        self.tool_gen_callback = kwargs.get("tool_gen_callback")
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.tool_gen_callback:
+            self.tool_gen_callback("terminal")
         self.tool_progress_callback("terminal", "pwd")
         time.sleep(0.35)
         self.tool_progress_callback("browser_navigate", "https://example.com")
@@ -104,6 +107,7 @@ class DiscordThinkingFakeAgent:
     def __init__(self, **kwargs):
         self.tool_progress_callback = kwargs["tool_progress_callback"]
         self.thinking_callback = kwargs.get("thinking_callback")
+        self.tool_gen_callback = kwargs.get("tool_gen_callback")
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
@@ -193,10 +197,12 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     assert len(adapter.sent) == 1
     first = adapter.sent[0]
     assert first["chat_id"] == "-1001"
-    assert 'terminal: "pwd"' in first["content"]
+    assert "starting request" in first["content"]
     assert first["reply_to"] is None
     assert first["metadata"] == {"tool_progress": True, "thread_id": "17585"}
     assert adapter.edits
+    rendered = [entry["content"] for entry in adapter.sent] + [entry["content"] for entry in adapter.edits]
+    assert any('terminal: "pwd"' in content for content in rendered)
     assert all(call["metadata"] == {"tool_progress": True, "thread_id": "17585"} for call in adapter.typing)
 
 

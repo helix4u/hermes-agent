@@ -104,3 +104,20 @@ async def test_disconnect_cancels_persistent_typing_tasks():
     await adapter.disconnect()
 
     assert adapter._typing_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_stop_typing_cancels_persistent_typing_task():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        http=SimpleNamespace(request=AsyncMock(return_value=None)),
+    )
+
+    await adapter.send_typing("555")
+    await asyncio.sleep(0)
+
+    assert "555" in adapter._typing_tasks
+
+    await adapter.stop_typing("555")
+
+    assert "555" not in adapter._typing_tasks

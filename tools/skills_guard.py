@@ -714,16 +714,27 @@ def format_scan_report(result: ScanResult) -> str:
 
 def content_hash(skill_path: Path) -> str:
     """Compute a SHA-256 hash of all files in a skill directory for integrity tracking."""
+    def _normalized_bytes(data: bytes) -> bytes:
+        try:
+            # Text skills should hash identically across LF/CRLF hosts.
+            return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+        except UnicodeDecodeError:
+            return data
+
     h = hashlib.sha256()
     if skill_path.is_dir():
-        for f in sorted(skill_path.rglob("*")):
+        files = [
+            f for f in skill_path.rglob("*")
+            if f.is_file()
+        ]
+        for f in sorted(files, key=lambda p: p.relative_to(skill_path).as_posix()):
             if f.is_file():
                 try:
-                    h.update(f.read_bytes())
+                    h.update(_normalized_bytes(f.read_bytes()))
                 except OSError:
                     continue
     elif skill_path.is_file():
-        h.update(skill_path.read_bytes())
+        h.update(_normalized_bytes(skill_path.read_bytes()))
     return f"sha256:{h.hexdigest()[:16]}"
 
 

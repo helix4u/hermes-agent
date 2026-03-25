@@ -73,6 +73,8 @@ def adapter():
     # Mock the Slack app client
     a._app = MagicMock()
     a._app.client = AsyncMock()
+    a._app.client.chat_postMessage = AsyncMock(return_value={"ts": "msg_ts"})
+    a._app.client.users_info = AsyncMock(return_value={})
     a._bot_user_id = "U_BOT"
     a._running = True
     # Capture events instead of processing them
@@ -209,6 +211,7 @@ class TestSendDocument:
         adapter._app.client.files_upload_v2 = AsyncMock(
             side_effect=RuntimeError("Slack API error")
         )
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "msg_ts"})
 
         # Should fall back to base class (text message)
         result = await adapter.send_document(
@@ -289,6 +292,7 @@ class TestSendVideo:
         adapter._app.client.files_upload_v2 = AsyncMock(
             side_effect=RuntimeError("Slack API error")
         )
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "msg_ts"})
 
         # Should fall back to base class (text message)
         result = await adapter.send_video(

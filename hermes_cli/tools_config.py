@@ -163,6 +163,12 @@ TOOL_CATEGORIES = {
                 "tts_provider": "openai",
             },
             {
+                "name": "Kokoro FastAPI",
+                "tag": "Local server - voice mixing, no API key needed",
+                "env_vars": [],
+                "tts_provider": "kokoro",
+            },
+            {
                 "name": "ElevenLabs",
                 "tag": "Premium - most natural voices",
                 "env_vars": [

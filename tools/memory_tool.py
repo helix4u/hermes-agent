@@ -32,6 +32,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
+from hermes_cli.config import get_hermes_home
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -45,7 +47,7 @@ except Exception:
     msvcrt = None
 
 # Where memory files live
-MEMORY_DIR = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "memories"
+MEMORY_DIR = get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
 _DYNAMIC_SHELL_CONTEXT_PATTERNS = (
@@ -587,7 +589,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

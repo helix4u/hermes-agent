@@ -35,7 +35,17 @@ _RST = "\033[0m"
 
 def cprint(text: str):
     """Print ANSI-colored text through prompt_toolkit's renderer."""
-    _pt_print(_PT_ANSI(text))
+    try:
+        _pt_print(_PT_ANSI(text))
+    except Exception as exc:
+        try:
+            from prompt_toolkit.output.win32 import NoConsoleScreenBufferError
+        except Exception:
+            NoConsoleScreenBufferError = ()  # type: ignore[assignment]
+        if NoConsoleScreenBufferError and isinstance(exc, NoConsoleScreenBufferError):
+            print(text)
+            return
+        raise
 
 
 # =========================================================================

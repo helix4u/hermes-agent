@@ -2,10 +2,11 @@
 """
 Text-to-Speech Tool Module
 
-Supports four TTS providers:
+Supports six TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY
+- Kokoro FastAPI (local): OpenAI-compatible local TTS with voice mixing
 - NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
 - F5 TTS (local): Fast local voice cloning, needs F5TTS_SECRET_KEY
 
@@ -80,6 +81,11 @@ DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
 DEFAULT_ELEVENLABS_STREAMING_MODEL_ID = "eleven_flash_v2_5"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts"
 DEFAULT_OPENAI_VOICE = "alloy"
+DEFAULT_KOKORO_BASE_URL = "http://localhost:8880"
+DEFAULT_KOKORO_MODEL = "kokoro"
+DEFAULT_KOKORO_VOICE = "af_sky+af_v0+af_nicole"
+DEFAULT_KOKORO_SPEED = 1.75
+DEFAULT_KOKORO_REQUEST_TIMEOUT = 120
 DEFAULT_F5_BASE_URL = "http://localhost:8081"
 DEFAULT_F5_TOKEN_TTL_MINUTES = 30
 DEFAULT_F5_HEALTH_TIMEOUT = 10
@@ -160,10 +166,26 @@ def _convert_to_opus(mp3_path: str) -> Optional[str]:
     return None
 
 
-def _normalize_base_url(base_url: str) -> str:
+def _normalize_base_url(base_url: str, default_base_url: str = DEFAULT_F5_BASE_URL) -> str:
     """Normalize a configured API base URL."""
-    value = (base_url or DEFAULT_F5_BASE_URL).strip()
+    value = (base_url or default_base_url).strip()
     return value.rstrip("/")
+
+
+def _response_format_for_output(output_path: str) -> str:
+    """Infer the provider response format from the requested output path."""
+    suffix = Path(output_path).suffix.lower()
+    if suffix == ".ogg":
+        return "opus"
+    if suffix == ".wav":
+        return "wav"
+    if suffix == ".flac":
+        return "flac"
+    if suffix == ".m4a":
+        return "m4a"
+    if suffix == ".pcm":
+        return "pcm"
+    return "mp3"
 
 
 def _build_f5_bearer_token(secret_key: str, ttl_minutes: int) -> str:
@@ -387,10 +409,7 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     base_url = oai_config.get("base_url", "https://api.openai.com/v1")
 
     # Determine response format from extension
-    if output_path.endswith(".ogg"):
-        response_format = "opus"
-    else:
-        response_format = "mp3"
+    response_format = _response_format_for_output(output_path)
 
     OpenAIClient = _import_openai_client()
     client = OpenAIClient(api_key=api_key, base_url=base_url)
@@ -402,6 +421,47 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     )
 
     response.stream_to_file(output_path)
+    return output_path
+
+
+def _generate_kokoro_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate audio using a local Kokoro FastAPI server."""
+    kokoro_config = tts_config.get("kokoro", {})
+    base_url = _normalize_base_url(
+        kokoro_config.get("base_url", DEFAULT_KOKORO_BASE_URL),
+        DEFAULT_KOKORO_BASE_URL,
+    )
+    model = str(kokoro_config.get("model", DEFAULT_KOKORO_MODEL)).strip() or DEFAULT_KOKORO_MODEL
+    voice = str(kokoro_config.get("voice", DEFAULT_KOKORO_VOICE)).strip() or DEFAULT_KOKORO_VOICE
+    speed = float(kokoro_config.get("speed", DEFAULT_KOKORO_SPEED))
+    request_timeout = int(
+        kokoro_config.get("request_timeout_seconds", DEFAULT_KOKORO_REQUEST_TIMEOUT)
+    )
+
+    if not voice:
+        raise ValueError(
+            "Kokoro TTS provider selected but no voice is configured. "
+            "Set tts.kokoro.voice in ~/.hermes/config.yaml."
+        )
+    if speed <= 0:
+        raise ValueError("Kokoro speed must be greater than 0.")
+
+    synth_url = urljoin(f"{base_url}/", "v1/audio/speech")
+    response = requests.post(
+        synth_url,
+        json={
+            "model": model,
+            "input": text,
+            "voice": voice,
+            "response_format": _response_format_for_output(output_path),
+            "speed": speed,
+        },
+        timeout=request_timeout,
+    )
+    response.raise_for_status()
+
+    with open(output_path, "wb") as f:
+        f.write(response.content)
     return output_path
 
 
@@ -609,9 +669,9 @@ def text_to_speech_tool(
     provider = _get_provider(tts_config)
 
     # Detect platform from gateway env var to choose the best output format.
-    # Telegram and Discord both benefit from compressed audio. OpenAI and
-    # ElevenLabs can produce Opus natively; Edge and F5 can be converted with
-    # ffmpeg when available.
+    # Telegram and Discord both benefit from compressed audio. OpenAI,
+    # ElevenLabs, and Kokoro can produce Opus natively; Edge/F5/NeuTTS can
+    # be converted with ffmpeg when available.
     platform = os.getenv("HERMES_SESSION_PLATFORM", "").lower()
     want_opus = platform in {"telegram", "discord"}
 
@@ -625,7 +685,7 @@ def text_to_speech_tool(
         # Use .ogg for platforms that prefer compressed voice/audio output when
         # providers support native Opus output. Use .wav for local F5 output
         # before optional conversion, otherwise .mp3.
-        if want_opus and provider in ("openai", "elevenlabs"):
+        if want_opus and provider in ("openai", "elevenlabs", "kokoro"):
             file_path = out_dir / f"tts_{timestamp}.ogg"
         elif provider == "f5":
             file_path = out_dir / f"tts_{timestamp}.wav"
@@ -659,6 +719,10 @@ def text_to_speech_tool(
                 }, ensure_ascii=False)
             logger.info("Generating speech with OpenAI TTS...")
             _generate_openai_tts(text, file_str, tts_config)
+
+        elif provider == "kokoro":
+            logger.info("Generating speech with Kokoro FastAPI...")
+            _generate_kokoro_tts(text, file_str, tts_config)
 
         elif provider == "neutts":
             if not _check_neutts_available():
@@ -718,7 +782,7 @@ def text_to_speech_tool(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
-        elif provider in ("elevenlabs", "openai"):
+        elif provider in ("elevenlabs", "openai", "kokoro"):
             # These providers can output Opus natively if the path ends in .ogg
             voice_compatible = file_str.endswith(".ogg")
 
@@ -768,6 +832,11 @@ def check_tts_requirements() -> bool:
     Returns:
         bool: True if at least one provider can work.
     """
+    try:
+        if _get_provider(_load_tts_config()) == "kokoro":
+            return True
+    except Exception:
+        pass
     try:
         _import_edge_tts()
         return True
@@ -1054,6 +1123,7 @@ if __name__ == "__main__":
 
     config = _load_tts_config()
     provider = _get_provider(config)
+    print(f"  Kokoro:     configured at {config.get('kokoro', {}).get('base_url', DEFAULT_KOKORO_BASE_URL)}")
     print(f"  Configured provider: {provider}")
 
 
@@ -1064,7 +1134,7 @@ from tools.registry import registry
 
 TTS_SCHEMA = {
     "name": "text_to_speech",
-    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as a voice message. On Telegram it plays as a voice bubble, on Discord/WhatsApp as an audio attachment. In CLI mode, saves to ~/voice-memos/. Voice and provider (Edge, ElevenLabs, OpenAI, local F5) are user-configured, not model-selected.",
+    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as a voice message. On Telegram it plays as a voice bubble, on Discord/WhatsApp as an audio attachment. In CLI mode, saves to ~/voice-memos/. Voice and provider (Edge, ElevenLabs, OpenAI, Kokoro FastAPI, local F5) are user-configured, not model-selected.",
     "parameters": {
         "type": "object",
         "properties": {

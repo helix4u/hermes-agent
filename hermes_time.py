@@ -66,6 +66,8 @@ def _get_zoneinfo(name: str) -> Optional[ZoneInfo]:
     """Validate and return a ZoneInfo, or None if invalid."""
     if not name:
         return None
+    if name.upper() == "UTC":
+        return _tz.utc
     try:
         return ZoneInfo(name)
     except (KeyError, Exception) as exc:

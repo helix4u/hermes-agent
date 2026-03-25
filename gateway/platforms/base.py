@@ -1099,6 +1099,10 @@ class BasePlatformAdapter(ABC):
                     await typing_task
                 except asyncio.CancelledError:
                     pass
+                try:
+                    await self.stop_typing(event.source.chat_id)
+                except Exception:
+                    pass
                 # Process pending message in new background task
                 await self._process_message_background(pending_event, session_key)
                 return  # Already cleaned up
@@ -1129,6 +1133,10 @@ class BasePlatformAdapter(ABC):
             try:
                 await typing_task
             except asyncio.CancelledError:
+                pass
+            try:
+                await self.stop_typing(event.source.chat_id)
+            except Exception:
                 pass
             # Clean up session tracking
             if session_key in self._active_sessions:

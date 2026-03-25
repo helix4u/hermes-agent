@@ -92,6 +92,16 @@ def _configure_console_encoding() -> None:
                 pass
 
 
+def _completed_output_text(result, stream_name: str = "stdout") -> str:
+    """Return subprocess output as text even for lightweight test doubles."""
+    value = getattr(result, stream_name, "")
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
 def _relative_time(ts) -> str:
     """Format a timestamp as relative time (e.g., '2h ago', 'yesterday')."""
     if not ts:
@@ -2715,7 +2725,7 @@ def cmd_update(args):
             text=True,
             check=True
         )
-        branch = result.stdout.strip()
+        branch = _completed_output_text(result).strip()
 
         # Fall back to main if the current branch doesn't exist on the remote
         verify = subprocess.run(
@@ -2733,7 +2743,8 @@ def cmd_update(args):
             text=True,
             check=True
         )
-        commit_count = int(result.stdout.strip())
+        commit_count_text = _completed_output_text(result).strip()
+        commit_count = int(commit_count_text or "0")
         
         if commit_count == 0:
             _invalidate_update_cache()
