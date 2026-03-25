@@ -1112,7 +1112,12 @@ class AIAgent:
         self.context_compressor = ContextCompressor(
             model=self.model,
             threshold_percent=compression_threshold,
-            protect_first_n=3,
+            # The system prompt is sent separately from ``messages`` in the live
+            # agent loop, so preserving head turns here would pin the opening
+            # conversation instead of "system + first exchange" as older
+            # comments assumed. Let the compaction summary carry early context
+            # and keep the live prompt anchored on the newest turns.
+            protect_first_n=0,
             protect_last_n=4,
             summary_target_tokens=500,
             summary_model_override=compression_summary_model,
@@ -4844,11 +4849,44 @@ class AIAgent:
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
 
-        compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+        anchor_key = "_hermes_current_turn_user"
+        compression_input = messages
+        anchored_idx = getattr(self, "_persist_user_message_idx", None)
+        if isinstance(anchored_idx, int) and 0 <= anchored_idx < len(messages):
+            anchored_msg = messages[anchored_idx]
+            if isinstance(anchored_msg, dict) and anchored_msg.get("role") == "user":
+                compression_input = [msg.copy() if isinstance(msg, dict) else msg for msg in messages]
+                compression_input[anchored_idx][anchor_key] = True
+
+        compressed = self.context_compressor.compress(compression_input, current_tokens=approx_tokens)
+
+        new_current_turn_idx = None
+        for idx, msg in enumerate(compressed):
+            if isinstance(msg, dict) and msg.pop(anchor_key, False):
+                new_current_turn_idx = idx
+                break
+        if new_current_turn_idx is not None:
+            self._persist_user_message_idx = new_current_turn_idx
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
-            compressed.append({"role": "user", "content": todo_snapshot})
+            todo_msg = {"role": "user", "content": todo_snapshot}
+            if new_current_turn_idx is not None:
+                # Keep the task snapshot ahead of the live user ask so the
+                # newest real request remains the latest user turn even when
+                # tool chatter already follows it.
+                insert_at = new_current_turn_idx
+            else:
+                insert_at = len(compressed)
+                while insert_at > 0 and compressed[insert_at - 1].get("role") == "user":
+                    insert_at -= 1
+            compressed.insert(insert_at, todo_msg)
+            if (
+                isinstance(new_current_turn_idx, int)
+                and isinstance(self._persist_user_message_idx, int)
+                and self._persist_user_message_idx >= insert_at
+            ):
+                self._persist_user_message_idx += 1
 
         self._invalidate_system_prompt()
         new_system_prompt = self._build_system_prompt(system_message)
@@ -5980,6 +6018,8 @@ class AIAgent:
                         messages, system_message, approx_tokens=_preflight_tokens,
                         task_id=effective_task_id,
                     )
+                    if isinstance(self._persist_user_message_idx, int):
+                        current_turn_user_idx = self._persist_user_message_idx
                     if len(messages) >= _orig_len:
                         break  # Cannot compress further
                     # Re-estimate after compression
@@ -6671,6 +6711,8 @@ class AIAgent:
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
                         )
+                        if isinstance(self._persist_user_message_idx, int):
+                            current_turn_user_idx = self._persist_user_message_idx
 
                         if len(messages) < original_len:
                             self._vprint(f"{self.log_prefix}   🗜️  Compressed {original_len} → {len(messages)} messages, retrying...")
@@ -6762,6 +6804,8 @@ class AIAgent:
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
                         )
+                        if isinstance(self._persist_user_message_idx, int):
+                            current_turn_user_idx = self._persist_user_message_idx
 
                         if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
                             if len(messages) < original_len:
@@ -7273,6 +7317,8 @@ class AIAgent:
                             approx_tokens=self.context_compressor.last_prompt_tokens,
                             task_id=effective_task_id,
                         )
+                        if isinstance(self._persist_user_message_idx, int):
+                            current_turn_user_idx = self._persist_user_message_idx
                     
                     # Save session log incrementally (so progress is visible even if interrupted)
                     self._session_messages = messages

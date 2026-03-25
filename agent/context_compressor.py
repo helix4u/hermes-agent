@@ -47,6 +47,11 @@ _DEFAULT_TAIL_TOKEN_BUDGET = 20_000
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
+# Marker set by AIAgent when the current live user request must survive
+# compaction even if trailing tool chatter would otherwise push it into the
+# summarized-away middle region.
+_CURRENT_TURN_ANCHOR_KEY = "_hermes_current_turn_user"
+
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
 
@@ -562,6 +567,15 @@ Write only the summary body. Do not include any preamble or prefix."""
 
         # Use token-budget tail protection instead of fixed message count
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+
+        # If the live current-turn user message is marked, force the tail to
+        # start there. Otherwise, large tool outputs after the user's request
+        # can consume the entire tail budget and make the latest ask vanish
+        # into the summary while only tool chatter survives verbatim.
+        for idx in range(compress_start, compress_end):
+            if messages[idx].get(_CURRENT_TURN_ANCHOR_KEY):
+                compress_end = idx
+                break
 
         if compress_start >= compress_end:
             return messages

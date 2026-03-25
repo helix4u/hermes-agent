@@ -513,3 +513,58 @@ class TestCompressWithClient:
         for msg in result:
             if msg.get("role") == "tool" and msg.get("tool_call_id"):
                 assert msg["tool_call_id"] in called_ids
+
+    def test_anchored_current_user_survives_large_tool_tail(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=0,
+                protect_last_n=2,
+            )
+
+        msgs = [
+            {"role": "user", "content": "what's up today?"},
+            {"role": "assistant", "content": "not much"},
+            {
+                "role": "user",
+                "content": "do the pending wiki stuff",
+                "_hermes_current_turn_user": True,
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "search_files", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "search_files", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "x" * 80000},
+            {"role": "tool", "tool_call_id": "call_2", "content": "y" * 80000},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+
+        anchored = [msg for msg in result if msg.get("_hermes_current_turn_user")]
+        assert len(anchored) == 1
+        assert anchored[0]["content"] == "do the pending wiki stuff"
+        anchored_idx = result.index(anchored[0])
+        tool_call_idx = next(
+            i
+            for i, msg in enumerate(result)
+            if msg.get("role") == "assistant" and msg.get("tool_calls")
+        )
+        assert anchored_idx < tool_call_idx

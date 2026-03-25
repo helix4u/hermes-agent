@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import run_agent
+from agent.context_compressor import ContextCompressor
 from honcho_integration.client import HonchoClientConfig
 from run_agent import AIAgent, _inject_honcho_turn_context
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
@@ -81,6 +82,121 @@ def agent_with_memory_tool():
         )
         a.client = MagicMock()
         return a
+
+
+def test_context_compressor_does_not_pin_opening_turns(agent):
+    """Live sessions should let compaction summarize the opening exchange."""
+    assert agent.context_compressor.protect_first_n == 0
+
+
+def test_compress_context_keeps_latest_user_turn_last(agent):
+    """Todo reinjection after compression must not displace the live user ask."""
+    latest_request = "do the wiki pending stuff"
+    todo_snapshot = "[Your active task list was preserved across context compression]"
+    messages = [
+        {"role": "user", "content": "what's up today?"},
+        {"role": "assistant", "content": "not much"},
+        {"role": "user", "content": latest_request},
+    ]
+
+    agent._persist_user_message_idx = 2
+    agent.context_compressor = MagicMock()
+
+    def _compress_side_effect(msgs, current_tokens=None):
+        return [
+            {"role": "assistant", "content": "[CONTEXT COMPACTION] summary"},
+            msgs[-1].copy(),
+        ]
+
+    agent.context_compressor.compress.side_effect = _compress_side_effect
+    agent._todo_store = MagicMock()
+    agent._todo_store.format_for_injection.return_value = todo_snapshot
+    agent._build_system_prompt = MagicMock(return_value="system prompt")
+    agent._cached_system_prompt = "old system prompt"
+    agent._session_db = None
+
+    with patch.object(agent, "flush_memories"):
+        compressed, new_system_prompt = agent._compress_context(messages, "system prompt")
+
+    assert new_system_prompt == "system prompt"
+    assert compressed[-2] == {"role": "user", "content": todo_snapshot}
+    assert compressed[-1] == {"role": "user", "content": latest_request}
+    assert agent._persist_user_message_idx == len(compressed) - 1
+
+
+def test_compress_context_preserves_current_user_before_tool_tail(agent):
+    """Large tool outputs after the live ask must not push that ask into the summary."""
+    latest_request = "do the wiki pending stuff"
+    todo_snapshot = "[Your active task list was preserved across context compression]"
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = "summary text"
+
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        agent.context_compressor = ContextCompressor(
+            model="test/model",
+            quiet_mode=True,
+            protect_first_n=0,
+            protect_last_n=2,
+        )
+
+    messages = [
+        {"role": "user", "content": "what's up today?"},
+        {"role": "assistant", "content": "not much"},
+        {"role": "user", "content": latest_request},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_wiki_1",
+                    "type": "function",
+                    "function": {"name": "search_files", "arguments": "{}"},
+                },
+                {
+                    "id": "call_wiki_2",
+                    "type": "function",
+                    "function": {"name": "search_files", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_wiki_1", "content": "x" * 80000},
+        {"role": "tool", "tool_call_id": "call_wiki_2", "content": "y" * 80000},
+    ]
+
+    agent._persist_user_message_idx = 2
+    agent._todo_store = MagicMock()
+    agent._todo_store.format_for_injection.return_value = todo_snapshot
+    agent._build_system_prompt = MagicMock(return_value="system prompt")
+    agent._cached_system_prompt = "old system prompt"
+    agent._session_db = None
+
+    with (
+        patch("agent.context_compressor.call_llm", return_value=mock_response),
+        patch.object(agent, "flush_memories"),
+    ):
+        compressed, new_system_prompt = agent._compress_context(messages, "system prompt")
+
+    assert new_system_prompt == "system prompt"
+    todo_idx = next(i for i, msg in enumerate(compressed) if msg.get("content") == todo_snapshot)
+    current_user_idx = next(
+        i
+        for i, msg in enumerate(compressed)
+        if msg.get("role") == "user" and msg.get("content") == latest_request
+    )
+    tool_call_idx = next(
+        i
+        for i, msg in enumerate(compressed)
+        if msg.get("role") == "assistant" and msg.get("tool_calls")
+    )
+
+    assert todo_idx < current_user_idx < tool_call_idx
+    assert agent._persist_user_message_idx == current_user_idx
+    assert [
+        msg.get("content")
+        for msg in compressed
+        if msg.get("role") == "user"
+    ][-1] == latest_request
 
 
 def test_aiagent_reuses_existing_errors_log_handler():
