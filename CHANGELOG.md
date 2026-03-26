@@ -33,6 +33,7 @@ All notable user-visible changes to this project are documented here. Agents and
 
 ### Terminal and docs
 
+- **Fork install targeting**: The documented install commands and bundled install scripts now target `helix4u/hermes-agent` instead of upstream `NousResearch/hermes-agent`, so fresh installs and checkout bootstraps land on this fork by default.
 - **Windows bootstrap scripts**: Added repo-local Windows bootstrap scripts at `scripts/bootstrap-windows.ps1` and `scripts/bootstrap-windows.bat` so an existing checkout can be set up for native Windows development without WSL, plus README coverage for both the fresh installer and local bootstrap path.
 - **Windows terminal order**: Windows local shell auto-selection now prefers `cmd.exe`, then PowerShell, then WSL, which is a better default for mainstream Windows installs.
 - **Per-command shell override**: The terminal tool now supports a Windows-only `shell_mode` override so advanced flows can deliberately mix `cmd`, PowerShell, and WSL work in one broader task.
