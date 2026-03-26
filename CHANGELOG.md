@@ -4,6 +4,12 @@ All notable user-visible changes to this project are documented here. Agents and
 
 ## Unreleased
 
+### Authentication
+
+- **Codex re-auth ownership**: Expired OpenAI Codex sessions no longer silently import fresh credentials from `~/.codex` during runtime refresh or status/model checks. Hermes now treats Hermes-owned re-auth as the authoritative recovery path and keeps shared Codex auth import limited to explicit import flows.
+- **Codex device auth retry**: Hermes now retries the OpenAI Codex device-code login once with a fresh code when the one-time authorization-code exchange is rejected as consumed/invalid, which avoids the common "already used" dead-end that previously forced a logout/login cycle.
+- **Codex status visibility**: `hermes status` now shows whether the current Codex session is Hermes-owned, a migrated shared session, or an explicitly imported shared session.
+
 ### Browser sidecar (Chrome extension)
 
 - **Control room**: Upgraded the built-in full-page `control-room.html` into an operator console with live session selection, follow-up chat, image attachments, voice-note transcription, reply TTS playback, audit-event browsing, delegation branch summaries, tool benchmarks, system prompt view, tool inventory, path metadata, and untruncated inspect JSON in one page.

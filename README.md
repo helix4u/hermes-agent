@@ -125,6 +125,8 @@ hermes update       # Update to the latest version
 hermes doctor       # Diagnose any issues
 ```
 
+OpenAI Codex auth is stored in `~/.hermes/auth.json`. If a cron job or gateway turn reports that Codex needs re-authentication, rerun `hermes model` locally to refresh Hermes's own Codex session.
+
 📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
 
 ## CLI vs Messaging Quick Reference
