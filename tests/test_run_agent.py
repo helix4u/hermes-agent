@@ -735,6 +735,54 @@ class TestBuildEnvironmentHint:
         assert "HERMES_WINDOWS_SHELL=cmd" in hint
 
 
+class TestBuildSkillRoutingHint:
+    def test_returns_empty_without_skill_view_tool(self, agent):
+        assert agent._build_skill_routing_hint("please use kokoro voices") == ""
+
+    def test_returns_empty_without_kokoro_markers(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "skill_view"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent.client = MagicMock()
+        assert agent._build_skill_routing_hint("say hello with tts") == ""
+
+    def test_kokoro_request_prefers_existing_skill_and_provider(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "skill_view", "text_to_speech"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent.client = MagicMock()
+
+        hint = agent._build_skill_routing_hint(
+            "Use Kokoro FastAPI on localhost:8880 and list voices before synthesis."
+        )
+
+        assert "skill `kokoro-tts`" in hint
+        assert "skill_view('kokoro-tts')" in hint
+        assert "`text_to_speech` provider `kokoro`" in hint
+
+
 class TestShellUtilsWindowsOverride:
     def test_env_override_takes_precedence_over_config(self):
         from tools.environments import shell_utils

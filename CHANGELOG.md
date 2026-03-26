@@ -44,3 +44,4 @@ All notable user-visible changes to this project are documented here. Agents and
 
 - Added bundled skill **`wiki-upkeep`** (`skills/productivity/wiki-upkeep/SKILL.md`) for maintaining local wikis (structure, links, safe edits).
 - Added bundled skill **`terminal-shell-orchestration`** (`skills/productivity/terminal-shell-orchestration/SKILL.md`) for shell-aware Windows/POSIX execution planning and tool discovery.
+- **Kokoro skill routing**: Added a narrow per-turn routing hint so requests that clearly mention Kokoro voices, the local Kokoro FastAPI service, or Kokoro endpoints are pushed toward the existing `kokoro-tts` skill and built-in `text_to_speech` Kokoro provider before broad web research.

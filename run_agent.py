@@ -2777,6 +2777,40 @@ class AIAgent:
             "action first before memory or worldview file reads."
         )
 
+    def _build_skill_routing_hint(self, user_message: str) -> str:
+        """
+        Build a narrow per-turn skill-routing hint for requests that match an
+        installed skill very clearly.
+        """
+        if "skill_view" not in (self.valid_tool_names or set()):
+            return ""
+
+        text = str(user_message or "").strip().lower()
+        if not text:
+            return ""
+
+        kokoro_markers = (
+            "kokoro",
+            "kokoro-fastapi",
+            "localhost:8880",
+            "/v1/audio/voices",
+            "/v1/audio/speech",
+            "af_bella",
+            "af_sky",
+            "af_nicole",
+            "af_v0",
+        )
+        if any(marker in text for marker in kokoro_markers):
+            return (
+                "Skill routing hint for this turn: this request strongly matches the installed "
+                "skill `kokoro-tts`. Load it with skill_view('kokoro-tts') before broad "
+                "research. Prefer the local Kokoro FastAPI workflow and the built-in "
+                "`text_to_speech` provider `kokoro` over generic web_search/web_extract unless "
+                "the local service or voice discovery step fails."
+            )
+
+        return ""
+
     def _repair_tool_call(self, tool_name: str) -> str | None:
         """Attempt to repair a mismatched tool name before aborting.
 
@@ -6130,6 +6164,9 @@ class AIAgent:
             env_hint = self._build_environment_hint()
             if env_hint:
                 extra_ephemeral.append(env_hint)
+            skill_routing_hint = self._build_skill_routing_hint(user_message)
+            if skill_routing_hint:
+                extra_ephemeral.append(skill_routing_hint)
             if extra_ephemeral:
                 effective_system = (effective_system + "\n\n" + "\n\n".join(extra_ephemeral)).strip()
             if effective_system:

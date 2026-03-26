@@ -14,6 +14,7 @@ Working list for durable goals, in-flight implementation, and recently completed
 
 ## Recently done
 
+- Added a Kokoro-specific routing hint so Kokoro voice / FastAPI requests are more likely to load the existing `kokoro-tts` skill and built-in provider instead of wasting time on broad web research.
 - Added the full-page control room with audit events, branch summaries, benchmarks, attachments, voice input, and reply TTS.
 - Added repo-local Windows bootstrap scripts (`scripts/bootstrap-windows.ps1` and `scripts/bootstrap-windows.bat`) and documented both the fresh installer path and local-checkout bootstrap path for native Windows use without WSL.
 - Removed the control-room recall panel after repeated zero-value searches and confusing UX.
