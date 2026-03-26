@@ -136,6 +136,33 @@ body {
   margin: 8px 0 0;
 }
 
+.two-column-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.radio-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.radio-option {
+  align-items: center;
+  background: var(--theme-chip-bg);
+  border: 1px solid var(--theme-chip-border);
+  border-radius: 999px;
+  color: var(--theme-text-soft);
+  display: inline-flex;
+  gap: 8px;
+  padding: 8px 12px;
+}
+
+.checkbox-row.align-end {
+  margin-top: 28px;
+}
+
 input[type="url"],
 input[type="password"],
 input[type="text"],
@@ -318,6 +345,23 @@ button {
 .ghost-button {
   background: var(--theme-ghost-button-bg);
   color: var(--theme-text-accent);
+}
+
+.field-actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.local-services-feedback {
+  min-height: 1.25em;
+  margin-top: 10px;
+  color: var(--theme-text-muted);
+}
+
+.local-services-feedback.has-error {
+  color: var(--theme-danger-text);
 }
 
 @media (max-width: 640px) {

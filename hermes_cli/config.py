@@ -153,12 +153,33 @@ DEFAULT_CONFIG = {
         # Enabled by default for non-local backends (SSH); local is always opt-in
         # via TERMINAL_LOCAL_PERSISTENT env var.
         "persistent_shell": True,
+        # Preferred Windows shell when terminal.backend=local.
+        # "auto" now resolves to cmd.exe first, then PowerShell, then WSL.
+        "windows_shell": "auto",
     },
     
     "browser": {
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
+    },
+
+    "control_room": {
+        "date_awareness_mode": "smart",  # off | smart
+    },
+
+    "web": {
+        "backend": "",
+        "archive_fallback": {
+            "enabled": False,
+            "service": "archive.today",
+            "fallback_to_original": True,
+            "paywalled_domains": [
+                "nytimes.com",
+                "wsj.com",
+                "thedailybeast.com",
+            ],
+        },
     },
 
     # Filesystem checkpoints — automatic snapshots before destructive file ops.
@@ -400,7 +421,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 11,
+    "_config_version": 12,
 }
 
 # =============================================================================

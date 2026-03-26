@@ -1,4 +1,6 @@
 const DEFAULT_BRIDGE_URL = "http://127.0.0.1:8765/inject";
+/** Default Hermes gateway wiki host (see `/wiki-host`); override in extension options. */
+const DEFAULT_WIKI_BASE_URL = "http://127.0.0.1:8000/knowledge_wiki.html";
 const BRIDGE_TIMEOUT_MS = 12000;
 /** Session history/state loads can be larger than normal bridge requests. */
 const SESSION_BRIDGE_TIMEOUT_MS = 30000;
@@ -83,6 +85,14 @@ function createDefaultQuickPrompts() {
   return DEFAULT_QUICK_PROMPTS.map((prompt) => ({ ...prompt }));
 }
 
+function normalizeActivityLogLevel(raw) {
+  const value = String(raw || "").trim().toLowerCase();
+  if (value === "minimal" || value === "verbose") {
+    return value;
+  }
+  return "normal";
+}
+
 function normalizeQuickPrompts(value) {
   if (!Array.isArray(value)) {
     return createDefaultQuickPrompts();
@@ -160,7 +170,10 @@ function normalizeStoredSettings(settings) {
     challengeModePrompt: String(next.challengeModePrompt || "").trim() || DEFAULT_CHALLENGE_MODE_PROMPT,
     themeName,
     customThemeAccent,
-    customThemes: normalizeCustomThemes(next.customThemes)
+    customThemes: normalizeCustomThemes(next.customThemes),
+    wikiBaseUrl: String(next.wikiBaseUrl || "").trim() || DEFAULT_WIKI_BASE_URL,
+    sidecarActivityLogLevel: normalizeActivityLogLevel(next.sidecarActivityLogLevel),
+    activityLogPanelOpen: next.activityLogPanelOpen === true
   };
 }
 
@@ -217,6 +230,15 @@ function buildSettingsPatch(settings) {
   }
   if (Object.prototype.hasOwnProperty.call(settings, "customThemes")) {
     patch.customThemes = normalizeCustomThemes(settings.customThemes);
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "wikiBaseUrl")) {
+    patch.wikiBaseUrl = String(settings.wikiBaseUrl || "").trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "sidecarActivityLogLevel")) {
+    patch.sidecarActivityLogLevel = normalizeActivityLogLevel(settings.sidecarActivityLogLevel);
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "activityLogPanelOpen")) {
+    patch.activityLogPanelOpen = settings.activityLogPanelOpen === true;
   }
 
   return patch;
@@ -747,14 +769,17 @@ async function getSettings() {
     challengeModePrompt: DEFAULT_CHALLENGE_MODE_PROMPT,
     themeName: DEFAULT_THEME_NAME,
     customThemeAccent: DEFAULT_CUSTOM_THEME_ACCENT,
-    customThemes: DEFAULT_CUSTOM_THEMES.slice()
+    customThemes: DEFAULT_CUSTOM_THEMES.slice(),
+    wikiBaseUrl: DEFAULT_WIKI_BASE_URL,
+    sidecarActivityLogLevel: "normal",
+    activityLogPanelOpen: false
   });
   return normalizeStoredSettings(stored);
 }
 
 async function setSettings(settings) {
   const patch = buildSettingsPatch(settings);
-  const obsoleteKeys = ["showCommandTools", "commandCatalog"];
+  const obsoleteKeys = ["showCommandTools", "commandCatalog", "logAnalysisServerUrl"];
   if (!Object.keys(patch).length) {
     await chrome.storage.sync.remove(obsoleteKeys);
     return;
@@ -1840,6 +1865,97 @@ async function loadChatSession(sessionKey = "") {
   return primaryResult;
 }
 
+function buildInspectionFallbackFromState(state, browserLabel, fallbackReason = "") {
+  const messages = Array.isArray(state?.messages) ? state.messages : [];
+  const transcript = messages.map((message, index) => ({
+    index: index + 1,
+    role: String(message?.role || "").trim(),
+    timestamp: String(message?.timestamp || "").trim(),
+    content_text: String(message?.content || message?.display_content || "").trim(),
+    tool_name: "",
+    tool_call_count: 0,
+    raw: message
+  }));
+  const progress = state?.progress && typeof state.progress === "object" ? state.progress : {};
+  const activityLog = Array.isArray(progress.activity_log) ? progress.activity_log : [];
+  const normalizedReason = String(fallbackReason || "").trim();
+  return {
+    ...state,
+    inspect_generated_at: new Date().toISOString(),
+    transcript,
+    session_log: null,
+    session_log_available: false,
+    session_log_exists: false,
+    session_log_error: normalizedReason,
+    configured_tools: [],
+    source_details: {
+      platform: String(state?.source || "").trim(),
+      session_key: String(state?.session_key || "").trim(),
+      browser_label: String(state?.browser_label || browserLabel || "").trim(),
+      inspection_mode: "fallback"
+    },
+    session_record: {},
+    paths: {
+      hermes_home: "",
+      config_path: "",
+      logs_dir: "",
+      sessions_dir: "",
+      session_log_path: ""
+    },
+    stats: {
+      visible_message_count: messages.length,
+      transcript_message_count: transcript.length,
+      raw_message_count: 0,
+      activity_event_count: activityLog.length,
+      system_prompt_chars: 0,
+      configured_tool_count: 0,
+      tool_call_count: 0,
+      tool_result_count: 0,
+      reasoning_message_count: 0,
+      roles: transcript.reduce((acc, message) => {
+        const role = String(message.role || "").trim();
+        if (role) {
+          acc[role] = (acc[role] || 0) + 1;
+        }
+        return acc;
+      }, {}),
+      tool_names: [],
+      elapsed_seconds: Number(progress.elapsed_seconds || 0),
+      last_updated: ""
+    }
+  };
+}
+
+async function inspectChatSession(sessionKey = "") {
+  const token = await getBridgeToken();
+  const clientSessionId = await getClientSessionId();
+  const browserLabel = await getActiveBrowserLabel();
+  const normalizedSessionKey = String(sessionKey || "").trim();
+  try {
+    return await callBridge("/session", {
+      token,
+      timeoutMs: SESSION_BRIDGE_TIMEOUT_MS,
+      body: {
+        action: "inspect",
+        browserLabel,
+        clientSessionId,
+        sessionKey: normalizedSessionKey || undefined
+      }
+    });
+  } catch (error) {
+    const message = String(error?.message || error || "");
+    if (!message.includes("Unsupported browser bridge action: inspect")) {
+      throw error;
+    }
+    const state = await loadChatSession(normalizedSessionKey);
+    return buildInspectionFallbackFromState(
+      state,
+      browserLabel,
+      "Inspect mode is unavailable on this bridge. Showing transcript-only fallback."
+    );
+  }
+}
+
 async function listChatSessions(limit = 25, sessionKey = "") {
   const token = await getBridgeToken();
   const clientSessionId = await getClientSessionId();
@@ -1880,6 +1996,63 @@ async function listChatSessions(limit = 25, sessionKey = "") {
         : []
     };
   }
+}
+
+async function getRuntimeConfig(selectedProvider = "") {
+  const token = await getBridgeToken();
+  return callBridge("/session", {
+    token,
+    timeoutMs: SESSION_BRIDGE_TIMEOUT_MS,
+    body: {
+      action: "runtime_config_get",
+      selected_provider: String(selectedProvider || "").trim() || undefined
+    }
+  });
+}
+
+async function saveRuntimeConfig(configPatch = {}, envUpdates = {}, selectedProvider = "") {
+  const token = await getBridgeToken();
+  return callBridge("/session", {
+    token,
+    timeoutMs: SESSION_BRIDGE_TIMEOUT_MS,
+    body: {
+      action: "runtime_config_save",
+      config_patch: configPatch && typeof configPatch === "object" ? configPatch : {},
+      env_updates: envUpdates && typeof envUpdates === "object" ? envUpdates : {},
+      selected_provider: String(selectedProvider || "").trim() || undefined
+    }
+  });
+}
+
+async function getRuntimeProviderModels(selectedProvider = "") {
+  const token = await getBridgeToken();
+  return callBridge("/session", {
+    token,
+    timeoutMs: SESSION_BRIDGE_TIMEOUT_MS,
+    body: {
+      action: "runtime_provider_models",
+      selected_provider: String(selectedProvider || "").trim() || undefined
+    }
+  });
+}
+
+async function recallSearch(query, limit = 5, sessionKey = "", dateAwareness = "smart") {
+  const token = await getBridgeToken();
+  const clientSessionId = await getClientSessionId();
+  const browserLabel = await getActiveBrowserLabel();
+  return callBridge("/session", {
+    token,
+    timeoutMs: SESSION_BRIDGE_TIMEOUT_MS,
+    body: {
+      action: "recall_search",
+      browserLabel,
+      clientSessionId,
+      sessionKey: String(sessionKey || "").trim() || undefined,
+      query: String(query || "").trim(),
+      limit: Math.max(1, Number(limit || 5) || 5),
+      date_awareness: String(dateAwareness || "smart").trim().toLowerCase() || "smart"
+    }
+  });
 }
 
 async function resetChatSession(sessionKey = "", createNew = false) {
@@ -2044,10 +2217,23 @@ async function transcribeChatAudio(audioBase64, mimeType = "audio/webm") {
   });
 }
 
-async function openVoiceRecorderWindow() {
-  const url = chrome.runtime.getURL("voice-recorder.html");
+async function openVoiceRecorderWindow(options = {}) {
+  const recorderUrl = new URL(chrome.runtime.getURL("voice-recorder.html"));
+  if (options && typeof options === "object") {
+    if (options.autoStart === true) {
+      recorderUrl.searchParams.set("autostart", "1");
+    }
+    const deviceId = String(options.deviceId || "").trim();
+    if (deviceId) {
+      recorderUrl.searchParams.set("deviceId", deviceId);
+    }
+    const captureMode = String(options.captureMode || "").trim().toLowerCase();
+    if (captureMode === "speech" || captureMode === "raw") {
+      recorderUrl.searchParams.set("captureMode", captureMode);
+    }
+  }
   return chrome.windows.create({
-    url,
+    url: recorderUrl.toString(),
     type: "popup",
     width: 420,
     height: 560,
@@ -2214,8 +2400,47 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return;
     }
 
+    if (message.type === "hermes:inspect-chat-session") {
+      const result = await inspectChatSession(message.sessionKey || "");
+      sendResponse({ ok: true, result });
+      return;
+    }
+
     if (message.type === "hermes:list-chat-sessions") {
       const result = await listChatSessions(message.limit || 25, message.sessionKey || "");
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:get-runtime-config") {
+      const result = await getRuntimeConfig(message.selectedProvider || "");
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:save-runtime-config") {
+      const result = await saveRuntimeConfig(
+        message.configPatch || {},
+        message.envUpdates || {},
+        message.selectedProvider || ""
+      );
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:get-runtime-provider-models") {
+      const result = await getRuntimeProviderModels(message.selectedProvider || "");
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:recall-search") {
+      const result = await recallSearch(
+        message.query || "",
+        message.limit || 5,
+        message.sessionKey || "",
+        message.dateAwareness || "smart"
+      );
       sendResponse({ ok: true, result });
       return;
     }
@@ -2271,7 +2496,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     if (message.type === "hermes:open-voice-recorder") {
-      const result = await openVoiceRecorderWindow();
+      const result = await openVoiceRecorderWindow({
+        autoStart: message.autoStart === true,
+        deviceId: message.deviceId || "",
+        captureMode: message.captureMode || "raw"
+      });
       sendResponse({ ok: true, result: { windowId: result?.id || null } });
       return;
     }

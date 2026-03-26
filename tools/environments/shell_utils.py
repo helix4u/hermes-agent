@@ -75,6 +75,11 @@ def _normalize_windows_shell_override(raw: str) -> str:
     return "auto"
 
 
+def normalize_windows_shell_override(raw: str) -> str:
+    """Public wrapper used by tool schemas and UI plumbing."""
+    return _normalize_windows_shell_override(raw)
+
+
 @lru_cache(maxsize=1)
 def _config_windows_shell_override() -> str:
     """Read optional Windows shell override from ~/.hermes/config.yaml."""
@@ -118,29 +123,46 @@ def resolve_windows_shell_override() -> str:
     return _resolve_windows_shell_override_with_source()[0]
 
 
-def get_local_shell_mode() -> str:
+def _resolve_windows_shell_mode(override: str) -> str:
+    normalized = _normalize_windows_shell_override(override)
+    if normalized == "wsl":
+        if _wsl_available():
+            return "wsl"
+        if _powershell_executable():
+            return "powershell"
+        return "cmd"
+    if normalized in {"powershell", "pwsh"}:
+        if _powershell_executable():
+            return "powershell"
+        return "cmd"
+    if normalized in {"cmd", "cmd.exe"}:
+        return "cmd"
+    if shutil.which("cmd.exe") or os.environ.get("COMSPEC"):
+        return "cmd"
+    if _powershell_executable():
+        return "powershell"
+    if _wsl_available():
+        return "wsl"
+    return "cmd"
+
+
+def get_local_shell_mode(shell_override: str | None = None) -> str:
     """Return one of: posix, wsl, powershell, cmd."""
     global _last_logged_mode
 
     if not is_windows():
         mode = "posix"
+        override = "auto"
+        override_source = "default"
     else:
-        override, override_source = _resolve_windows_shell_override_with_source()
-        if override == "wsl":
-            mode = "wsl" if _wsl_available() else "powershell" if _powershell_executable() else "cmd"
-        elif override in {"powershell", "pwsh"}:
-            mode = "powershell" if _powershell_executable() else "cmd"
-        elif override in {"cmd", "cmd.exe"}:
-            mode = "cmd"
+        if shell_override is not None and str(shell_override).strip():
+            override = _normalize_windows_shell_override(str(shell_override))
+            override_source = "call"
         else:
-            if _wsl_available():
-                mode = "wsl"
-            elif _powershell_executable():
-                mode = "powershell"
-            else:
-                mode = "cmd"
+            override, override_source = _resolve_windows_shell_override_with_source()
+        mode = _resolve_windows_shell_mode(override)
 
-    if _last_logged_mode != mode:
+    if shell_override is None and _last_logged_mode != mode:
         if is_windows():
             override_label = override
             logger.info(
@@ -236,6 +258,7 @@ def _windows_safe_cwd(work_dir: str | None) -> str:
 def build_local_subprocess_invocation(
     command: str,
     work_dir: str | None = None,
+    shell_override: str | None = None,
 ) -> Tuple[CommandType, Dict[str, Any], str]:
     """
     Build a subprocess invocation tuple for local backend execution.
@@ -245,7 +268,7 @@ def build_local_subprocess_invocation(
     where popen_overrides contains platform-specific kwargs like `shell`,
     `cwd`, and process-group flags.
     """
-    mode = get_local_shell_mode()
+    mode = get_local_shell_mode(shell_override=shell_override)
 
     if mode == "posix":
         return (

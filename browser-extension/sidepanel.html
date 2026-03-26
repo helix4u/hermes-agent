@@ -15,7 +15,10 @@
             <p class="eyebrow">Hermes Agent</p>
             <h1>Hermes Sidecar</h1>
           </div>
-          <button id="open-options-button" class="ghost-button" type="button" title="Open sidecar settings">Options</button>
+          <div class="hero-actions">
+            <button id="open-control-room-button" class="ghost-button" type="button" title="Open the full observability and control room">Control room</button>
+            <button id="open-options-button" class="ghost-button" type="button" title="Open sidecar settings">Options</button>
+          </div>
         </div>
         <p class="subhead">Chat beside the page and pull it into the turn only when it helps.</p>
       </header>
@@ -115,6 +118,21 @@
           </details>
         </div>
       </section>
+
+      <details id="activity-log-panel" class="card utility-panel">
+        <summary class="details-summary">
+          <div>
+            <h2>Activity log</h2>
+            <p class="section-copy"><span id="activity-log-badge" class="summary-chip">0 lines</span></p>
+          </div>
+        </summary>
+        <div class="details-body">
+          <p class="section-copy muted">
+            Gateway tool/thinking stream (same data as Discord-style progress). Verbosity: Options → Activity log level.
+          </p>
+          <pre id="activity-log-pre" class="activity-log-pre" aria-live="polite"></pre>
+        </div>
+      </details>
 
       <details id="page-panel" class="card utility-panel">
         <summary class="details-summary">

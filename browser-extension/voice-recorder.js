@@ -9,6 +9,10 @@ let recorder = null;
 let recorderStream = null;
 let recorderChunks = [];
 let transcriptionPending = false;
+const urlParams = new URLSearchParams(window.location.search);
+const autoStartRequested = urlParams.get("autostart") === "1";
+const defaultDeviceId = String(urlParams.get("deviceId") || "").trim();
+const defaultCaptureMode = String(urlParams.get("captureMode") || "").trim().toLowerCase() === "speech" ? "speech" : "raw";
 
 function publish(type, extra = {}) {
   if (!voiceChannel) {
@@ -95,7 +99,7 @@ async function transcribeBlob(blob) {
   }
 }
 
-async function startRecording() {
+async function startRecording(selectedDeviceId = defaultDeviceId, captureMode = defaultCaptureMode) {
   if (transcriptionPending) {
     return;
   }
@@ -103,7 +107,26 @@ async function startRecording() {
     throw new Error("Voice recording is not supported in this browser.");
   }
 
-  recorderStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const normalizedDeviceId = String(selectedDeviceId || "").trim();
+  const normalizedMode = String(captureMode || "").trim().toLowerCase() === "speech" ? "speech" : "raw";
+  const audioConstraints = normalizedMode === "speech"
+    ? {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: { ideal: 1 }
+      }
+    : {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: { ideal: 1 }
+      };
+  if (normalizedDeviceId) {
+    audioConstraints.deviceId = { exact: normalizedDeviceId };
+  }
+
+  recorderStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
   const preferredMimeType = MediaRecorder.isTypeSupported?.("audio/webm;codecs=opus")
     ? "audio/webm;codecs=opus"
     : MediaRecorder.isTypeSupported?.("audio/webm")
@@ -145,6 +168,7 @@ async function startRecording() {
   }, { once: true });
 
   recorder.start();
+  publish("recording");
   updateUi();
   setStatus("Recording... click Stop recording when you're done.");
 }
@@ -162,7 +186,7 @@ async function toggleRecording() {
     stopRecording();
     return;
   }
-  await startRecording();
+  await startRecording(defaultDeviceId, defaultCaptureMode);
 }
 
 recordButton.addEventListener("click", () => {
@@ -181,6 +205,23 @@ cancelButton.addEventListener("click", () => {
   window.close();
 });
 
+if (voiceChannel) {
+  voiceChannel.addEventListener("message", (event) => {
+    const payload = event?.data && typeof event.data === "object" ? event.data : {};
+    const type = String(payload.type || "");
+    if (type === "hermes:start-recording") {
+      startRecording(payload.deviceId || defaultDeviceId, payload.captureMode || defaultCaptureMode).catch((error) => {
+        publish("voice-recorder:error", { error: String(error?.message || error) });
+        setStatus(String(error?.message || error));
+      });
+      return;
+    }
+    if (type === "hermes:stop-recording") {
+      stopRecording();
+    }
+  });
+}
+
 window.addEventListener("beforeunload", () => {
   stopStream();
   publish("voice-recorder:closed");
@@ -188,3 +229,16 @@ window.addEventListener("beforeunload", () => {
 
 publish("voice-recorder:ready");
 updateUi();
+
+if (autoStartRequested) {
+  setStatus("Opening microphone prompt...");
+  startRecording(defaultDeviceId, defaultCaptureMode).catch((error) => {
+    publish("voice-recorder:error", { error: String(error?.message || error) });
+    setStatus(String(error?.message || error));
+    stopStream();
+    recorder = null;
+    recorderChunks = [];
+    transcriptionPending = false;
+    updateUi();
+  });
+}

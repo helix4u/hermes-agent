@@ -58,6 +58,7 @@ agents/memory.md
 agents/worldview.md
 audio_cache/
 cache/
+output/
 cron/output/
 cron/jobs.json
 cron/.tick.lock
@@ -67,3 +68,7 @@ upstream/
 
 # Release script temp files
 .release_notes.md
+
+# Local Honcho self-hosted reference
+docker/honcho/.env
+docker/honcho/honcho-src/

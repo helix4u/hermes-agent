@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
 DISCORD_AUDIO_SAFE_BYTES = 7_500_000
+DISCORD_LISTEN_FULL_CUSTOM_ID = "hermes:listen:full"
+DISCORD_LISTEN_KNIGHT_CUSTOM_ID = "hermes:listen:knight"
+DISCORD_LISTEN_ANSWER_CUSTOM_ID = "hermes:listen:answer"
 
 try:
     import discord
@@ -64,6 +67,10 @@ from gateway.platforms.base import (
 )
 
 
+_KNIGHT_BLOCK_RE = re.compile(r"<ʞᴎiʜƚ>([\s\S]*?)</ʞᴎiʜƚ>", re.IGNORECASE)
+_ACTION_RESPONSE_RE = re.compile(r"(?im)^\s*Action\s*/\s*Response\s*:\s*")
+
+
 def _clean_discord_id(entry: str) -> str:
     """Strip common prefixes from a Discord user ID or username entry.
 
@@ -79,6 +86,55 @@ def _clean_discord_id(entry: str) -> str:
     if entry.lower().startswith("user:"):
         entry = entry[5:]
     return entry.strip()
+
+
+def build_discord_listen_components() -> list[dict[str, Any]]:
+    """Return REST-compatible persistent listen buttons for detached Discord sends."""
+    return [
+        {
+            "type": 1,
+            "components": [
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Listen",
+                    "emoji": {"name": "🔊"},
+                    "custom_id": DISCORD_LISTEN_FULL_CUSTOM_ID,
+                },
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "ʞᴎiʜƚ",
+                    "emoji": {"name": "🧠"},
+                    "custom_id": DISCORD_LISTEN_KNIGHT_CUSTOM_ID,
+                },
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Answer",
+                    "emoji": {"name": "🗣️"},
+                    "custom_id": DISCORD_LISTEN_ANSWER_CUSTOM_ID,
+                },
+            ],
+        }
+    ]
+
+
+def _extract_listen_sections(text: str) -> dict[str, str]:
+    full = str(text or "").strip()
+    if not full:
+        return {"full": "", "knight": "", "answer": ""}
+
+    knight_parts = [part.strip() for part in _KNIGHT_BLOCK_RE.findall(full) if str(part).strip()]
+    knight = "\n\n".join(knight_parts).strip()
+
+    action_match = _ACTION_RESPONSE_RE.search(full)
+    if action_match:
+        answer = full[action_match.end():].strip()
+    else:
+        answer = _KNIGHT_BLOCK_RE.sub("", full).strip()
+
+    return {"full": full, "knight": knight, "answer": answer}
 
 
 def check_discord_requirements() -> bool:
@@ -1741,14 +1797,17 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Discord's TYPING_START gateway event is unreliable in DMs for bots.
         Instead, start a background loop that hits the typing endpoint every
-        8 seconds (typing indicator lasts ~10s).  The loop is cancelled when
-        stop_typing() is called (after the response is sent).
+        ~10s (indicator lasts ~10s; slightly longer spacing reduces REST 429s).
+        The loop is cancelled when stop_typing() is called (after the response
+        is sent). On HTTP 429, backs off using retry_after instead of stopping.
         """
         if not self._client:
             return
         # Don't start a duplicate loop
         if chat_id in self._typing_tasks:
             return
+
+        _typing_interval = 10.0
 
         async def _typing_loop() -> None:
             try:
@@ -1762,9 +1821,32 @@ class DiscordAdapter(BasePlatformAdapter):
                     except asyncio.CancelledError:
                         return
                     except Exception as e:
-                        logger.debug("Discord typing indicator failed for %s: %s", chat_id, e)
+                        status = getattr(e, "status", None)
+                        if status == 429:
+                            retry_after = getattr(e, "retry_after", None)
+                            if retry_after is None:
+                                response_obj = getattr(e, "response", None)
+                                if response_obj is not None:
+                                    try:
+                                        header_val = response_obj.headers.get("Retry-After")
+                                        retry_after = (
+                                            float(header_val) if header_val else None
+                                        )
+                                    except (TypeError, ValueError):
+                                        retry_after = None
+                            delay = max(float(retry_after or 3), 1.0)
+                            logger.debug(
+                                "Discord typing rate-limited for %s; waiting %.1fs",
+                                chat_id,
+                                delay,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        logger.debug(
+                            "Discord typing indicator failed for %s: %s", chat_id, e
+                        )
                         return
-                    await asyncio.sleep(8)
+                    await asyncio.sleep(_typing_interval)
             except asyncio.CancelledError:
                 pass
 
@@ -1983,7 +2065,7 @@ class DiscordAdapter(BasePlatformAdapter):
             await self.handle_message(event)
 
         @tree.command(name="terminal", description="Show or change the local terminal shell (Windows)")
-        @discord.app_commands.describe(mode="powershell, wsl, auto, or cmd. Leave empty to show current.")
+        @discord.app_commands.describe(mode="cmd, powershell, wsl, or auto. Leave empty to show current.")
         async def slash_terminal(interaction: discord.Interaction, mode: str = ""):
             await self._run_simple_slash(
                 interaction,
@@ -2743,12 +2825,26 @@ if DISCORD_AVAILABLE:
         async def listen(
             self, interaction: discord.Interaction, button: discord.ui.Button
         ):
-            await _handle_discord_listen(self.adapter, interaction)
+            await _handle_discord_listen(self.adapter, interaction, section="full")
+
+        @discord.ui.button(label="ʞᴎiʜƚ", style=_LISTEN_BUTTON_STYLE, emoji="🧠")
+        async def listen_knight(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await _handle_discord_listen(self.adapter, interaction, section="knight")
+
+        @discord.ui.button(label="Answer", style=_LISTEN_BUTTON_STYLE, emoji="🗣️")
+        async def listen_answer(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await _handle_discord_listen(self.adapter, interaction, section="answer")
 
     class PersistentListenButtonView(discord.ui.View):
         """Persistent listen button for messages sent through REST payloads."""
 
-        CUSTOM_ID = "hermes:listen"
+        FULL_CUSTOM_ID = DISCORD_LISTEN_FULL_CUSTOM_ID
+        KNIGHT_CUSTOM_ID = DISCORD_LISTEN_KNIGHT_CUSTOM_ID
+        ANSWER_CUSTOM_ID = DISCORD_LISTEN_ANSWER_CUSTOM_ID
 
         def __init__(self, adapter: "DiscordAdapter"):
             try:
@@ -2761,16 +2857,38 @@ if DISCORD_AVAILABLE:
             label="Listen",
             style=_LISTEN_BUTTON_STYLE,
             emoji="🔊",
-            custom_id=CUSTOM_ID,
+            custom_id=FULL_CUSTOM_ID,
         )
         async def listen(
             self, interaction: discord.Interaction, button: discord.ui.Button
         ):
-            await _handle_discord_listen(self.adapter, interaction)
+            await _handle_discord_listen(self.adapter, interaction, section="full")
+
+        @discord.ui.button(
+            label="ʞᴎiʜƚ",
+            style=_LISTEN_BUTTON_STYLE,
+            emoji="🧠",
+            custom_id=KNIGHT_CUSTOM_ID,
+        )
+        async def listen_knight(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await _handle_discord_listen(self.adapter, interaction, section="knight")
+
+        @discord.ui.button(
+            label="Answer",
+            style=_LISTEN_BUTTON_STYLE,
+            emoji="🗣️",
+            custom_id=ANSWER_CUSTOM_ID,
+        )
+        async def listen_answer(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await _handle_discord_listen(self.adapter, interaction, section="answer")
 
 
 async def _handle_discord_listen(
-    adapter: "DiscordAdapter", interaction: "discord.Interaction"
+    adapter: "DiscordAdapter", interaction: "discord.Interaction", section: str = "full"
 ) -> None:
     try:
         if not interaction.message:
@@ -2791,10 +2909,20 @@ async def _handle_discord_listen(
             )
             return
 
+        sections = _extract_listen_sections(text)
+        requested_text = sections.get(section, "").strip()
+        if not requested_text:
+            label = "ʞᴎiʜƚ" if section == "knight" else "answer" if section == "answer" else "message"
+            await interaction.response.send_message(
+                f"This message does not have a separate {label} section to read.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.defer(ephemeral=True, thinking=False)
 
         from tools.tts_tool import text_to_speech_tool
-        tts_json = await asyncio.to_thread(text_to_speech_tool, text)
+        tts_json = await asyncio.to_thread(text_to_speech_tool, requested_text)
         data = json.loads(tts_json)
         if not data.get("success"):
             await interaction.followup.send(

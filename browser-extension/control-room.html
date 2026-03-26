@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hermes Control Room</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="icons/nous-32.png">
+    <link rel="stylesheet" href="options.css">
+    <link rel="stylesheet" href="control-room.css">
+  </head>
+  <body>
+    <main class="app control-room-app">
+      <header class="hero hero-shell">
+        <div>
+          <p class="eyebrow">Hermes Agent</p>
+          <h1>Control room</h1>
+          <p class="subhead">
+            Live command deck for session audit, tool timing, branch runs, prompt inspection, and follow-up turns with images or voice.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="open-options-button" class="ghost-button" type="button">Options</button>
+          <button id="refresh-all-button" class="primary-button" type="button">Refresh now</button>
+        </div>
+      </header>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Session deck</h2>
+            <p class="section-copy">
+              Inspect browser, CLI, and gateway sessions. Browser sidecar sessions stay interactive; everything else is read-only but fully inspectable.
+            </p>
+          </div>
+          <div class="section-head-actions">
+            <label class="checkbox-row compact-row live-refresh-row">
+              <input id="live-poll-toggle" type="checkbox" checked>
+              <span>Live refresh</span>
+            </label>
+            <p id="bridge-status-text" class="bridge-status-text">Checking bridge...</p>
+          </div>
+        </div>
+
+        <div class="session-toolbar">
+          <label class="field compact-field">
+            <span class="field-label">Hermes session</span>
+            <select id="session-select">
+              <option value="">Loading sessions...</option>
+            </select>
+          </label>
+          <div class="action-cluster">
+            <button id="refresh-sessions-button" class="ghost-button" type="button">Refresh list</button>
+            <button id="refresh-inspect-button" class="ghost-button" type="button">Refresh inspect</button>
+            <button id="new-chat-button" class="ghost-button" type="button">New browser chat</button>
+            <button id="interrupt-button" class="ghost-button danger-button" type="button">Interrupt</button>
+          </div>
+        </div>
+
+        <div class="meta-grid">
+          <div class="meta-column">
+            <div class="meta-row">
+              <span class="meta-label">Status</span>
+              <p id="status-text" class="status-text">Waiting for the first snapshot.</p>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Selected session</span>
+              <p id="session-meta-text" class="meta-value">Session ID unavailable.</p>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Mode</span>
+              <p id="mode-text" class="meta-value">Detecting session capabilities...</p>
+            </div>
+          </div>
+          <div id="stats-chip-grid" class="stats-chip-grid" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section class="card composer-card">
+        <div class="section-head">
+          <div>
+            <h2>Ask Hermes</h2>
+            <p class="section-copy">
+              Use the selected browser sidecar session to explain failures, compare tooling, inspect timings, or propose the next patch.
+            </p>
+          </div>
+        </div>
+        <textarea
+          id="ask-input"
+          rows="5"
+          spellcheck="true"
+          placeholder="Ask Hermes to explain the latest failure, walk the tool calls, compare tooling, or propose the fix..."
+        ></textarea>
+        <input id="attachment-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" multiple hidden>
+        <div id="attachment-strip" class="attachment-strip" hidden></div>
+        <div id="voice-recorder-sheet" class="voice-recorder-sheet" hidden>
+          <div class="voice-recorder-sheet-card">
+            <div class="voice-recorder-sheet-head">
+              <div>
+                <p class="voice-recorder-sheet-eyebrow">Hermes Voice Input</p>
+                <h3>Voice note</h3>
+              </div>
+              <button id="voice-recorder-close-button" class="ghost-button small-button" type="button">Hide</button>
+            </div>
+            <p id="voice-recorder-sheet-status" class="voice-recorder-sheet-status">
+              Recording and transcription state will appear here.
+            </p>
+          </div>
+        </div>
+        <div class="composer-actions">
+          <div class="action-cluster">
+            <button id="voice-input-button" class="ghost-button voice-input-button" type="button">Voice input</button>
+            <button id="attach-button" class="ghost-button" type="button">Attach image</button>
+            <button id="screengrab-button" class="ghost-button" type="button">Screen grab</button>
+            <button id="send-button" class="primary-button" type="button">Send to Hermes</button>
+          </div>
+        </div>
+        <div>
+          <p class="field-label quick-actions-label">Quick questions</p>
+          <div id="quick-actions" class="quick-actions" aria-label="Quick analysis prompts"></div>
+        </div>
+      </section>
+
+      <div class="dashboard-grid">
+        <section class="card panel-card span-6">
+          <div class="section-head">
+            <div>
+              <h2>Conversation</h2>
+              <p class="section-copy">Browser-friendly message flow from the selected session, including image attachments and reply audio controls.</p>
+            </div>
+          </div>
+          <div id="conversation-timeline" class="timeline">
+            <div class="empty-state">No messages yet.</div>
+          </div>
+        </section>
+
+        <section class="card panel-card span-6">
+          <div class="section-head">
+            <div>
+              <h2>Activity log</h2>
+              <p class="section-copy">Live gateway progress lines, tool traces, and recent events.</p>
+            </div>
+          </div>
+          <pre id="activity-log-pre" class="mono-pre activity-log-pre">(No gateway activity captured for this session yet.)</pre>
+        </section>
+
+        <section class="card panel-card span-6">
+          <div class="section-head">
+            <div>
+              <h2>Audit events</h2>
+              <p class="section-copy">Structured audit events from the session DB: starts, finishes, errors, durations, and tool spans.</p>
+            </div>
+          </div>
+          <div id="audit-events-list" class="data-stack">
+            <div class="empty-state">No structured audit events loaded yet.</div>
+          </div>
+        </section>
+
+        <section class="card panel-card span-6">
+          <div class="section-head">
+            <div>
+              <h2>Branches</h2>
+              <p class="section-copy">Delegation graph and child-branch rollups from `delegate_task` runs.</p>
+            </div>
+          </div>
+          <div id="branch-graph" class="data-stack">
+            <div class="empty-state">No delegate-task branches recorded for this session.</div>
+          </div>
+        </section>
+
+        <section class="card panel-card span-6">
+          <div class="section-head">
+            <div>
+              <h2>Benchmarks</h2>
+              <p class="section-copy">Tool timing, slowest operations, error rates, and runtime totals for the selected session.</p>
+            </div>
+          </div>
+          <div id="benchmark-summary" class="data-stack">
+            <div class="empty-state">Benchmark stats will appear here after inspect refresh.</div>
+          </div>
+        </section>
+
+        <section class="card panel-card span-6">
+          <div class="section-head">
+            <div>
+              <h2>System prompt</h2>
+              <p class="section-copy">Full prompt snapshot from the latest saved session log.</p>
+            </div>
+          </div>
+          <pre id="system-prompt-pre" class="mono-pre">(No saved session log for this session yet.)</pre>
+        </section>
+
+        <section class="card panel-card span-6">
+          <div class="section-head">
+            <div>
+              <h2>Tools</h2>
+              <p class="section-copy">Configured tools and tools actually seen during the run.</p>
+            </div>
+          </div>
+          <div id="tool-summary" class="data-stack">
+            <div class="empty-state">Tool metadata will appear here after the first inspect snapshot.</div>
+          </div>
+          <pre id="tool-schema-pre" class="mono-pre tool-schema-pre">(No tool schema snapshot yet.)</pre>
+        </section>
+
+        <section class="card panel-card span-6">
+          <div class="section-head">
+            <div>
+              <h2>Settings and source</h2>
+              <p class="section-copy">Extension settings, session metadata, and persisted session records.</p>
+            </div>
+          </div>
+          <div id="settings-source-stack" class="data-stack">
+            <div class="empty-state">Waiting for control-room state.</div>
+          </div>
+        </section>
+
+        <section class="card panel-card span-6">
+          <div class="section-head">
+            <div>
+              <h2>Paths</h2>
+              <p class="section-copy">Where Hermes stores the current session log, config, and related files.</p>
+            </div>
+          </div>
+          <div id="paths-stack" class="data-stack">
+            <div class="empty-state">Path metadata will appear after inspect refresh.</div>
+          </div>
+        </section>
+
+        <section class="card panel-card span-12">
+          <div class="section-head">
+            <div>
+              <h2>Raw inspect JSON</h2>
+              <p class="section-copy">Untruncated inspection payload from the Hermes gateway.</p>
+            </div>
+          </div>
+          <pre id="raw-inspect-pre" class="mono-pre raw-json-pre">(No inspect payload loaded yet.)</pre>
+        </section>
+      </div>
+    </main>
+    <script src="theme.js"></script>
+    <script src="control-room.js"></script>
+  </body>
+</html>

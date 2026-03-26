@@ -33,7 +33,10 @@ import logging
 import os
 import datetime
 from typing import Dict, Any, Optional, Union
-import fal_client
+try:
+    import fal_client
+except ImportError:  # pragma: no cover - optional dependency
+    fal_client = None
 from tools.debug_helpers import DebugSession
 
 logger = logging.getLogger(__name__)
@@ -77,6 +80,13 @@ VALID_OUTPUT_FORMATS = ["jpeg", "png"]
 VALID_ACCELERATION_MODES = ["none", "regular", "high"]
 
 _debug = DebugSession("image_tools", env_var="IMAGE_TOOLS_DEBUG")
+
+
+def _require_fal_client():
+    """Return the optional FAL client or raise a clean runtime error."""
+    if fal_client is None:
+        raise ValueError("fal_client library not found. Install it with: pip install fal-client")
+    return fal_client
 
 
 def _validate_parameters(
@@ -167,6 +177,7 @@ def _upscale_image(image_url: str, original_prompt: str) -> Dict[str, Any]:
         Dict[str, Any]: Upscaled image data or None if upscaling fails
     """
     try:
+        fal = _require_fal_client()
         logger.info("Upscaling image with Clarity Upscaler...")
         
         # Prepare arguments for upscaler
@@ -186,7 +197,7 @@ def _upscale_image(image_url: str, original_prompt: str) -> Dict[str, Any]:
         # The async API (submit_async) caches a global httpx.AsyncClient via
         # @cached_property, which breaks when asyncio.run() destroys the loop
         # between calls (gateway thread-pool pattern).
-        handler = fal_client.submit(
+        handler = fal.submit(
             UPSCALER_MODEL,
             arguments=upscaler_arguments
         )
@@ -274,6 +285,7 @@ def image_generate_tool(
     
     try:
         logger.info("Generating %s image(s) with FLUX 2 Pro: %s", num_images, prompt[:80])
+        fal = _require_fal_client()
         
         # Validate prompt
         if not prompt or not isinstance(prompt, str) or len(prompt.strip()) == 0:
@@ -312,7 +324,7 @@ def image_generate_tool(
         logger.info("  Guidance: %s", validated_params['guidance_scale'])
         
         # Submit request to FAL.ai using sync API (avoids cached event loop issues)
-        handler = fal_client.submit(
+        handler = fal.submit(
             DEFAULT_MODEL,
             arguments=arguments
         )
@@ -410,17 +422,7 @@ def check_image_generation_requirements() -> bool:
     Returns:
         bool: True if requirements are met, False otherwise
     """
-    try:
-        # Check API key
-        if not check_fal_api_key():
-            return False
-        
-        # Check if fal_client is available
-        import fal_client
-        return True
-        
-    except ImportError:
-        return False
+    return check_fal_api_key() and fal_client is not None
 
 
 def get_debug_session_info() -> Dict[str, Any]:
@@ -452,10 +454,9 @@ if __name__ == "__main__":
         print("✅ FAL.ai API key found")
     
     # Check if fal_client is available
-    try:
-        import fal_client
+    if fal_client is not None:
         print("✅ fal_client library available")
-    except ImportError:
+    else:
         print("❌ fal_client library not found")
         print("Please install: pip install fal-client")
         exit(1)

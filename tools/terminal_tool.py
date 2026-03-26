@@ -362,7 +362,7 @@ from tools.environments.singularity import SingularityEnvironment as _Singularit
 from tools.environments.ssh import SSHEnvironment as _SSHEnvironment
 from tools.environments.docker import DockerEnvironment as _DockerEnvironment
 from tools.environments.modal import ModalEnvironment as _ModalEnvironment
-from tools.environments.shell_utils import get_local_shell_mode
+from tools.environments.shell_utils import get_local_shell_mode, normalize_windows_shell_override
 
 
 # Tool description for LLM
@@ -408,6 +408,7 @@ Background: ONLY for long-running servers, watchers, or processes that never exi
 Do NOT use background for scripts, builds, or installs — foreground with a generous timeout is always better (fewer tool calls, instant results).
 Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
+Windows local backend: 'shell_mode' can override the current Windows shell for this call only (`cmd`, `powershell`, `wsl`, or `auto`).
 
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
 """
@@ -894,6 +895,7 @@ def terminal_tool(
     workdir: Optional[str] = None,
     check_interval: Optional[int] = None,
     pty: bool = False,
+    shell_mode: Optional[str] = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -907,6 +909,7 @@ def terminal_tool(
         workdir: Working directory for this command (optional, uses session cwd if not set)
         check_interval: Seconds between auto-checks for background processes (gateway only, min 30)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
+        shell_mode: On Windows with the local backend, override the shell for this call (`cmd`, `powershell`, `wsl`, `auto`)
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -953,6 +956,7 @@ def terminal_tool(
         cwd = overrides.get("cwd") or config["cwd"]
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
+        shell_mode_override = normalize_windows_shell_override(shell_mode) if shell_mode else None
 
         # Start cleanup thread
         _start_cleanup_thread()
@@ -1088,6 +1092,7 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=pty,
+                        shell_mode_override=shell_mode_override,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -1158,6 +1163,8 @@ def terminal_tool(
                     execute_kwargs = {"timeout": effective_timeout}
                     if workdir:
                         execute_kwargs["cwd"] = workdir
+                    if env_type == "local" and shell_mode_override:
+                        execute_kwargs["shell_mode_override"] = shell_mode_override
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
@@ -1376,6 +1383,11 @@ TERMINAL_SCHEMA = {
                 "type": "boolean",
                 "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, or Python REPL. Only works with local and SSH backends. Default: false.",
                 "default": False
+            },
+            "shell_mode": {
+                "type": "string",
+                "description": "Windows local backend only: choose which shell to use for this command (`cmd`, `powershell`, `wsl`, or `auto`).",
+                "enum": ["auto", "cmd", "powershell", "wsl"]
             }
         },
         "required": ["command"]
@@ -1392,6 +1404,7 @@ def _handle_terminal(args, **kw):
         workdir=args.get("workdir"),
         check_interval=args.get("check_interval"),
         pty=args.get("pty", False),
+        shell_mode=args.get("shell_mode"),
     )
 
 

@@ -108,6 +108,9 @@ def _load_sidecar_sync_timeout_seconds() -> float:
 
 _BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS = _load_sidecar_sync_timeout_seconds()
 
+# Mirror agent tool/thinking lines into the browser bridge poll payload (sidecar UI parity).
+_BROWSER_BRIDGE_PROGRESS_EVENT_CAP = 128
+
 
 def _format_timeout_seconds(value: float) -> str:
     return f"{int(value)}" if float(value).is_integer() else f"{value:g}"
@@ -1157,17 +1160,22 @@ class GatewayRunner:
         session_key: str,
         message: str,
         *,
-        limit: int = 6,
+        limit=None,
     ) -> List[str]:
-        """Append a short progress event and return the bounded event list."""
+        """Append a progress event and return the bounded event list (sidecar activity log)."""
+        cap = (
+            _BROWSER_BRIDGE_PROGRESS_EVENT_CAP
+            if limit is None
+            else max(1, min(int(limit), 500))
+        )
         normalized = str(message or "").strip()
         if not normalized:
             normalized = "Working..."
         events = list(self._browser_bridge_progress.get(session_key, {}).get("recent_events") or [])
         stamp = datetime.now().strftime("%H:%M:%S")
         events.append(f"[{stamp}] {normalized}")
-        if len(events) > limit:
-            events = events[-limit:]
+        if len(events) > cap:
+            events = events[-cap:]
         return events
 
     def _wiki_host_status_message(self) -> str:
@@ -1304,13 +1312,16 @@ class GatewayRunner:
             end = finished_at if isinstance(finished_at, (int, float)) and not state.get("running") else time.time()
             elapsed = max(0, int(end - started_at))
 
+        recent = list(state.get("recent_events") or [])
         return {
             "running": bool(state.get("running")),
             "detail": str(state.get("detail") or "").strip(),
             "error": str(state.get("error") or "").strip(),
             "interrupt_requested": bool(state.get("interrupt_requested")),
             "elapsed_seconds": elapsed,
-            "recent_events": list(state.get("recent_events") or []),
+            "recent_events": recent,
+            # Alias for extension UI (full activity log; same backing store as recent_events).
+            "activity_log": list(recent),
         }
 
     def _normalize_browser_bridge_public_host(self, host: str) -> str:
@@ -1961,6 +1972,454 @@ class GatewayRunner:
             "can_send": is_browser_session,
         }
 
+    @staticmethod
+    def _serialize_browser_bridge_timestamp(value: Any) -> str:
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(value).isoformat()
+            except Exception:
+                return ""
+        return str(value or "").strip()
+
+    def _serialize_browser_bridge_transcript(
+        self,
+        history: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        for index, message in enumerate(history, start=1):
+            if isinstance(message, dict):
+                raw_message: Any = message
+                tool_calls = message.get("tool_calls")
+                if not isinstance(tool_calls, list):
+                    tool_calls = []
+                result.append(
+                    {
+                        "index": index,
+                        "role": str(message.get("role") or "").strip(),
+                        "timestamp": self._serialize_browser_bridge_timestamp(message.get("timestamp")),
+                        "content_text": self._extract_browser_bridge_content(message.get("content")),
+                        "tool_name": str(message.get("tool_name") or "").strip(),
+                        "tool_call_count": len(tool_calls),
+                        "raw": raw_message,
+                    }
+                )
+                continue
+
+            result.append(
+                {
+                    "index": index,
+                    "role": "",
+                    "timestamp": "",
+                    "content_text": self._extract_browser_bridge_content(message),
+                    "tool_name": "",
+                    "tool_call_count": 0,
+                    "raw": message,
+                }
+            )
+        return result
+
+    def _load_browser_bridge_session_log(self, session_id: str) -> Dict[str, Any]:
+        normalized_session_id = str(session_id or "").strip()
+        path = _hermes_home / "sessions" / f"session_{normalized_session_id}.json"
+        result = {
+            "path": str(path),
+            "exists": path.exists(),
+            "data": None,
+            "error": "",
+        }
+        if not normalized_session_id or not path.exists():
+            return result
+        try:
+            result["data"] = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            result["error"] = str(exc)
+        return result
+
+    @staticmethod
+    def _extract_session_log_tool_name(tool_call: Any) -> str:
+        if not isinstance(tool_call, dict):
+            return ""
+        function_info = tool_call.get("function")
+        if isinstance(function_info, dict):
+            name = str(function_info.get("name") or "").strip()
+            if name:
+                return name
+        return str(tool_call.get("name") or "").strip()
+
+    @staticmethod
+    def _deep_merge_browser_bridge_config(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+        for key, value in patch.items():
+            if isinstance(base.get(key), dict) and isinstance(value, dict):
+                GatewayRunner._deep_merge_browser_bridge_config(base[key], value)
+            else:
+                base[key] = value
+        return base
+
+    @staticmethod
+    def _safe_json_loads(value: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            return value
+        text = str(value or "").strip()
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except Exception:
+            return {}
+
+    def _build_delegate_branch_summary(self, audit_events: List[Dict[str, Any]]) -> Dict[str, Any]:
+        calls: List[Dict[str, Any]] = []
+        graph_nodes: List[Dict[str, Any]] = [
+            {"id": "root", "label": "Hermes session", "kind": "root", "status": "ok"}
+        ]
+        graph_edges: List[Dict[str, Any]] = []
+
+        delegate_events = [
+            event for event in (audit_events or [])
+            if event.get("kind") == "tool_finish" and event.get("tool_name") == "delegate_task"
+        ]
+        for index, event in enumerate(delegate_events, start=1):
+            parsed = self._safe_json_loads((event.get("payload") or {}).get("result"))
+            tasks = parsed.get("results") if isinstance(parsed, dict) else []
+            if not isinstance(tasks, list):
+                tasks = []
+            call_id = f"delegate-{index}"
+            call_status = "error" if event.get("is_error") else "ok"
+            call_summary = {
+                "id": call_id,
+                "status": call_status,
+                "duration_ms": int(event.get("duration_ms") or 0),
+                "started_at": event.get("ts"),
+                "branch_count": len(tasks),
+                "ok_count": sum(1 for task in tasks if str(task.get("status") or "").strip().lower() == "completed"),
+                "error_count": sum(1 for task in tasks if str(task.get("status") or "").strip().lower() not in {"", "completed"}),
+                "tasks": [],
+            }
+            graph_nodes.append({
+                "id": call_id,
+                "label": f"delegate_task #{index}",
+                "kind": "delegate_call",
+                "status": call_status,
+                "duration_ms": call_summary["duration_ms"],
+            })
+            graph_edges.append({"from": "root", "to": call_id})
+
+            for task_index, task in enumerate(tasks, start=1):
+                task_status = str(task.get("status") or "unknown").strip().lower() or "unknown"
+                summary = str(task.get("summary") or task.get("error") or "").strip()
+                label = summary[:96] if summary else f"Branch {task_index}"
+                node_id = f"{call_id}-task-{task_index}"
+                call_summary["tasks"].append({
+                    "task_index": int(task.get("task_index") or task_index - 1),
+                    "status": task_status,
+                    "duration_seconds": float(task.get("duration_seconds") or 0),
+                    "summary": summary,
+                    "error": str(task.get("error") or "").strip(),
+                })
+                graph_nodes.append({
+                    "id": node_id,
+                    "label": label,
+                    "kind": "delegate_branch",
+                    "status": task_status,
+                    "duration_seconds": float(task.get("duration_seconds") or 0),
+                })
+                graph_edges.append({"from": call_id, "to": node_id})
+            calls.append(call_summary)
+
+        return {
+            "total_delegate_calls": len(calls),
+            "total_branches": sum(call["branch_count"] for call in calls),
+            "calls": calls,
+            "graph": {"nodes": graph_nodes, "edges": graph_edges},
+        }
+
+    def _build_tool_benchmark_summary(
+        self,
+        audit_events: List[Dict[str, Any]],
+        audit_metrics: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        tool_finish = [
+            event for event in (audit_events or [])
+            if event.get("kind") == "tool_finish"
+        ]
+        tool_stats: Dict[str, Dict[str, Any]] = {}
+        for event in tool_finish:
+            tool_name = str(event.get("tool_name") or "tool").strip() or "tool"
+            entry = tool_stats.setdefault(
+                tool_name,
+                {
+                    "tool_name": tool_name,
+                    "count": 0,
+                    "error_count": 0,
+                    "total_duration_ms": 0,
+                    "max_duration_ms": 0,
+                },
+            )
+            entry["count"] += 1
+            if event.get("is_error"):
+                entry["error_count"] += 1
+            duration_ms = int(event.get("duration_ms") or 0)
+            entry["total_duration_ms"] += duration_ms
+            entry["max_duration_ms"] = max(entry["max_duration_ms"], duration_ms)
+
+        tools = []
+        for entry in tool_stats.values():
+            count = int(entry["count"] or 0)
+            error_count = int(entry["error_count"] or 0)
+            total_duration_ms = int(entry["total_duration_ms"] or 0)
+            tools.append({
+                **entry,
+                "avg_duration_ms": int(total_duration_ms / count) if count else 0,
+                "error_rate": round(error_count / count, 3) if count else 0.0,
+            })
+        tools.sort(key=lambda item: (item["avg_duration_ms"], item["count"], item["max_duration_ms"]), reverse=True)
+
+        return {
+            "runtime_ms": audit_metrics.get("runtime_ms"),
+            "error_count": audit_metrics.get("error_count", 0),
+            "tool_count": audit_metrics.get("tool_count", 0),
+            "message_count": audit_metrics.get("message_count", 0),
+            "slowest_tools": audit_metrics.get("slowest_tools", []),
+            "tools": tools,
+        }
+
+    def _build_runtime_config_snapshot(self, selected_provider: str = "") -> Dict[str, Any]:
+        from hermes_cli.auth import PROVIDER_REGISTRY, get_auth_status
+        from hermes_cli.config import get_env_value, load_config
+        from hermes_cli.models import curated_models_for_provider, list_available_providers
+
+        config = load_config()
+        model_cfg = config.get("model")
+        if isinstance(model_cfg, str):
+            model_settings = {
+                "default": model_cfg.strip(),
+                "provider": "auto",
+                "base_url": "",
+                "api_mode": "",
+            }
+        elif isinstance(model_cfg, dict):
+            model_settings = {
+                "default": str(model_cfg.get("default") or "").strip(),
+                "provider": str(model_cfg.get("provider") or "auto").strip() or "auto",
+                "base_url": str(model_cfg.get("base_url") or "").strip(),
+                "api_mode": str(model_cfg.get("api_mode") or "").strip(),
+            }
+        else:
+            model_settings = {"default": "", "provider": "auto", "base_url": "", "api_mode": ""}
+
+        selected_provider_id = str(selected_provider or model_settings.get("provider") or "openrouter").strip() or "openrouter"
+        providers: List[Dict[str, Any]] = []
+        for provider in list_available_providers():
+            provider_id = str(provider.get("id") or "").strip()
+            pconfig = PROVIDER_REGISTRY.get(provider_id)
+            status = get_auth_status(provider_id)
+            base_url_env_var = str(getattr(pconfig, "base_url_env_var", "") or "").strip()
+            providers.append({
+                **provider,
+                "auth_type": str(getattr(pconfig, "auth_type", "") or "").strip(),
+                "api_key_env_vars": list(getattr(pconfig, "api_key_env_vars", ()) or ()),
+                "base_url_env_var": base_url_env_var,
+                "base_url_value": get_env_value(base_url_env_var) if base_url_env_var else "",
+                "status": status,
+            })
+
+        provider_models = curated_models_for_provider(selected_provider_id if selected_provider_id != "auto" else "openrouter")
+        terminal_settings = dict(config.get("terminal") or {})
+        env_windows_shell = str(os.getenv("HERMES_WINDOWS_SHELL") or "").strip()
+        if env_windows_shell:
+            terminal_settings["windows_shell"] = env_windows_shell
+        config_path = _hermes_home / "config.yaml"
+        env_path = _hermes_home / ".env"
+        config_text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+
+        return {
+            "config": {
+                "model": model_settings,
+                "control_room": dict(config.get("control_room") or {}),
+                "terminal": terminal_settings,
+                "web": dict(config.get("web") or {}),
+                "tts": dict(config.get("tts") or {}),
+                "stt": dict(config.get("stt") or {}),
+                "delegation": dict(config.get("delegation") or {}),
+            },
+            "providers": providers,
+            "provider_models": [
+                {"id": model_id, "description": description}
+                for model_id, description in provider_models
+            ],
+            "catalog": {
+                "tts_providers": ["edge", "elevenlabs", "openai", "kokoro", "neutts", "f5"],
+                "stt_providers": ["local", "groq", "openai"],
+                "date_awareness_modes": [
+                    {"id": "smart", "label": "Smart date grounding"},
+                    {"id": "off", "label": "Literal dates only"},
+                ],
+            },
+            "paths": {
+                "config_path": str(config_path),
+                "env_path": str(env_path),
+            },
+            "raw_config_text": config_text,
+        }
+
+    def _save_runtime_config_snapshot(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from hermes_cli.config import load_config, save_config, save_env_value, save_env_value_secure
+        from tools.environments.shell_utils import normalize_windows_shell_override
+
+        config = load_config()
+        config_patch = payload.get("config_patch")
+        if isinstance(config_patch, dict):
+            self._deep_merge_browser_bridge_config(config, config_patch)
+            save_config(config)
+            terminal_patch = config_patch.get("terminal")
+            if isinstance(terminal_patch, dict) and "windows_shell" in terminal_patch:
+                os.environ["HERMES_WINDOWS_SHELL"] = normalize_windows_shell_override(
+                    str(terminal_patch.get("windows_shell") or "auto")
+                )
+
+        env_updates = payload.get("env_updates")
+        if isinstance(env_updates, dict):
+            for key, raw_value in env_updates.items():
+                env_key = str(key or "").strip()
+                if not env_key:
+                    continue
+                value = str(raw_value or "")
+                if any(token in env_key.upper() for token in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+                    save_env_value_secure(env_key, value)
+                else:
+                    save_env_value(env_key, value)
+
+        selected_provider = str(payload.get("selected_provider") or "").strip()
+        return self._build_runtime_config_snapshot(selected_provider=selected_provider)
+
+    def _build_sidebar_session_inspection(self, session_ref: str) -> Dict[str, Any]:
+        snapshot = self._get_sidebar_session_snapshot(session_ref)
+        resolved_session_id = str(snapshot.get("session_id") or "").strip()
+        resolved_session_key = str(snapshot.get("session_key") or resolved_session_id).strip()
+        active_entry = self._get_active_session_entry_by_key_or_session_id(resolved_session_key)
+        if not active_entry and resolved_session_id:
+            active_entry = self._get_active_session_entry_by_key_or_session_id(resolved_session_id)
+        session_record = self.session_store._db.get_session(resolved_session_id) if self.session_store._db else None
+        history = self.session_store.load_transcript(resolved_session_id)
+        transcript = self._serialize_browser_bridge_transcript(history)
+        session_log_snapshot = self._load_browser_bridge_session_log(resolved_session_id)
+        session_log = session_log_snapshot.get("data") if isinstance(session_log_snapshot.get("data"), dict) else None
+        raw_messages = session_log.get("messages") if isinstance(session_log, dict) else None
+        if not isinstance(raw_messages, list):
+            raw_messages = []
+
+        role_counts: Dict[str, int] = {}
+        tool_names: List[str] = []
+        configured_tools: List[str] = []
+        tool_call_count = 0
+        tool_result_count = 0
+        reasoning_message_count = 0
+
+        for message in raw_messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip()
+            if role:
+                role_counts[role] = role_counts.get(role, 0) + 1
+            if role == "tool":
+                tool_result_count += 1
+            if message.get("reasoning"):
+                reasoning_message_count += 1
+            tool_name = str(message.get("tool_name") or "").strip()
+            if tool_name and tool_name not in tool_names:
+                tool_names.append(tool_name)
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                tool_calls = []
+            tool_call_count += len(tool_calls)
+            for tool_call in tool_calls:
+                call_name = self._extract_session_log_tool_name(tool_call)
+                if call_name and call_name not in tool_names:
+                    tool_names.append(call_name)
+
+        raw_configured_tools = session_log.get("tools") if isinstance(session_log, dict) else None
+        if isinstance(raw_configured_tools, list):
+            for item in raw_configured_tools:
+                if not isinstance(item, dict):
+                    continue
+                name = self._extract_session_log_tool_name(item)
+                if name and name not in configured_tools:
+                    configured_tools.append(name)
+
+        source_details: Dict[str, Any] = {}
+        if active_entry and active_entry.origin:
+            source_details = {
+                "platform": active_entry.origin.platform.value,
+                "chat_id": str(active_entry.origin.chat_id or ""),
+                "chat_name": str(active_entry.origin.chat_name or ""),
+                "user_id": str(active_entry.origin.user_id or ""),
+                "user_name": str(active_entry.origin.user_name or ""),
+                "session_key": active_entry.session_key,
+            }
+        elif session_record:
+            source_details = {
+                "platform": str(session_record.get("source") or ""),
+                "session_key": resolved_session_key,
+            }
+
+        progress = snapshot.get("progress") if isinstance(snapshot.get("progress"), dict) else {}
+        activity_log = progress.get("activity_log") if isinstance(progress, dict) else None
+        if not isinstance(activity_log, list):
+            activity_log = []
+        audit_events: List[Dict[str, Any]] = []
+        audit_metrics: Dict[str, Any] = {}
+        if self.session_store._db and resolved_session_id:
+            try:
+                audit_events = self.session_store._db.get_audit_events(resolved_session_id, limit=500)
+                audit_metrics = self.session_store._db.get_session_metrics(resolved_session_id)
+            except Exception:
+                audit_events = []
+                audit_metrics = {}
+        delegate_summary = self._build_delegate_branch_summary(audit_events)
+        benchmark_summary = self._build_tool_benchmark_summary(audit_events, audit_metrics)
+
+        return {
+            **snapshot,
+            "inspect_generated_at": datetime.now().isoformat(),
+            "transcript": transcript,
+            "session_log": session_log,
+            "session_log_available": bool(session_log),
+            "session_log_exists": bool(session_log_snapshot.get("exists")),
+            "session_log_error": str(session_log_snapshot.get("error") or "").strip(),
+            "configured_tools": configured_tools,
+            "source_details": source_details,
+            "session_record": session_record or {},
+            "audit_events": audit_events,
+            "audit_metrics": audit_metrics,
+            "delegate_summary": delegate_summary,
+            "benchmark_summary": benchmark_summary,
+            "paths": {
+                "hermes_home": str(_hermes_home),
+                "config_path": str(_hermes_home / "config.yaml"),
+                "logs_dir": str(_hermes_home / "logs"),
+                "sessions_dir": str(_hermes_home / "sessions"),
+                "session_log_path": str(session_log_snapshot.get("path") or ""),
+            },
+            "stats": {
+                "visible_message_count": len(snapshot.get("messages") or []),
+                "transcript_message_count": len(transcript),
+                "raw_message_count": len(raw_messages),
+                "activity_event_count": len(activity_log),
+                "system_prompt_chars": len(str(session_log.get("system_prompt") or "")) if session_log else 0,
+                "configured_tool_count": len(configured_tools),
+                "tool_call_count": tool_call_count,
+                "tool_result_count": tool_result_count,
+                "reasoning_message_count": reasoning_message_count,
+                "audit_event_count": len(audit_events),
+                "delegate_call_count": delegate_summary.get("total_delegate_calls", 0),
+                "delegate_branch_count": delegate_summary.get("total_branches", 0),
+                "roles": role_counts,
+                "tool_names": tool_names,
+                "elapsed_seconds": int(progress.get("elapsed_seconds") or 0),
+                "last_updated": str(session_log.get("last_updated") or "").strip() if session_log else "",
+            },
+        }
+
     def _resolve_sidebar_active_session_key(
         self,
         *,
@@ -2166,6 +2625,59 @@ class GatewayRunner:
                 "provider": str(result.get("provider") or "").strip(),
             }
 
+        if action == "runtime_config_get":
+            return {
+                "ok": True,
+                **self._build_runtime_config_snapshot(
+                    selected_provider=str(payload.get("selected_provider") or "").strip()
+                ),
+            }
+
+        if action == "runtime_config_save":
+            return {
+                "ok": True,
+                **self._save_runtime_config_snapshot(payload),
+            }
+
+        if action == "runtime_provider_models":
+            from hermes_cli.models import curated_models_for_provider
+
+            selected_provider = str(payload.get("selected_provider") or "openrouter").strip() or "openrouter"
+            models = curated_models_for_provider(selected_provider if selected_provider != "auto" else "openrouter")
+            return {
+                "ok": True,
+                "provider_models": [
+                    {"id": model_id, "description": description}
+                    for model_id, description in models
+                ],
+            }
+
+        if action == "recall_search":
+            from tools.session_search_tool import session_search
+
+            query = str(payload.get("query") or "").strip()
+            if not query:
+                raise ValueError("Query is required for recall_search.")
+            limit = max(1, min(8, int(payload.get("limit") or 5)))
+            date_awareness = str(payload.get("date_awareness") or "smart").strip().lower() or "smart"
+            recall_session_key = str(payload.get("sessionKey") or payload.get("session_key") or selected_session_key).strip()
+            recall_session_id = ""
+            if recall_session_key:
+                try:
+                    recall_snapshot = self._get_sidebar_session_snapshot(recall_session_key)
+                    recall_session_id = str(recall_snapshot.get("session_id") or "").strip()
+                except Exception:
+                    recall_session_id = ""
+            raw_result = session_search(
+                query=query,
+                limit=limit,
+                db=self.session_store._db,
+                current_session_id=recall_session_id,
+                date_awareness=date_awareness,
+            )
+            parsed = json.loads(raw_result) if isinstance(raw_result, str) else {}
+            return {"ok": True, **parsed}
+
         if action == "list":
             active_session_key = self._resolve_sidebar_active_session_key(
                 browser_label=browser_label,
@@ -2192,6 +2704,11 @@ class GatewayRunner:
                         "ok": True,
                         **sidebar_snapshot,
                     }
+                if action == "inspect":
+                    return {
+                        "ok": True,
+                        **self._build_sidebar_session_inspection(selected_session_key),
+                    }
                 raise ValueError(
                     "This session is read-only in the browser side panel right now. "
                     "You can browse it here, but sending new turns is only supported for browser sidecar sessions."
@@ -2203,6 +2720,12 @@ class GatewayRunner:
 
         if action == "state":
             return self._get_browser_bridge_session_snapshot(source)
+
+        if action == "inspect":
+            return {
+                "ok": True,
+                **self._build_sidebar_session_inspection(session_key),
+            }
 
         if action == "reset":
             session_entry = self.session_store.get_or_create_session(source, force_new=True)
@@ -5343,7 +5866,7 @@ class GatewayRunner:
             return (
                 "🖥️ **Current terminal mode:** "
                 f"`{current}`\n\n"
-                "Usage: `/terminal powershell`, `/terminal wsl`, `/terminal auto`, `/terminal cmd`"
+                "Usage: `/terminal cmd`, `/terminal powershell`, `/terminal wsl`, `/terminal auto`"
             )
 
         mode_map = {
@@ -5360,7 +5883,7 @@ class GatewayRunner:
         if args not in mode_map:
             return (
                 f"Unknown terminal mode: `{args}`\n\n"
-                "Valid options: `powershell`, `wsl`, `auto`, `cmd` "
+                "Valid options: `cmd`, `powershell`, `wsl`, `auto` "
                 "(aliases: `windows`, `pwsh`)."
             )
 
@@ -5393,7 +5916,7 @@ class GatewayRunner:
             "powershell": "PowerShell",
             "wsl": "WSL (Linux shell)",
             "cmd": "cmd.exe",
-            "auto": "auto (WSL > PowerShell > cmd)",
+            "auto": "auto (cmd.exe > PowerShell > WSL)",
         }.get(new_value, new_value)
 
         return (
@@ -7388,7 +7911,8 @@ class GatewayRunner:
         history: List[Dict[str, Any]],
         source: SessionSource,
         session_id: str,
-        session_key: str = None
+        session_key: str = None,
+        interrupt_depth: int = 0,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -7559,8 +8083,11 @@ class GatewayRunner:
 
         tool_progress_enabled = progress_mode != "off"
 
-        # Queue for progress/status ticks (thread-safe).
-        progress_queue = queue.Queue() if tool_progress_enabled else None
+        _has_messaging_adapter = bool(self.adapters.get(source.platform))
+        _bridge_sidecar = self._is_browser_bridge_source(source)
+        # Queue only when a messaging adapter consumes progress (Discord, etc.). Browser sidecar
+        # uses synchronous fan-out from _push_recent_event into _browser_bridge_progress instead.
+        progress_queue = queue.Queue() if (tool_progress_enabled and _has_messaging_adapter) else None
         last_tool = [None]  # Mutable container for tracking in closure
         last_terminal_progress = [None]
         progress_state = {
@@ -7616,6 +8143,20 @@ class GatewayRunner:
             recent_events.append(event_line)
             while len(recent_events) > progress_rolling_entries:
                 recent_events.pop(0)
+            # Sidecar extension polls progress.recent_events — mirror Discord-style tool lines here.
+            if session_key and _bridge_sidecar:
+                bridge_line = f"[{ts}] {text}"
+                bridge_events = self._append_browser_bridge_progress_event(
+                    session_key,
+                    bridge_line,
+                    limit=_BROWSER_BRIDGE_PROGRESS_EVENT_CAP,
+                )
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=True,
+                    detail=text[:500] if text else "",
+                    recent_events=bridge_events,
+                )
 
         def _emit_gateway_terminal_progress(detail: str, phase: str | None = None) -> None:
             text = (detail or "").strip()
@@ -7693,7 +8234,7 @@ class GatewayRunner:
 
         def progress_callback(tool_name: str, preview: str = None, args: dict = None):
             """Callback invoked by agent when tool progress changes."""
-            if not progress_queue:
+            if not progress_queue and not _bridge_sidecar:
                 return
 
             # Optional completion payloads from newer run_agent variants.
@@ -8378,11 +8919,11 @@ class GatewayRunner:
                 
                 # Cap recursion depth to prevent resource exhaustion when the
                 # user sends multiple messages while the agent keeps failing. (#816)
-                if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
+                if interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
                     logger.warning(
                         "Interrupt recursion depth %d reached for session %s — "
                         "queueing message instead of recursing.",
-                        _interrupt_depth, session_key,
+                        interrupt_depth, session_key,
                     )
                     # Queue the pending message for normal processing on next turn
                     adapter = self.adapters.get(source.platform)
@@ -8416,7 +8957,8 @@ class GatewayRunner:
                     history=updated_history,
                     source=source,
                     session_id=session_id,
-                    session_key=session_key
+                    session_key=session_key,
+                    interrupt_depth=interrupt_depth + 1,
                 )
         finally:
             # Stop progress sender and interrupt monitor

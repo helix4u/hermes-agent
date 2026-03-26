@@ -16,7 +16,46 @@ const challengeModePrompt = document.getElementById("challenge-mode-prompt");
 const quickPromptList = document.getElementById("quick-prompt-list");
 const addQuickPromptButton = document.getElementById("add-quick-prompt-button");
 const bridgeStatusText = document.getElementById("bridge-status-text");
+const wikiBaseUrlInput = document.getElementById("wiki-base-url");
+const sidecarActivityLogLevelSelect = document.getElementById("sidecar-activity-log-level");
+const activityLogPanelOpenCheckbox = document.getElementById("activity-log-panel-open");
+const openWikiButton = document.getElementById("open-wiki-button");
+const openControlRoomButton = document.getElementById("open-control-room-button");
+const localServicesFeedback = document.getElementById("local-services-feedback");
 const statusText = document.getElementById("status-text");
+const runtimeProviderSelect = document.getElementById("runtime-provider-select");
+const runtimeModelSelect = document.getElementById("runtime-model-select");
+const runtimeModelInput = document.getElementById("runtime-model-input");
+const runtimeBaseUrlInput = document.getElementById("runtime-base-url");
+const runtimeApiModeSelect = document.getElementById("runtime-api-mode");
+const providerAuthStatus = document.getElementById("provider-auth-status");
+const providerApiKeyInput = document.getElementById("provider-api-key-input");
+const providerEnvBaseUrlInput = document.getElementById("provider-env-base-url-input");
+const providerEnvHint = document.getElementById("provider-env-hint");
+const ttsProviderSelect = document.getElementById("tts-provider-select");
+const ttsEdgeVoiceInput = document.getElementById("tts-edge-voice");
+const ttsOpenaiModelInput = document.getElementById("tts-openai-model");
+const ttsOpenaiVoiceInput = document.getElementById("tts-openai-voice");
+const ttsKokoroBaseUrlInput = document.getElementById("tts-kokoro-base-url");
+const ttsKokoroVoiceInput = document.getElementById("tts-kokoro-voice");
+const sttProviderSelect = document.getElementById("stt-provider-select");
+const sttLocalModelInput = document.getElementById("stt-local-model");
+const sttOpenaiModelInput = document.getElementById("stt-openai-model");
+const sttEnabledCheckbox = document.getElementById("stt-enabled");
+const terminalBackendSelect = document.getElementById("terminal-backend-select");
+const terminalTimeoutInput = document.getElementById("terminal-timeout-input");
+const terminalWindowsShellSelect = document.getElementById("terminal-windows-shell-select");
+const terminalCwdInput = document.getElementById("terminal-cwd-input");
+const terminalPersistentShellCheckbox = document.getElementById("terminal-persistent-shell");
+const terminalDockerMountCwdCheckbox = document.getElementById("terminal-docker-mount-cwd");
+const webBackendSelect = document.getElementById("web-backend-select");
+const archiveFallbackEnabledCheckbox = document.getElementById("archive-fallback-enabled");
+const archiveServiceSelect = document.getElementById("archive-service-select");
+const archiveFallbackToOriginalCheckbox = document.getElementById("archive-fallback-to-original");
+const archivePaywalledDomainsInput = document.getElementById("archive-paywalled-domains");
+const delegationProviderInput = document.getElementById("delegation-provider-input");
+const delegationModelInput = document.getElementById("delegation-model-input");
+const delegationBaseUrlInput = document.getElementById("delegation-base-url-input");
 
 const THEME_GROUP_ORDER = [
   "Monochrome dark",
@@ -31,6 +70,7 @@ let quickPromptDrafts = [];
 let customThemeDrafts = [];
 let currentThemeAccent = window.HermesTheme?.defaultCustomThemePrimary || "#8b5cf6";
 let themePreviewSaveTimer = null;
+let runtimeConfigState = null;
 
 window.HermesTheme?.applyThemeToDocument({
   themeName: window.HermesTheme?.defaultThemeId || "obsidian"
@@ -38,6 +78,28 @@ window.HermesTheme?.applyThemeToDocument({
 
 function setStatus(message) {
   statusText.textContent = message;
+}
+
+function setLocalServicesFeedback(message, isError = false) {
+  if (!localServicesFeedback) {
+    return;
+  }
+  localServicesFeedback.textContent = message || "";
+  localServicesFeedback.classList.toggle("has-error", Boolean(isError && message));
+}
+
+function openControlRoomTab() {
+  const url = chrome.runtime.getURL("control-room.html");
+  chrome.tabs.create({ url }, () => {
+    const err = chrome.runtime.lastError;
+    if (err) {
+      const text = err.message || String(err);
+      setLocalServicesFeedback(text, true);
+      setStatus(text);
+    } else {
+      setLocalServicesFeedback("Control room opened in a new tab.");
+    }
+  });
 }
 
 function setBridgeStatus(message) {
@@ -48,6 +110,222 @@ function setMicrophoneStatus(message) {
   if (microphoneStatusText) {
     microphoneStatusText.textContent = message;
   }
+}
+
+function getSelectedProviderInfo() {
+  const providerId = String(runtimeProviderSelect?.value || "").trim();
+  const providers = Array.isArray(runtimeConfigState?.providers) ? runtimeConfigState.providers : [];
+  return providers.find((provider) => String(provider.id || "").trim() === providerId) || null;
+}
+
+function populateRuntimeProviderOptions(selectedProvider = "") {
+  if (!runtimeProviderSelect) {
+    return;
+  }
+  runtimeProviderSelect.textContent = "";
+  const providers = Array.isArray(runtimeConfigState?.providers) ? runtimeConfigState.providers : [];
+  for (const provider of providers) {
+    const option = document.createElement("option");
+    option.value = String(provider.id || "").trim();
+    const authMarker = provider.authenticated ? "configured" : "not configured";
+    option.textContent = `${provider.label || provider.id} (${authMarker})`;
+    runtimeProviderSelect.appendChild(option);
+  }
+  const fallback = providers[0]?.id || "openrouter";
+  runtimeProviderSelect.value = providers.some((provider) => provider.id === selectedProvider)
+    ? selectedProvider
+    : fallback;
+}
+
+function populateRuntimeModelOptions(selectedModel = "") {
+  if (!runtimeModelSelect) {
+    return;
+  }
+  runtimeModelSelect.textContent = "";
+  const models = Array.isArray(runtimeConfigState?.provider_models) ? runtimeConfigState.provider_models : [];
+  const defaultOption = document.createElement("option");
+  defaultOption.value = "";
+  defaultOption.textContent = "Use provider default / custom override";
+  runtimeModelSelect.appendChild(defaultOption);
+  for (const model of models) {
+    const option = document.createElement("option");
+    option.value = String(model.id || "").trim();
+    option.textContent = String(model.id || "").trim();
+    option.title = String(model.description || "").trim();
+    runtimeModelSelect.appendChild(option);
+  }
+  const hasSelected = Array.from(runtimeModelSelect.options).some((option) => option.value === selectedModel);
+  runtimeModelSelect.value = hasSelected ? selectedModel : "";
+}
+
+function updateProviderAuthUi() {
+  const provider = getSelectedProviderInfo();
+  if (!provider) {
+    if (providerAuthStatus) {
+      providerAuthStatus.textContent = "Provider metadata unavailable.";
+    }
+    if (providerEnvHint) {
+      providerEnvHint.textContent = "";
+    }
+    return;
+  }
+  const status = provider.status || {};
+  const authSummary = status.logged_in
+    ? "Authenticated"
+    : status.configured
+      ? "Configured via API key"
+      : "Not configured yet";
+  if (providerAuthStatus) {
+    providerAuthStatus.textContent = `${provider.label || provider.id}: ${authSummary}.`;
+  }
+  if (providerEnvHint) {
+    const apiKeyVars = Array.isArray(provider.api_key_env_vars) && provider.api_key_env_vars.length
+      ? provider.api_key_env_vars.join(", ")
+      : "(no API key env var metadata)";
+    const baseUrlVar = String(provider.base_url_env_var || "").trim();
+    providerEnvHint.textContent = baseUrlVar
+      ? `API key env: ${apiKeyVars}. Base URL env: ${baseUrlVar}.`
+      : `API key env: ${apiKeyVars}.`;
+  }
+  if (providerEnvBaseUrlInput) {
+    providerEnvBaseUrlInput.value = String(provider.base_url_value || "").trim();
+    providerEnvBaseUrlInput.dataset.originalValue = String(provider.base_url_value || "").trim();
+  }
+}
+
+async function loadRuntimeProviderModels(providerId, selectedModel = "") {
+  if (!providerId) {
+    runtimeConfigState = {
+      ...(runtimeConfigState || {}),
+      provider_models: []
+    };
+    populateRuntimeModelOptions(selectedModel);
+    return;
+  }
+  const response = await sendRuntimeMessage({
+    type: "hermes:get-runtime-provider-models",
+    selectedProvider: providerId
+  });
+  runtimeConfigState = {
+    ...(runtimeConfigState || {}),
+    provider_models: response.result?.provider_models || []
+  };
+  populateRuntimeModelOptions(selectedModel);
+}
+
+async function loadRuntimeConfig(selectedProvider = "") {
+  const response = await sendRuntimeMessage({
+    type: "hermes:get-runtime-config",
+    selectedProvider
+  });
+  runtimeConfigState = response.result || {};
+  const config = runtimeConfigState.config || {};
+  const modelConfig = config.model || {};
+  const provider = String(modelConfig.provider || "auto").trim() || "auto";
+  const model = String(modelConfig.default || "").trim();
+
+  populateRuntimeProviderOptions(provider);
+  await loadRuntimeProviderModels(runtimeProviderSelect?.value || provider, model);
+  if (runtimeModelInput) {
+    runtimeModelInput.value = model;
+  }
+  if (runtimeBaseUrlInput) {
+    runtimeBaseUrlInput.value = String(modelConfig.base_url || "").trim();
+  }
+  if (runtimeApiModeSelect) {
+    runtimeApiModeSelect.value = String(modelConfig.api_mode || "").trim();
+  }
+
+  const tts = config.tts || {};
+  if (ttsProviderSelect) {
+    ttsProviderSelect.value = String(tts.provider || "edge").trim() || "edge";
+  }
+  if (ttsEdgeVoiceInput) {
+    ttsEdgeVoiceInput.value = String(tts.edge?.voice || "").trim();
+  }
+  if (ttsOpenaiModelInput) {
+    ttsOpenaiModelInput.value = String(tts.openai?.model || "").trim();
+  }
+  if (ttsOpenaiVoiceInput) {
+    ttsOpenaiVoiceInput.value = String(tts.openai?.voice || "").trim();
+  }
+  if (ttsKokoroBaseUrlInput) {
+    ttsKokoroBaseUrlInput.value = String(tts.kokoro?.base_url || "").trim();
+  }
+  if (ttsKokoroVoiceInput) {
+    ttsKokoroVoiceInput.value = String(tts.kokoro?.voice || "").trim();
+  }
+
+  const stt = config.stt || {};
+  if (sttProviderSelect) {
+    sttProviderSelect.value = String(stt.provider || "local").trim() || "local";
+  }
+  if (sttLocalModelInput) {
+    sttLocalModelInput.value = String(stt.local?.model || "").trim();
+  }
+  if (sttOpenaiModelInput) {
+    sttOpenaiModelInput.value = String(stt.openai?.model || "").trim();
+  }
+  if (sttEnabledCheckbox) {
+    sttEnabledCheckbox.checked = stt.enabled !== false;
+  }
+
+  const terminal = config.terminal || {};
+  if (terminalBackendSelect) {
+    terminalBackendSelect.value = String(terminal.backend || "local").trim() || "local";
+  }
+  if (terminalTimeoutInput) {
+    terminalTimeoutInput.value = String(terminal.timeout ?? 180);
+  }
+  if (terminalWindowsShellSelect) {
+    const preferredShell = String(terminal.windows_shell || "auto").trim().toLowerCase();
+    terminalWindowsShellSelect.value =
+      preferredShell === "cmd" || preferredShell === "powershell" || preferredShell === "wsl"
+        ? preferredShell
+        : "auto";
+  }
+  if (terminalCwdInput) {
+    terminalCwdInput.value = String(terminal.cwd || ".").trim() || ".";
+  }
+  if (terminalPersistentShellCheckbox) {
+    terminalPersistentShellCheckbox.checked = terminal.persistent_shell !== false;
+  }
+  if (terminalDockerMountCwdCheckbox) {
+    terminalDockerMountCwdCheckbox.checked = terminal.docker_mount_cwd_to_workspace === true;
+  }
+
+  const webConfig = config.web || {};
+  if (webBackendSelect) {
+    webBackendSelect.value = String(webConfig.backend || "").trim();
+  }
+  const archiveFallback = webConfig.archive_fallback || {};
+  if (archiveFallbackEnabledCheckbox) {
+    archiveFallbackEnabledCheckbox.checked = archiveFallback.enabled === true;
+  }
+  if (archiveServiceSelect) {
+    archiveServiceSelect.value = String(archiveFallback.service || "archive.today").trim() || "archive.today";
+  }
+  if (archiveFallbackToOriginalCheckbox) {
+    archiveFallbackToOriginalCheckbox.checked = archiveFallback.fallback_to_original !== false;
+  }
+  if (archivePaywalledDomainsInput) {
+    const paywalledDomains = Array.isArray(archiveFallback.paywalled_domains)
+      ? archiveFallback.paywalled_domains.join(", ")
+      : "";
+    archivePaywalledDomainsInput.value = paywalledDomains;
+  }
+
+  const delegation = config.delegation || {};
+  if (delegationProviderInput) {
+    delegationProviderInput.value = String(delegation.provider || "").trim();
+  }
+  if (delegationModelInput) {
+    delegationModelInput.value = String(delegation.model || "").trim();
+  }
+  if (delegationBaseUrlInput) {
+    delegationBaseUrlInput.value = String(delegation.base_url || "").trim();
+  }
+  updateProviderAuthUi();
 }
 
 function isExtensionContextInvalidated(error) {
@@ -552,6 +830,17 @@ async function loadSettings() {
   showChallengeMode.checked = settings.showChallengeMode === true;
   challengeModeLabel.value = settings.challengeModeLabel || "";
   challengeModePrompt.value = settings.challengeModePrompt || "";
+  if (wikiBaseUrlInput) {
+    wikiBaseUrlInput.value = settings.wikiBaseUrl || "";
+  }
+  if (sidecarActivityLogLevelSelect) {
+    const level = String(settings.sidecarActivityLogLevel || "normal").toLowerCase();
+    sidecarActivityLogLevelSelect.value =
+      level === "minimal" || level === "verbose" ? level : "normal";
+  }
+  if (activityLogPanelOpenCheckbox) {
+    activityLogPanelOpenCheckbox.checked = settings.activityLogPanelOpen === true;
+  }
   quickPromptDrafts = Array.isArray(settings.quickPrompts)
     ? settings.quickPrompts.map((prompt) => createPromptDraft(prompt))
     : [];
@@ -659,8 +948,95 @@ function buildSettingsPayload() {
       showChallengeMode: showChallengeMode.checked,
       quickPrompts: prompts,
       challengeModeLabel: challengeModeLabel.value.trim(),
-      challengeModePrompt: challengeModePrompt.value.trim()
+      challengeModePrompt: challengeModePrompt.value.trim(),
+      wikiBaseUrl: wikiBaseUrlInput ? wikiBaseUrlInput.value.trim() : "",
+      sidecarActivityLogLevel: sidecarActivityLogLevelSelect
+        ? sidecarActivityLogLevelSelect.value
+        : "normal",
+      activityLogPanelOpen: Boolean(activityLogPanelOpenCheckbox?.checked)
     }
+  };
+}
+
+function buildRuntimeConfigPayload() {
+  const selectedProvider = String(runtimeProviderSelect?.value || "auto").trim() || "auto";
+  const selectedModel = String(runtimeModelInput?.value || "").trim() || String(runtimeModelSelect?.value || "").trim();
+  const configPatch = {
+    model: {
+      default: selectedModel,
+      provider: selectedProvider,
+      base_url: String(runtimeBaseUrlInput?.value || "").trim(),
+      api_mode: String(runtimeApiModeSelect?.value || "").trim(),
+    },
+    tts: {
+      provider: String(ttsProviderSelect?.value || "edge").trim() || "edge",
+      edge: {
+        voice: String(ttsEdgeVoiceInput?.value || "").trim(),
+      },
+      openai: {
+        model: String(ttsOpenaiModelInput?.value || "").trim(),
+        voice: String(ttsOpenaiVoiceInput?.value || "").trim(),
+      },
+      kokoro: {
+        base_url: String(ttsKokoroBaseUrlInput?.value || "").trim(),
+        voice: String(ttsKokoroVoiceInput?.value || "").trim(),
+      },
+    },
+    stt: {
+      enabled: Boolean(sttEnabledCheckbox?.checked),
+      provider: String(sttProviderSelect?.value || "local").trim() || "local",
+      local: {
+        model: String(sttLocalModelInput?.value || "").trim(),
+      },
+      openai: {
+        model: String(sttOpenaiModelInput?.value || "").trim(),
+      },
+    },
+    terminal: {
+      backend: String(terminalBackendSelect?.value || "local").trim() || "local",
+      timeout: Math.max(1, Number.parseInt(String(terminalTimeoutInput?.value || "180"), 10) || 180),
+      windows_shell: String(terminalWindowsShellSelect?.value || "auto").trim().toLowerCase() || "auto",
+      cwd: String(terminalCwdInput?.value || ".").trim() || ".",
+      persistent_shell: terminalPersistentShellCheckbox?.checked !== false,
+      docker_mount_cwd_to_workspace: Boolean(terminalDockerMountCwdCheckbox?.checked),
+    },
+    web: {
+      backend: String(webBackendSelect?.value || "").trim(),
+      archive_fallback: {
+        enabled: Boolean(archiveFallbackEnabledCheckbox?.checked),
+        service: String(archiveServiceSelect?.value || "archive.today").trim() || "archive.today",
+        fallback_to_original: archiveFallbackToOriginalCheckbox?.checked !== false,
+        paywalled_domains: String(archivePaywalledDomainsInput?.value || "")
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean),
+      },
+    },
+    delegation: {
+      provider: String(delegationProviderInput?.value || "").trim(),
+      model: String(delegationModelInput?.value || "").trim(),
+      base_url: String(delegationBaseUrlInput?.value || "").trim(),
+    },
+  };
+
+  const envUpdates = {};
+  const provider = getSelectedProviderInfo();
+  const apiKeyValue = String(providerApiKeyInput?.value || "").trim();
+  if (provider && apiKeyValue && Array.isArray(provider.api_key_env_vars) && provider.api_key_env_vars.length) {
+    envUpdates[provider.api_key_env_vars[0]] = apiKeyValue;
+  }
+  const envBaseUrlValue = String(providerEnvBaseUrlInput?.value || "").trim();
+  const originalEnvBaseUrlValue = String(providerEnvBaseUrlInput?.dataset.originalValue || "").trim();
+  if (provider && String(provider.base_url_env_var || "").trim()) {
+    if (envBaseUrlValue !== originalEnvBaseUrlValue) {
+      envUpdates[provider.base_url_env_var] = envBaseUrlValue;
+    }
+  }
+
+  return {
+    selectedProvider,
+    configPatch,
+    envUpdates
   };
 }
 
@@ -680,12 +1056,23 @@ async function saveSettings({
   savedPrefix = "Settings saved."
 } = {}) {
   const { settings, skippedPromptCount } = buildSettingsPayload();
+  const runtimePayload = buildRuntimeConfigPayload();
   await sendRuntimeMessage({
     type: "hermes:save-settings",
     settings
   });
+  await sendRuntimeMessage({
+    type: "hermes:save-runtime-config",
+    selectedProvider: runtimePayload.selectedProvider,
+    configPatch: runtimePayload.configPatch,
+    envUpdates: runtimePayload.envUpdates
+  });
 
   await loadSettings();
+  await loadRuntimeConfig(runtimePayload.selectedProvider);
+  if (providerApiKeyInput) {
+    providerApiKeyInput.value = "";
+  }
 
   const skippedMessages = [];
   if (skippedPromptCount) {
@@ -782,6 +1169,83 @@ document.getElementById("save-settings-button").addEventListener("click", () => 
   saveSettings().catch((error) => setStatus(error.message || String(error)));
 });
 
+const DEFAULT_WIKI_FALLBACK = "http://127.0.0.1:8000/knowledge_wiki.html";
+
+function normalizeSidecarOpenUrl(raw, fallback) {
+  const trimmed = String(raw || "").trim();
+  if (trimmed) {
+    try {
+      return new URL(trimmed).toString();
+    } catch (_error) {
+      return fallback;
+    }
+  }
+  return fallback;
+}
+
+if (openWikiButton) {
+  openWikiButton.addEventListener("click", () => {
+    setLocalServicesFeedback("");
+    const candidate = wikiBaseUrlInput?.value || "";
+    const url = normalizeSidecarOpenUrl(candidate, DEFAULT_WIKI_FALLBACK);
+    chrome.tabs.create({ url }, () => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        setLocalServicesFeedback(err.message || "Could not open tab.", true);
+        setStatus(err.message || "Could not open tab.");
+      }
+    });
+  });
+}
+
+if (openControlRoomButton) {
+  openControlRoomButton.addEventListener("click", () => {
+    setLocalServicesFeedback("Opening control room in a new tab…");
+    openControlRoomTab();
+  });
+}
+
+if (runtimeProviderSelect) {
+  runtimeProviderSelect.addEventListener("change", () => {
+    const providerId = String(runtimeProviderSelect.value || "").trim();
+    loadRuntimeProviderModels(providerId, "")
+      .then(() => {
+        updateProviderAuthUi();
+        const placeholder = runtimeModelSelect?.value || "";
+        if (runtimeModelInput && !runtimeModelInput.value.trim() && placeholder) {
+          runtimeModelInput.value = placeholder;
+        }
+      })
+      .catch((error) => setStatus(error.message || String(error)));
+  });
+}
+
+if (runtimeModelSelect) {
+  runtimeModelSelect.addEventListener("change", () => {
+    if (runtimeModelInput && !runtimeModelInput.value.trim()) {
+      runtimeModelInput.value = String(runtimeModelSelect.value || "").trim();
+    }
+  });
+}
+
+if (sidecarActivityLogLevelSelect) {
+  sidecarActivityLogLevelSelect.addEventListener("change", () => {
+    saveSettings({
+      checkBridgeAfterSave: false,
+      savedPrefix: "Activity log level saved."
+    }).catch((error) => setStatus(error.message || String(error)));
+  });
+}
+
+if (activityLogPanelOpenCheckbox) {
+  activityLogPanelOpenCheckbox.addEventListener("change", () => {
+    saveSettings({
+      checkBridgeAfterSave: false,
+      savedPrefix: "Activity log panel default saved."
+    }).catch((error) => setStatus(error.message || String(error)));
+  });
+}
+
 window.addEventListener("error", (event) => {
   if (!isExtensionContextInvalidated(event?.error || event?.message)) {
     return;
@@ -805,6 +1269,7 @@ window.addEventListener("unhandledrejection", (event) => {
 (async () => {
   try {
     await loadSettings();
+    await loadRuntimeConfig();
   } catch (error) {
     const message = error.message || String(error);
     setStatus(message);

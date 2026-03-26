@@ -135,6 +135,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        shell_mode_override: str | None = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -163,7 +164,9 @@ class ProcessRegistry:
                 else:
                     from ptyprocess import PtyProcess as _PtyProcessCls
                 pty_args, _, shell_mode = build_local_subprocess_invocation(
-                    command, session.cwd
+                    command,
+                    session.cwd,
+                    shell_override=shell_mode_override,
                 )
                 if not isinstance(pty_args, list):
                     logger.warning(
@@ -206,7 +209,9 @@ class ProcessRegistry:
 
         # Standard Popen path (non-PTY or PTY fallback)
         popen_args, popen_platform_kwargs, _ = build_local_subprocess_invocation(
-            command, session.cwd
+            command,
+            session.cwd,
+            shell_override=shell_mode_override,
         )
         # Force unbuffered output for Python scripts so progress is visible
         # during background execution (libraries like tqdm/datasets buffer when

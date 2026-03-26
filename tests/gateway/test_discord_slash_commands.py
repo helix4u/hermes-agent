@@ -38,7 +38,7 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+from gateway.platforms.discord import DiscordAdapter, _extract_listen_sections  # noqa: E402
 
 
 class FakeTree:
@@ -137,6 +137,29 @@ async def test_run_post_ready_startup_syncs_commands_and_registers_persistent_li
     view_cls.assert_called_once_with(adapter)
     adapter._client.add_view.assert_called_once_with(sentinel_view)
     assert adapter._listen_view_registered is True
+
+
+def test_extract_listen_sections_prefers_action_response_body_for_answer():
+    text = (
+        "<ʞᴎiʜƚ>\nInitial Reaction:\nThinky bits.\n</ʞᴎiʜƚ>\n"
+        "Action / Response:\n"
+        "This is the user-facing answer.\n"
+        "Second line."
+    )
+
+    sections = _extract_listen_sections(text)
+
+    assert sections["knight"] == "Initial Reaction:\nThinky bits."
+    assert sections["answer"] == "This is the user-facing answer.\nSecond line."
+
+
+def test_extract_listen_sections_falls_back_to_non_knight_content_without_marker():
+    text = "<ʞᴎiʜƚ>\nInner monologue\n</ʞᴎiʜƚ>\nVisible answer only."
+
+    sections = _extract_listen_sections(text)
+
+    assert sections["knight"] == "Inner monologue"
+    assert sections["answer"] == "Visible answer only."
 
 
 @pytest.mark.asyncio

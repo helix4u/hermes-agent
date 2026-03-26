@@ -389,7 +389,8 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
 
     def _execute_oneshot(self, command: str, cwd: str = "", *,
                          timeout: int | None = None,
-                         stdin_data: str | None = None) -> dict:
+                         stdin_data: str | None = None,
+                         shell_mode_override: str | None = None) -> dict:
         work_dir = cwd or self.cwd or os.getcwd()
         effective_timeout = timeout or self.timeout
         exec_command, sudo_stdin = self._prepare_command(command)
@@ -403,7 +404,9 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
 
         shell_command = exec_command
         popen_args, popen_platform_kwargs, shell_mode = build_local_subprocess_invocation(
-            shell_command, work_dir
+            shell_command,
+            work_dir,
+            shell_override=shell_mode_override,
         )
         if shell_mode in {"posix", "wsl"}:
             shell_command = (
@@ -414,7 +417,9 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
                 f" exit $__hermes_rc"
             )
             popen_args, popen_platform_kwargs, shell_mode = build_local_subprocess_invocation(
-                shell_command, work_dir
+                shell_command,
+                work_dir,
+                shell_override=shell_mode_override,
             )
 
         proc = subprocess.Popen(

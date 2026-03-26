@@ -336,7 +336,12 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     last_result = None
     for chunk in chunks:
         if platform == Platform.DISCORD:
-            result = await _send_discord(pconfig.token, chat_id, chunk)
+            result = await _send_discord(
+                pconfig.token,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+            )
         elif platform == Platform.SLACK:
             result = await _send_slack(pconfig.token, chat_id, chunk)
         elif platform == Platform.WHATSAPP:
@@ -482,20 +487,24 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return {"error": f"Telegram send failed: {e}"}
 
 
-async def _send_discord(token, chat_id, message):
+async def _send_discord(token, chat_id, message, *, thread_id=None):
     """Send a single Discord message via REST using the normal embed format."""
     try:
         import aiohttp
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
-        url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
+        from gateway.platforms.discord import build_discord_listen_components
+
+        target_channel_id = thread_id or chat_id
+        url = f"https://discord.com/api/v10/channels/{target_channel_id}/messages"
         headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
         if not message:
             return {"error": "Discord send failed: message is empty"}
         async with aiohttp.ClientSession() as session:
             payload = {
                 "embeds": [{"description": message}],
+                "components": build_discord_listen_components(),
                 "allowed_mentions": {"parse": []},
             }
             async with session.post(url, headers=headers, json=payload) as resp:
@@ -503,7 +512,13 @@ async def _send_discord(token, chat_id, message):
                     body = await resp.text()
                     return {"error": f"Discord API error ({resp.status}): {body}"}
                 data = await resp.json()
-        return {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": data.get("id")}
+        return {
+            "success": True,
+            "platform": "discord",
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "message_id": data.get("id"),
+        }
     except Exception as e:
         return {"error": f"Discord send failed: {e}"}
 

@@ -39,6 +39,10 @@ const voiceInputButton = document.getElementById("voice-input-button");
 const voiceRecorderSheet = document.getElementById("voice-recorder-sheet");
 const voiceRecorderSheetStatus = document.getElementById("voice-recorder-sheet-status");
 const voiceRecorderCloseButton = document.getElementById("voice-recorder-close-button");
+const activityLogPanel = document.getElementById("activity-log-panel");
+const activityLogPre = document.getElementById("activity-log-pre");
+const activityLogBadge = document.getElementById("activity-log-badge");
+const openControlRoomButton = document.getElementById("open-control-room-button");
 const composer = chatInput?.closest(".composer");
 const STATUS_INLINE_MAX_CHARS = 220;
 const STATUS_INLINE_MAX_LINES = 3;
@@ -64,6 +68,8 @@ let refreshDebounceTimer = null;
 let previewInFlight = false;
 let currentMessages = [];
 let currentProgress = null;
+/** Last gateway progress payload (keeps activity_log after a turn finishes). */
+let lastProgressSnapshot = null;
 let pendingUserMessage = null;
 let lastPreview = null;
 let sharePageByDefault = true;
@@ -96,7 +102,9 @@ let sidebarSettings = {
   challengeModePrompt: "",
   themeName: window.HermesTheme?.defaultThemeId || "obsidian",
   customThemeAccent: "#9ca3af",
-  customThemes: []
+  customThemes: [],
+  sidecarActivityLogLevel: "normal",
+  activityLogPanelOpen: false
 };
 
 window.HermesTheme?.applyThemeToDocument({
@@ -186,6 +194,36 @@ function summarizeStatusMessage(message, fallback = "Working...") {
   return firstLine;
 }
 
+function sliceActivityLogEvents(events, level) {
+  const list = Array.isArray(events) ? events.slice() : [];
+  const normalized = String(level || "normal").toLowerCase();
+  if (normalized === "minimal") {
+    return list.slice(-8);
+  }
+  if (normalized === "verbose") {
+    return list;
+  }
+  return list.slice(-40);
+}
+
+function syncActivityLogUi() {
+  if (!activityLogPre) {
+    return;
+  }
+  const progress = lastProgressSnapshot;
+  const raw = progress?.activity_log || progress?.recent_events || [];
+  const level = String(sidebarSettings.sidecarActivityLogLevel || "normal").toLowerCase();
+  const lines = sliceActivityLogEvents(raw, level);
+  activityLogPre.textContent = lines.length
+    ? lines.join("\n")
+    : "(No gateway activity captured for this session yet.)";
+  if (activityLogBadge) {
+    const total = raw.length;
+    const shown = lines.length;
+    activityLogBadge.textContent = total === 0 ? "0 lines" : `${shown}/${total} lines`;
+  }
+}
+
 function setStatus(message, { openActivity = false } = {}) {
   const summarized = summarizeStatusMessage(message, "Waiting for input.");
   const inlineMessage = compactStatusText(summarized, {
@@ -210,6 +248,89 @@ function setStatus(message, { openActivity = false } = {}) {
 
 function getMessageText(message) {
   return String(message?.display_content || message?.content || "").trim();
+}
+
+function extractTaggedReplySections(rawText) {
+  const full = String(rawText || "").trim();
+  if (!full) {
+    return { full: "", knight: "", answer: "" };
+  }
+  const pattern = /<ʞᴎiʜƚ>([\s\S]*?)<\/ʞᴎiʜƚ>/gi;
+  const knightParts = [];
+  let match;
+  while ((match = pattern.exec(full)) !== null) {
+    const value = String(match[1] || "").trim();
+    if (value) {
+      knightParts.push(value);
+    }
+  }
+  const knight = knightParts.join("\n\n").trim();
+  const answer = full.replace(pattern, "").trim();
+  return { full, knight, answer };
+}
+
+function buildReplyActionSpecs(message) {
+  const full = getMessageText(message);
+  const sections = extractTaggedReplySections(full);
+  const key = messageKey(message);
+
+  if (sections.knight || sections.answer) {
+    return [
+      sections.knight
+        ? {
+            kind: "copy",
+            label: "Copy ʞᴎiʜƚ",
+            text: sections.knight,
+            successMessage: "ʞᴎiʜƚ section copied to clipboard.",
+            errorMessage: "Could not copy the ʞᴎiʜƚ section.",
+          }
+        : null,
+      sections.answer
+        ? {
+            kind: "copy",
+            label: "Copy answer",
+            text: sections.answer,
+            successMessage: "Answer section copied to clipboard.",
+            errorMessage: "Could not copy the answer section.",
+          }
+        : null,
+      sections.knight
+        ? {
+            kind: "speak",
+            label: "Read ʞᴎiʜƚ",
+            text: sections.knight,
+            audioKey: `${key}:knight`,
+            errorMessage: "Could not generate Hermes TTS audio for the ʞᴎiʜƚ section.",
+          }
+        : null,
+      sections.answer
+        ? {
+            kind: "speak",
+            label: "Read answer",
+            text: sections.answer,
+            audioKey: `${key}:answer`,
+            errorMessage: "Could not generate Hermes TTS audio for the answer section.",
+          }
+        : null,
+    ].filter(Boolean);
+  }
+
+  return [
+    {
+      kind: "copy",
+      label: "Copy",
+      text: full,
+      successMessage: "Reply copied to clipboard.",
+      errorMessage: "Could not copy this reply.",
+    },
+    {
+      kind: "speak",
+      label: "Read aloud",
+      text: full,
+      audioKey: key,
+      errorMessage: "Could not generate Hermes TTS audio.",
+    },
+  ];
 }
 
 async function copyTextToClipboard(text) {
@@ -314,34 +435,93 @@ function appendTranscriptToComposer(value) {
   chatInput.setSelectionRange(chatInput.value.length, chatInput.value.length);
 }
 
+async function getMicrophonePermissionState() {
+  if (!navigator.permissions?.query) {
+    return "unknown";
+  }
+  try {
+    const status = await navigator.permissions.query({ name: "microphone" });
+    return String(status?.state || "unknown");
+  } catch (_error) {
+    return "unknown";
+  }
+}
+
+function buildVoiceAudioConstraints(selectedDeviceId = "", captureMode = "raw") {
+  const normalizedMode = String(captureMode || "").trim().toLowerCase() === "speech" ? "speech" : "raw";
+  const constraints = normalizedMode === "speech"
+    ? {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: { ideal: 1 }
+      }
+    : {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: { ideal: 1 }
+      };
+  const normalizedDeviceId = String(selectedDeviceId || "").trim();
+  if (normalizedDeviceId) {
+    constraints.deviceId = { exact: normalizedDeviceId };
+  }
+  return constraints;
+}
+
+async function ensureMicrophoneCapturePermission(selectedDeviceId = "", captureMode = "raw") {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error("This browser does not support microphone capture from extension pages.");
+  }
+  const permissionState = await getMicrophonePermissionState();
+  if (permissionState === "granted") {
+    return;
+  }
+  if (permissionState === "denied") {
+    throw new Error("Microphone access is blocked for this extension. Re-enable it in Chrome site permissions or Hermes Options.");
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: buildVoiceAudioConstraints(selectedDeviceId, captureMode)
+  });
+  for (const track of stream.getTracks()) {
+    track.stop();
+  }
+}
+
 async function toggleVoiceRecording() {
   if (voiceTranscriptionPending) {
     return;
   }
 
   if (voiceRecordingActive) {
-    await sendRuntimeMessage({ type: "hermes:stop-voice-recording" });
     voiceInputChannel?.postMessage({ type: "hermes:stop-recording" });
     setVoiceRecorderSheetVisible(true, "Voice note captured. Hermes is transcribing it now...");
     setStatus("Stopping voice recording...", { openActivity: true });
     return;
   }
 
-  setVoiceRecorderSheetVisible(
-    true,
-    "Recording will start as soon as microphone access is available. If needed, enable microphone access from the Sidecar options page first."
-  );
-  const settingsResponse = await sendRuntimeMessage({ type: "hermes:get-settings" });
-  const selectedDeviceId = String(settingsResponse.settings?.audioInputDeviceId || "").trim();
-  await sendRuntimeMessage({ type: "hermes:ensure-offscreen-voice-recorder" });
-  voiceInputChannel?.postMessage({
-    type: "hermes:start-recording",
-    deviceId: selectedDeviceId,
-    captureMode: "raw"
-  });
-  voiceRecordingActive = true;
-  updateComposerAvailability();
-  setStatus("Recording voice note from the sidecar...", { openActivity: true });
+  setVoiceRecorderSheetVisible(true, "Requesting microphone access if needed...");
+  try {
+    const settingsResponse = await sendRuntimeMessage({ type: "hermes:get-settings" });
+    const selectedDeviceId = String(settingsResponse.settings?.audioInputDeviceId || "").trim();
+    await ensureMicrophoneCapturePermission(selectedDeviceId, "raw");
+    await sendRuntimeMessage({ type: "hermes:ensure-offscreen-voice-recorder" });
+    voiceInputChannel?.postMessage({
+      type: "hermes:start-recording",
+      deviceId: selectedDeviceId,
+      captureMode: "raw"
+    });
+    voiceRecordingActive = true;
+    updateComposerAvailability();
+    setStatus("Starting voice recording...", { openActivity: true });
+  } catch (error) {
+    voiceRecordingActive = false;
+    voiceTranscriptionPending = false;
+    updateComposerAvailability();
+    const message = String(error?.message || error);
+    setVoiceRecorderSheetVisible(true, message);
+    throw error;
+  }
 }
 
 function clearReplyAudioState() {
@@ -377,13 +557,13 @@ function decodeBase64Audio(base64Text) {
   return bytes;
 }
 
-async function speakReply(message) {
-  const text = getMessageText(message);
+async function speakReply(message, options = {}) {
+  const text = String(options.text || getMessageText(message)).trim();
   if (!text) {
     return;
   }
 
-  const nextKey = messageKey(message);
+  const nextKey = String(options.audioKey || messageKey(message)).trim() || messageKey(message);
   if (activeAudioMessageKey === nextKey) {
     stopReplySpeech();
     return;
@@ -898,8 +1078,21 @@ function applySidebarSettings(settings, { preserveBusyState = false } = {}) {
       window.HermesTheme?.defaultThemeId ||
       "obsidian",
     customThemeAccent: String(nextSettings.customThemeAccent || "#9ca3af").trim() || "#9ca3af",
-    customThemes: Array.isArray(nextSettings.customThemes) ? nextSettings.customThemes : []
+    customThemes: Array.isArray(nextSettings.customThemes) ? nextSettings.customThemes : [],
+    sidecarActivityLogLevel: (() => {
+      const raw = String(nextSettings.sidecarActivityLogLevel || "normal").toLowerCase();
+      if (raw === "minimal" || raw === "verbose") {
+        return raw;
+      }
+      return "normal";
+    })(),
+    activityLogPanelOpen: nextSettings.activityLogPanelOpen === true
   };
+
+  if (activityLogPanel) {
+    activityLogPanel.open = sidebarSettings.activityLogPanelOpen === true;
+  }
+  syncActivityLogUi();
 
   window.HermesTheme?.applyThemeToDocument(sidebarSettings);
   includeTranscript.checked = nextSettings.includeTranscriptByDefault !== false;
@@ -1672,38 +1865,34 @@ function renderMessages(
       const actions = document.createElement("div");
       actions.className = "message-actions";
 
-      const copyButton = document.createElement("button");
-      copyButton.className = "message-action-button";
-      copyButton.type = "button";
-      copyButton.textContent = "Copy";
-      copyButton.title = "Copy this reply to your clipboard";
-      copyButton.addEventListener("click", async () => {
-        try {
-          await copyTextToClipboard(getMessageText(message));
-          setStatus("Reply copied to clipboard.");
-        } catch (error) {
-          setStatus(error?.message || "Could not copy this reply.");
+      for (const action of buildReplyActionSpecs(message)) {
+        const button = document.createElement("button");
+        button.className = "message-action-button";
+        button.type = "button";
+        if (action.kind === "speak") {
+          const isSpeaking = activeAudioMessageKey === action.audioKey;
+          if (isSpeaking) {
+            button.classList.add("is-active");
+          }
+          button.textContent = isSpeaking ? "Stop audio" : action.label;
+          button.addEventListener("click", () => {
+            speakReply(message, { text: action.text, audioKey: action.audioKey }).catch((error) => {
+              setStatus(error?.message || action.errorMessage, { openActivity: true });
+            });
+          });
+        } else {
+          button.textContent = action.label;
+          button.addEventListener("click", async () => {
+            try {
+              await copyTextToClipboard(action.text);
+              setStatus(action.successMessage);
+            } catch (error) {
+              setStatus(error?.message || action.errorMessage);
+            }
+          });
         }
-      });
-      actions.appendChild(copyButton);
-
-      const speakButton = document.createElement("button");
-      speakButton.className = "message-action-button";
-      speakButton.type = "button";
-      const isSpeaking = activeAudioMessageKey === messageKey(message);
-      if (isSpeaking) {
-        speakButton.classList.add("is-active");
+        actions.appendChild(button);
       }
-      speakButton.textContent = isSpeaking ? "Stop audio" : "Read aloud";
-      speakButton.title = isSpeaking
-        ? "Stop Hermes TTS playback for this reply"
-        : "Read this reply aloud using Hermes' configured TTS voice";
-      speakButton.addEventListener("click", () => {
-        speakReply(message).catch((error) => {
-          setStatus(error?.message || "Could not generate Hermes TTS audio.", { openActivity: true });
-        });
-      });
-      actions.appendChild(speakButton);
 
       bubble.appendChild(actions);
     }
@@ -1923,6 +2112,9 @@ async function loadChatSession({ quiet = false, sessionKey = "" } = {}) {
 
   currentMessages = incomingMessages;
   currentProgress = response.result?.progress || null;
+  if (response.result?.progress && typeof response.result.progress === "object") {
+    lastProgressSnapshot = response.result.progress;
+  }
   updateComposerAvailability();
   clearPendingIfAcknowledged();
 
@@ -1947,6 +2139,7 @@ async function loadChatSession({ quiet = false, sessionKey = "" } = {}) {
       );
       setStatus("Your turn is still queued. Waiting for queue state to sync...", { openActivity: true });
       schedulePolling();
+      syncActivityLogUi();
       return;
     }
 
@@ -1963,6 +2156,8 @@ async function loadChatSession({ quiet = false, sessionKey = "" } = {}) {
     setBusyState(false);
     stopPolling();
   }
+
+  syncActivityLogUi();
 
   if (sessionKeyChanged && quiet) {
     loadSessionHistory({ quiet: true, preferredSessionKey: incomingSessionKey }).catch(() => {});
@@ -2372,6 +2567,10 @@ document.getElementById("open-options-button").addEventListener("click", () => {
   chrome.runtime.openOptionsPage();
 });
 
+openControlRoomButton?.addEventListener("click", () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL("control-room.html") });
+});
+
 if (challengeModeButton) {
   challengeModeButton.addEventListener("click", () => {
     setChallengeModeEnabled(!challengeModeEnabled);
@@ -2469,6 +2668,14 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     setVoiceRecorderSheetVisible(true, String(payload.error || "Voice input failed."));
     updateComposerAvailability();
     setStatus(String(payload.error || "Voice input failed."), { openActivity: true });
+    return;
+  }
+
+  if (type === "closed") {
+    voiceRecordingActive = false;
+    voiceTranscriptionPending = false;
+    setVoiceRecorderSheetVisible(false);
+    updateComposerAvailability();
   }
 });
 
@@ -2495,6 +2702,14 @@ if (voiceInputChannel) {
       setVoiceRecorderSheetVisible(true, String(payload.error || "Voice input failed."));
       updateComposerAvailability();
       setStatus(String(payload.error || "Voice input failed."), { openActivity: true });
+      return;
+    }
+
+    if (type === "closed") {
+      voiceRecordingActive = false;
+      voiceTranscriptionPending = false;
+      setVoiceRecorderSheetVisible(false);
+      updateComposerAvailability();
     }
   });
 }
@@ -2730,4 +2945,23 @@ syncPreviewPollingUi();
   }
 
   setChallengeModeEnabled(false);
+
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "sync") {
+        return;
+      }
+      const keys = [
+        "sidecarActivityLogLevel",
+        "activityLogPanelOpen",
+        "wikiBaseUrl"
+      ];
+      if (!keys.some((key) => Object.prototype.hasOwnProperty.call(changes, key))) {
+        return;
+      }
+      loadSettings().catch(() => {});
+    });
+  } catch (_error) {
+    // Ignore if storage API unavailable.
+  }
 })();

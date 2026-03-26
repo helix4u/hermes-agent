@@ -6,6 +6,8 @@ Never push to a remote unless the user explicitly asks. Human testing is require
 
 On the design principle: we want one host-aware path layer so Windows, Linux, and macOS all work out of the box.
 
+Always update docs. At the time of writing this there is a large lack of documentation, including the readme. We also need install scripts for windows. A .bat is fine for me, a .ps1 is fine too, but we need a way to get this installable from windows as well without the need for wsl if necissary.
+
 ## Development Environment
 
 ```bash
@@ -67,6 +69,13 @@ hermes-agent/
 ```
 
 **User config:** `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys)
+
+## Fast orientation docs
+
+- Repo map: `docs/repo-map.md`
+- Cross-session goals: `docs/todo.md`
+- Tool and shell registry: `docs/tool-registry.md`
+- User-visible changes: `CHANGELOG.md`
 
 ## File Dependency Chain
 
@@ -357,6 +366,14 @@ in config.yaml (or `HERMES_BACKGROUND_NOTIFICATIONS` env var):
 - `result` — only the final completion message
 - `error` — only the final message when exit code != 0
 - `off` — no watcher messages at all
+
+---
+
+## Changelog and user-visible changes
+
+- Keep **repo root `CHANGELOG.md`** updated when behavior users see changes (CLI, gateway, browser extension, default configs). Use a short **Unreleased** section with bullets; trim on release if your process moves entries elsewhere.
+- When you ship sidecar/extension or gateway UX changes, mention **where to configure** (e.g. extension Options) and any **defaults** (URLs, limits).
+- Hermes instances with a **SOUL.md / MEMORY.md** in the user workspace: after substantive product changes, suggest a one-line memory or doc pointer so the running agent knows to skim **`CHANGELOG.md`** (or this section) for recent deltas.
 
 ---
 

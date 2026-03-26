@@ -410,7 +410,50 @@ class TestSendToPlatformChunking:
 
         assert result["success"] is True
         assert captured["json"]["embeds"] == [{"description": "hello discord"}]
+        assert captured["json"]["components"][0]["components"][0]["custom_id"] == "hermes:listen:full"
+        assert captured["json"]["components"][0]["components"][1]["custom_id"] == "hermes:listen:knight"
+        assert captured["json"]["components"][0]["components"][2]["custom_id"] == "hermes:listen:answer"
         assert captured["json"]["allowed_mentions"] == {"parse": []}
+
+    def test_discord_rest_sender_uses_thread_id_as_target_channel(self, monkeypatch):
+        captured = {}
+
+        class _FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def text(self):
+                return ""
+
+            async def json(self):
+                return {"id": "mid-thread"}
+
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, headers=None, json=None):
+                captured["url"] = url
+                captured["json"] = json
+                return _FakeResponse()
+
+        aiohttp_mod = SimpleNamespace(ClientSession=lambda: _FakeSession())
+        monkeypatch.setitem(sys.modules, "aiohttp", aiohttp_mod)
+
+        from tools.send_message_tool import _send_discord
+
+        result = asyncio.run(_send_discord("tok", "1234", "hello discord", thread_id="5678"))
+
+        assert result["success"] is True
+        assert captured["url"].endswith("/channels/5678/messages")
 
     def test_telegram_media_attaches_to_last_chunk(self):
         """When chunked, media files are sent only with the last chunk."""

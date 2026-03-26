@@ -1290,9 +1290,11 @@ class SessionDB:
 
     def search_messages(
         self,
-        query: str,
+        query: str = "",
         source_filter: List[str] = None,
         role_filter: List[str] = None,
+        since_ts: Optional[float] = None,
+        until_ts: Optional[float] = None,
         limit: int = 20,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
@@ -1308,16 +1310,23 @@ class SessionDB:
         Returns matching messages with session metadata, content snippet,
         and surrounding context (1 message before and after the match).
         """
-        if not query or not query.strip():
+        normalized_query = (query or "").strip()
+        if not normalized_query and since_ts is None and until_ts is None:
             return []
 
-        query = self._sanitize_fts5_query(query)
-        if not query:
-            return []
+        using_fts = bool(normalized_query)
+        if using_fts:
+            normalized_query = self._sanitize_fts5_query(normalized_query)
+            if not normalized_query:
+                return []
 
         # Build WHERE clauses dynamically
-        where_clauses = ["messages_fts MATCH ?"]
-        params: list = [query]
+        where_clauses = []
+        params: list = []
+
+        if using_fts:
+            where_clauses.append("messages_fts MATCH ?")
+            params.append(normalized_query)
 
         if source_filter is not None:
             source_placeholders = ",".join("?" for _ in source_filter)
@@ -1329,28 +1338,56 @@ class SessionDB:
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
 
+        if since_ts is not None:
+            where_clauses.append("m.timestamp >= ?")
+            params.append(float(since_ts))
+
+        if until_ts is not None:
+            where_clauses.append("m.timestamp <= ?")
+            params.append(float(until_ts))
+
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
 
-        sql = f"""
-            SELECT
-                m.id,
-                m.session_id,
-                m.role,
-                snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
-                m.content,
-                m.timestamp,
-                m.tool_name,
-                s.source,
-                s.model,
-                s.started_at AS session_started
-            FROM messages_fts
-            JOIN messages m ON m.id = messages_fts.rowid
-            JOIN sessions s ON s.id = m.session_id
-            WHERE {where_sql}
-            ORDER BY rank
-            LIMIT ? OFFSET ?
-        """
+        if using_fts:
+            sql = f"""
+                SELECT
+                    m.id,
+                    m.session_id,
+                    m.role,
+                    snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
+                    m.content,
+                    m.timestamp,
+                    m.tool_name,
+                    s.source,
+                    s.model,
+                    s.started_at AS session_started
+                FROM messages_fts
+                JOIN messages m ON m.id = messages_fts.rowid
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {where_sql}
+                ORDER BY rank
+                LIMIT ? OFFSET ?
+            """
+        else:
+            sql = f"""
+                SELECT
+                    m.id,
+                    m.session_id,
+                    m.role,
+                    '' AS snippet,
+                    m.content,
+                    m.timestamp,
+                    m.tool_name,
+                    s.source,
+                    s.model,
+                    s.started_at AS session_started
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {where_sql}
+                ORDER BY m.timestamp DESC, m.id DESC
+                LIMIT ? OFFSET ?
+            """
 
         with self._lock:
             try:
@@ -1379,6 +1416,10 @@ class SessionDB:
 
         # Remove full content from result (snippet is enough, saves tokens)
         for match in matches:
+            if not match.get("snippet"):
+                content = str(match.get("content") or "").replace("\n", " ").strip()
+                if content:
+                    match["snippet"] = content[:200] + ("..." if len(content) > 200 else "")
             match.pop("content", None)
 
         return matches
@@ -1386,21 +1427,31 @@ class SessionDB:
     def search_sessions(
         self,
         source: str = None,
+        since_ts: Optional[float] = None,
+        until_ts: Optional[float] = None,
         limit: int = 20,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """List sessions, optionally filtered by source."""
         with self._lock:
+            where_clauses = []
+            params: List[Any] = []
             if source:
-                cursor = self._conn.execute(
-                    "SELECT * FROM sessions WHERE source = ? ORDER BY started_at DESC LIMIT ? OFFSET ?",
-                    (source, limit, offset),
-                )
-            else:
-                cursor = self._conn.execute(
-                    "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
-                )
+                where_clauses.append("source = ?")
+                params.append(source)
+            if since_ts is not None:
+                where_clauses.append("started_at >= ?")
+                params.append(float(since_ts))
+            if until_ts is not None:
+                where_clauses.append("started_at <= ?")
+                params.append(float(until_ts))
+
+            sql = "SELECT * FROM sessions"
+            if where_clauses:
+                sql += " WHERE " + " AND ".join(where_clauses)
+            sql += " ORDER BY started_at DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+            cursor = self._conn.execute(sql, params)
             return [dict(row) for row in cursor.fetchall()]
 
     # =========================================================================
