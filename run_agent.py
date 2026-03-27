@@ -5419,7 +5419,7 @@ class AIAgent:
                     goal_preview = (function_args.get("goal") or "")[:30]
                     spinner_label = f"🔀 {goal_preview}" if goal_preview else "🔀 delegating"
                 spinner = None
-                if self.quiet_mode:
+                if self.quiet_mode and not (self.thinking_callback or self.tool_progress_callback):
                     face = random.choice(KawaiiSpinner.KAWAII_WAITING)
                     spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots')
                     spinner.start()
@@ -5443,7 +5443,7 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self.quiet_mode:
                         self._vprint(f"  {cute_msg}")
-            elif self.quiet_mode:
+            elif self.quiet_mode and not (self.thinking_callback or self.tool_progress_callback):
                 face = random.choice(KawaiiSpinner.KAWAII_WAITING)
                 emoji = _get_tool_emoji(function_name)
                 preview = _build_tool_preview(function_name, function_args) or function_name

@@ -989,6 +989,34 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
+    def test_single_tool_skips_raw_spinner_when_progress_callback_present(self, agent):
+        tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        progress_callback = MagicMock()
+        agent.tool_progress_callback = progress_callback
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch("run_agent.KawaiiSpinner") as mock_spinner,
+        ):
+            agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        mock_spinner.assert_not_called()
+        assert progress_callback.call_count == 2
+        start_call, finish_call = progress_callback.call_args_list
+        assert start_call.args[0] == "web_search"
+        assert start_call.args[2] == {"q": "test"}
+        assert finish_call.args[0] == "_tool_result"
+        assert finish_call.args[1] == "web_search"
+        assert finish_call.args[2]["tool"] == "web_search"
+        assert isinstance(finish_call.args[2]["duration_seconds"], (int, float))
+        assert finish_call.args[2]["is_error"] is False
+        assert finish_call.args[2]["status_suffix"] == ""
+        assert finish_call.args[2]["result"] == "search result"
+        assert len(messages) == 1
+        assert messages[0]["role"] == "tool"
+
     def test_interrupt_skips_remaining(self, agent):
         tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments="{}", call_id="c2")

@@ -26,6 +26,7 @@ All notable user-visible changes to this project are documented here. Agents and
 ### Gateway
 
 - **Browser bridge progress**: While the agent runs a **browser sidecar** turn, `_run_agent` mirrors each progress line into `_browser_bridge_progress` so the extension poll sees the same stream as messaging platforms (without requiring a `Platform.LOCAL` messaging adapter).
+- **Quiet-mode tool spinners**: Gateway sessions with live tool/thinking progress enabled no longer start the raw quiet-mode tool spinner underneath. This avoids stale animated lines like long-running `read`/`grep`/`patch` spinners lingering after the real progress feed has already moved on.
 - **Session inspection**: Browser bridge `/session` `inspect` now returns persisted audit events, derived audit metrics, delegation/branch summaries, and per-tool benchmark rollups in addition to transcript, saved session-log JSON, tool counts, role counts, source details, and Hermes paths.
 - **Runtime config bridge**: Browser bridge `/session` now supports `runtime_config_get`, `runtime_config_save`, `runtime_provider_models`, and `recall_search`, allowing extension surfaces to read/write Hermes runtime settings and call the session-recall backend when needed.
 - **Optional tool deps**: Gateway/browser-bridge startup no longer hard-fails in environments missing `fal_client`; the image-generation tool now degrades cleanly behind its own requirement checks.
