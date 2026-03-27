@@ -26,6 +26,8 @@ All notable user-visible changes to this project are documented here. Agents and
 ### Gateway
 
 - **Browser bridge progress**: While the agent runs a **browser sidecar** turn, `_run_agent` mirrors each progress line into `_browser_bridge_progress` so the extension poll sees the same stream as messaging platforms (without requiring a `Platform.LOCAL` messaging adapter).
+- **Concurrent tool progress**: Concurrent tool batches now emit each tool's completion update as soon as that tool finishes instead of waiting for the whole batch, which keeps sidecar/gateway sessions from looking dead during mixed fast/slow searches.
+- **Long-tool heartbeats**: Gateway progress now emits periodic `still running` updates for long-lived tools, so browser sidecar and console users can see that Hermes is alive even when a search or shell task is taking a while.
 - **Quiet-mode tool spinners**: Gateway sessions with live tool/thinking progress enabled no longer start the raw quiet-mode tool spinner underneath. This avoids stale animated lines like long-running `read`/`grep`/`patch` spinners lingering after the real progress feed has already moved on.
 - **Session inspection**: Browser bridge `/session` `inspect` now returns persisted audit events, derived audit metrics, delegation/branch summaries, and per-tool benchmark rollups in addition to transcript, saved session-log JSON, tool counts, role counts, source details, and Hermes paths.
 - **Runtime config bridge**: Browser bridge `/session` now supports `runtime_config_get`, `runtime_config_save`, `runtime_provider_models`, and `recall_search`, allowing extension surfaces to read/write Hermes runtime settings and call the session-recall backend when needed.
@@ -41,6 +43,8 @@ All notable user-visible changes to this project are documented here. Agents and
 ### Terminal and docs
 
 - **Fork install targeting**: The documented install commands and bundled install scripts now target `helix4u/hermes-agent` instead of upstream `NousResearch/hermes-agent`, so fresh installs and checkout bootstraps land on this fork by default.
+- **Filename-aware search defaults**: `search_files` now auto-infers `target='files'` for filename/glob/full-path patterns like `*.py` or `D:\...\clip.mp4` when the model omits `target`, which avoids the common “content search on a filename” stall during sidecar/browser tasks.
+- **Search visibility and deadlines**: `search_files` previews now include mode/path context instead of only the raw pattern, and Windows local-backend searches now return partial results with a timeout warning after 15 seconds instead of sitting silently inside a native filesystem walk.
 - **Windows bootstrap scripts**: Added repo-local Windows bootstrap scripts at `scripts/bootstrap-windows.ps1` and `scripts/bootstrap-windows.bat` so an existing checkout can be set up for native Windows development without WSL, plus README coverage for both the fresh installer and local bootstrap path.
 - **Windows terminal order**: Windows local shell auto-selection now prefers `cmd.exe`, then PowerShell, then WSL, which is a better default for mainstream Windows installs.
 - **Per-command shell override**: The terminal tool now supports a Windows-only `shell_mode` override so advanced flows can deliberately mix `cmd`, PowerShell, and WSL work in one broader task.

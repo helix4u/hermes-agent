@@ -29,6 +29,7 @@ import os
 import re
 import json
 import difflib
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
@@ -73,6 +74,11 @@ WRITE_DENIED_PREFIXES = [
         "/etc/systemd",
     ]
 ]
+
+
+# Native Python search on Windows local backends is convenient, but it can
+# otherwise walk very large trees with no shell-level timeout protection.
+_WINDOWS_NATIVE_SEARCH_TIMEOUT_SECONDS = 15.0
 
 
 def _get_safe_write_root() -> Optional[str]:
@@ -194,6 +200,7 @@ class SearchResult:
     total_count: int = 0
     truncated: bool = False
     error: Optional[str] = None
+    warning: Optional[str] = None
     
     def to_dict(self) -> dict:
         result = {"total_count": self.total_count}
@@ -210,6 +217,8 @@ class SearchResult:
             result["truncated"] = True
         if self.error:
             result["error"] = self.error
+        if self.warning:
+            result["warning"] = self.warning
         return result
 
 
@@ -1093,6 +1102,15 @@ class ShellFileOperations(FileOperations):
         if not os.path.exists(base_path):
             return SearchResult(error=f"Path not found: {base_path}", total_count=0)
 
+        deadline = time.monotonic() + _WINDOWS_NATIVE_SEARCH_TIMEOUT_SECONDS
+        timeout_warning = (
+            f"Windows-native search timed out after {_WINDOWS_NATIVE_SEARCH_TIMEOUT_SECONDS:.0f}s "
+            f"while scanning {base_path}. Results may be incomplete."
+        )
+
+        def _timed_out() -> bool:
+            return time.monotonic() >= deadline
+
         if target == "files":
             search_pattern = pattern
             if not any(ch in search_pattern for ch in ("*", "?", "[", "]")):
@@ -1104,8 +1122,12 @@ class ShellFileOperations(FileOperations):
                     matches = [base_path]
             else:
                 for root, dirs, files in os.walk(base_path):
+                    if _timed_out():
+                        break
                     dirs[:] = [name for name in dirs if not name.startswith(".")]
                     for name in files:
+                        if _timed_out():
+                            break
                         if name.startswith("."):
                             continue
                         full = os.path.join(root, name)
@@ -1116,22 +1138,36 @@ class ShellFileOperations(FileOperations):
 
             total = len(matches)
             page = matches[offset:offset + limit]
-            return SearchResult(files=page, total_count=total, truncated=total > offset + limit)
+            timed_out = _timed_out()
+            return SearchResult(
+                files=page,
+                total_count=total,
+                truncated=timed_out or total > offset + limit,
+                warning=timeout_warning if timed_out else None,
+            )
 
         try:
             regex = re.compile(pattern)
         except re.error as e:
             return SearchResult(error=f"Invalid regex pattern: {e}", total_count=0)
 
+        content_matches = []
+        files_only = set()
+        counts = {}
+
         if os.path.isfile(base_path):
             files_to_scan = [base_path]
         else:
             files_to_scan = []
             for root, dirs, files in os.walk(base_path):
+                if _timed_out():
+                    break
                 # Mirror ripgrep's default behavior on Windows: don't descend
                 # into hidden dot-directories like .git or .venv.
                 dirs[:] = [name for name in dirs if not name.startswith(".")]
                 for name in files:
+                    if _timed_out():
+                        break
                     if name.startswith("."):
                         continue
                     if file_glob and not fnmatch.fnmatch(name, file_glob):
@@ -1144,46 +1180,61 @@ class ShellFileOperations(FileOperations):
                         continue
                     files_to_scan.append(full_path)
 
-        content_matches = []
-        files_only = set()
-        counts = {}
-
         for file_path in files_to_scan:
+            if _timed_out():
+                break
             try:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = f.readlines()
+                    hit_count = 0
+                    for idx, line in enumerate(f, start=1):
+                        if idx % 250 == 0 and _timed_out():
+                            break
+                        if regex.search(line):
+                            hit_count += 1
+                            if output_mode == "content":
+                                content_matches.append(
+                                    SearchMatch(
+                                        path=file_path,
+                                        line_number=idx,
+                                        content=line.rstrip("\r\n")[:500],
+                                    )
+                                )
             except Exception:
                 continue
-
-            hit_count = 0
-            for idx, line in enumerate(lines, start=1):
-                if regex.search(line):
-                    hit_count += 1
-                    if output_mode == "content":
-                        content_matches.append(
-                            SearchMatch(
-                                path=file_path,
-                                line_number=idx,
-                                content=line.rstrip("\r\n")[:500],
-                            )
-                        )
 
             if hit_count:
                 files_only.add(file_path)
                 counts[file_path] = hit_count
 
+        timed_out = _timed_out()
+
         if output_mode == "files_only":
             all_files = sorted(files_only)
             total = len(all_files)
             page = all_files[offset:offset + limit]
-            return SearchResult(files=page, total_count=total, truncated=total > offset + limit)
+            return SearchResult(
+                files=page,
+                total_count=total,
+                truncated=timed_out or total > offset + limit,
+                warning=timeout_warning if timed_out else None,
+            )
 
         if output_mode == "count":
-            return SearchResult(counts=counts, total_count=sum(counts.values()))
+            return SearchResult(
+                counts=counts,
+                total_count=sum(counts.values()),
+                truncated=timed_out,
+                warning=timeout_warning if timed_out else None,
+            )
 
         total = len(content_matches)
         page = content_matches[offset:offset + limit]
-        return SearchResult(matches=page, total_count=total, truncated=total > offset + limit)
+        return SearchResult(
+            matches=page,
+            total_count=total,
+            truncated=timed_out or total > offset + limit,
+            warning=timeout_warning if timed_out else None,
+        )
     
     def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name pattern (glob-like)."""

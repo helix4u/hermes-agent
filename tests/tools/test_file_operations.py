@@ -358,6 +358,47 @@ class TestShellFileOpsHelpers:
         assert result.files == [str(visible_file)]
         assert result.total_count == 1
 
+    def test_search_files_windows_local_backend_times_out_with_warning(self, tmp_path, monkeypatch):
+        visible_dir = tmp_path / "pkg"
+        visible_dir.mkdir()
+        (visible_dir / "a.py").write_text("print('a')\n", encoding="utf-8")
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        monkeypatch.setattr("tools.file_operations._WINDOWS_NATIVE_SEARCH_TIMEOUT_SECONDS", 0.0)
+
+        result = ops.search("*.py", path=str(tmp_path), target="files")
+
+        assert result.error is None
+        assert result.truncated is True
+        assert result.warning is not None
+        assert "timed out" in result.warning
+
+    def test_search_content_windows_local_backend_times_out_with_warning(self, tmp_path, monkeypatch):
+        sample = tmp_path / "notes.txt"
+        sample.write_text(("match me\n" * 200), encoding="utf-8")
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        monkeypatch.setattr("tools.file_operations._WINDOWS_NATIVE_SEARCH_TIMEOUT_SECONDS", 0.0)
+
+        result = ops.search("match", path=str(tmp_path))
+
+        assert result.error is None
+        assert result.truncated is True
+        assert result.warning is not None
+        assert "timed out" in result.warning
+
     def test_write_file_windows_local_backend(self, tmp_path):
         env = MagicMock()
         env.cwd = str(tmp_path)

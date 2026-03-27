@@ -1294,6 +1294,60 @@ class TestConcurrentToolExecution:
             assert len(m["content"]) < 150_000
             assert "Truncated" in m["content"]
 
+    def test_concurrent_reports_completion_as_each_tool_finishes(self, agent):
+        """Progress callbacks should stream per-tool completion without waiting for the whole batch."""
+        import time as _time
+
+        tc1 = _mock_tool_call(name="web_search", arguments='{"q":"slow"}', call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments='{"q":"fast"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        progress_callback = MagicMock()
+        agent.tool_progress_callback = progress_callback
+
+        def fake_handle(name, args, task_id, **kwargs):
+            q = args.get("q", "")
+            if q == "slow":
+                _time.sleep(0.1)
+            return f"result_{q}"
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        completion_calls = [
+            call for call in progress_callback.call_args_list
+            if call.args[0] == "_tool_result"
+        ]
+        assert len(completion_calls) == 2
+        assert completion_calls[0].args[2]["result"] == "result_fast"
+        assert completion_calls[1].args[2]["result"] == "result_slow"
+
+    def test_concurrent_emits_waiting_heartbeat_for_long_tool(self, agent, monkeypatch):
+        """Long-running concurrent tools should emit periodic waiting updates."""
+        import time as _time
+
+        tc1 = _mock_tool_call(name="web_search", arguments='{"q":"slow"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1])
+        messages = []
+        progress_callback = MagicMock()
+        agent.tool_progress_callback = progress_callback
+        monkeypatch.setattr(run_agent, "_TOOL_PROGRESS_HEARTBEAT_SECONDS", 0.01)
+
+        def fake_handle(name, args, task_id, **kwargs):
+            _time.sleep(0.05)
+            return "slow_result"
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        waiting_calls = [
+            call for call in progress_callback.call_args_list
+            if call.args[0] == "_tool_waiting"
+        ]
+        assert waiting_calls
+        assert waiting_calls[0].args[1] == "web_search"
+        assert waiting_calls[0].args[2]["tool"] == "web_search"
+
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
         with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:

@@ -8258,6 +8258,20 @@ class GatewayRunner:
                 _set_progress_state(phase="tool", detail=detail, tool_call=False)
                 return
 
+            if tool_name == "_tool_waiting":
+                payload = args or {}
+                waiting_tool = str(payload.get("tool") or preview or "tool")
+                elapsed = payload.get("elapsed_seconds")
+                waiting_preview = str(payload.get("preview") or waiting_tool).strip()
+                elapsed_text = ""
+                if isinstance(elapsed, (int, float)):
+                    elapsed_text = f" ({int(max(1, round(float(elapsed))))}s)"
+                detail = f"⏳ {waiting_tool} still running{elapsed_text}"
+                if waiting_preview and waiting_preview != waiting_tool:
+                    detail = f"{detail} | {waiting_preview}"
+                _set_progress_state(phase="tool", detail=detail, tool_call=False)
+                return
+
             # "new" mode: only report when tool changes.
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return

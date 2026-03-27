@@ -118,7 +118,7 @@ class DiscordThinkingFakeAgent:
         self.tool_progress_callback(
             "terminal",
             "git status",
-            {"command": "git status", "workdir": "c:/Users/btgil/.hermes/hermes-agent"},
+            {"command": "git status", "workdir": "c:/workspace/hermes-agent"},
         )
         time.sleep(0.35)
         self.tool_progress_callback(
@@ -135,6 +135,51 @@ class DiscordThinkingFakeAgent:
             },
         )
         time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class WaitingFakeAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs["tool_progress_callback"]
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        sample_path = "videos"
+        self.tool_progress_callback(
+            "search_files",
+            'files 2026-03-27_22-09-10.mp4 @ videos',
+            {
+                "pattern": "2026-03-27_22-09-10.mp4",
+                "target": "files",
+                "path": sample_path,
+            },
+        )
+        time.sleep(0.15)
+        self.tool_progress_callback(
+            "_tool_waiting",
+            "search_files",
+            {
+                "tool": "search_files",
+                "elapsed_seconds": 6.0,
+                "preview": 'files 2026-03-27_22-09-10.mp4 @ videos',
+            },
+        )
+        time.sleep(0.15)
+        self.tool_progress_callback(
+            "_tool_result",
+            "search_files",
+            {
+                "tool": "search_files",
+                "duration_seconds": 6.2,
+                "is_error": False,
+                "status_suffix": "",
+                "result": json.dumps({"files": [f"{sample_path}/2026-03-27_22-09-10.mp4"]}),
+            },
+        )
         return {
             "final_response": "done",
             "messages": [],
@@ -246,6 +291,47 @@ async def test_run_agent_progress_keeps_single_message_on_transient_edit_failure
 
 
 @pytest.mark.asyncio
+async def test_run_agent_progress_reports_waiting_heartbeat(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = WaitingFakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    console_lines = []
+    monkeypatch.setattr(gateway_run, "_write_gateway_console_progress_line", console_lines.append)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-1",
+        session_key="agent:main:telegram:group:-1001:17585",
+    )
+
+    assert result["final_response"] == "done"
+    console_text = "\n".join(console_lines)
+    assert "search_files still running" in console_text
+    assert "2026-03-27_22-09-10.mp4" in console_text
+
+
+@pytest.mark.asyncio
 async def test_discord_progress_includes_thinking_and_error_details(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
@@ -327,10 +413,10 @@ async def test_gateway_terminal_logs_progress_updates(monkeypatch, tmp_path, cap
     logged = "\n".join(record.getMessage() for record in caplog.records if "gateway-progress" in record.getMessage())
     console_text = "\n".join(console_lines)
     assert "planning next step" in console_text
-    assert 'terminal: "git status"' in console_text
+    assert "git status" in console_text
     assert "terminal finished in 1.25s [exit 1]" in console_text
     assert "planning next step" in logged
-    assert 'terminal: "git status"' in logged
+    assert "git status" in logged
     assert "terminal finished in 1.25s [exit 1]" in logged
 
 

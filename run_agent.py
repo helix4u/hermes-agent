@@ -265,6 +265,10 @@ _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
 # Maximum number of concurrent worker threads for parallel tool execution.
 _MAX_TOOL_WORKERS = 8
 
+# Emit periodic "still running" progress updates for long-lived tools so
+# gateway/sidecar users are not left staring at a silent spinner.
+_TOOL_PROGRESS_HEARTBEAT_SECONDS = 5.0
+
 # Patterns that indicate a terminal command may modify/delete files.
 _DESTRUCTIVE_PATTERNS = re.compile(
     r"""(?:^|\s|&&|\|\||;|`)(?:
@@ -5054,6 +5058,42 @@ class AIAgent:
                 honcho_session_key=self._honcho_session_key,
             )
 
+    def _start_tool_progress_heartbeat(self, function_name: str, function_args: dict):
+        """Emit periodic progress callbacks while a long-running tool is still active."""
+        if not self.tool_progress_callback or _TOOL_PROGRESS_HEARTBEAT_SECONDS <= 0:
+            return lambda: None
+
+        stop_event = threading.Event()
+        preview = _build_tool_preview(function_name, function_args) or function_name
+        started_at = time.monotonic()
+
+        def _heartbeat_worker():
+            while not stop_event.wait(_TOOL_PROGRESS_HEARTBEAT_SECONDS):
+                elapsed = time.monotonic() - started_at
+                try:
+                    self.tool_progress_callback(
+                        "_tool_waiting",
+                        function_name,
+                        {
+                            "tool": function_name,
+                            "elapsed_seconds": elapsed,
+                            "preview": preview,
+                        },
+                    )
+                except Exception:
+                    logging.debug(
+                        "Tool progress waiting callback failed for %s",
+                        function_name,
+                        exc_info=True,
+                    )
+
+        threading.Thread(
+            target=_heartbeat_worker,
+            name=f"tool-heartbeat-{function_name}",
+            daemon=True,
+        ).start()
+        return stop_event.set
+
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute multiple tool calls concurrently using a thread pool.
 
@@ -5145,18 +5185,55 @@ class AIAgent:
         # Each slot holds:
         # (function_name, function_args, function_result, duration, error_flag, status_suffix)
         results = [None] * num_tools
+        progress_reported = [False] * num_tools
 
         def _run_tool(index, tool_call, function_name, function_args):
             """Worker function executed in a thread."""
             start = time.time()
+            stop_heartbeat = self._start_tool_progress_heartbeat(function_name, function_args)
             try:
                 result = self._invoke_tool(function_name, function_args, effective_task_id)
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+            finally:
+                stop_heartbeat()
             duration = time.time() - start
             is_error, status_suffix = _detect_tool_failure(function_name, result)
             results[index] = (function_name, function_args, result, duration, is_error, status_suffix)
+
+        def _emit_progress_result(index: int) -> None:
+            if not self.tool_progress_callback or progress_reported[index]:
+                return
+
+            r = results[index]
+            _, name, _ = parsed_calls[index]
+            if r is None:
+                function_result = f"Error executing tool '{name}': thread did not return a result"
+                tool_duration = 0.0
+                is_error = True
+                status_suffix = ""
+            else:
+                _, _, function_result, tool_duration, is_error, status_suffix = r
+
+            progress_result = function_result
+            if len(progress_result) > 4000:
+                progress_result = progress_result[:4000] + "\n...[truncated for progress]"
+            try:
+                self.tool_progress_callback(
+                    "_tool_result",
+                    name,
+                    {
+                        "tool": name,
+                        "duration_seconds": tool_duration,
+                        "is_error": is_error,
+                        "status_suffix": status_suffix.strip(),
+                        "result": progress_result,
+                    },
+                )
+                progress_reported[index] = True
+            except Exception:
+                logging.debug("Tool progress completion callback failed for %s", name, exc_info=True)
 
         # Start spinner for CLI mode
         spinner = None
@@ -5168,13 +5245,18 @@ class AIAgent:
         try:
             max_workers = min(num_tools, _MAX_TOOL_WORKERS)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
+                future_to_index = {}
                 for i, (tc, name, args) in enumerate(parsed_calls):
                     f = executor.submit(_run_tool, i, tc, name, args)
-                    futures.append(f)
+                    future_to_index[f] = i
 
-                # Wait for all to complete (exceptions are captured inside _run_tool)
-                concurrent.futures.wait(futures)
+                for future in concurrent.futures.as_completed(future_to_index):
+                    index = future_to_index[future]
+                    try:
+                        future.result()
+                    except Exception:
+                        logger.debug("Concurrent tool future failed unexpectedly", exc_info=True)
+                    _emit_progress_result(index)
         finally:
             if spinner:
                 # Build a summary message for the spinner stop
@@ -5203,24 +5285,7 @@ class AIAgent:
                     logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                     logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
 
-            if self.tool_progress_callback:
-                progress_result = function_result
-                if len(progress_result) > 4000:
-                    progress_result = progress_result[:4000] + "\n...[truncated for progress]"
-                try:
-                    self.tool_progress_callback(
-                        "_tool_result",
-                        name,
-                        {
-                            "tool": name,
-                            "duration_seconds": tool_duration,
-                            "is_error": is_error,
-                            "status_suffix": status_suffix.strip(),
-                            "result": progress_result,
-                        },
-                    )
-                except Exception:
-                    logging.debug("Tool progress completion callback failed for %s", name, exc_info=True)
+            _emit_progress_result(i)
             self._audit_emit_tool_finish(
                 name,
                 function_result,
@@ -5468,6 +5533,7 @@ class AIAgent:
                     cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_spinner_result)
                     spinner.stop(cute_msg)
             else:
+                stop_heartbeat = self._start_tool_progress_heartbeat(function_name, function_args)
                 try:
                     function_result = handle_function_call(
                         function_name, function_args, effective_task_id,
@@ -5478,6 +5544,8 @@ class AIAgent:
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                finally:
+                    stop_heartbeat()
                 tool_duration = time.time() - tool_start_time
 
             result_preview = function_result if self.verbose_logging else (
