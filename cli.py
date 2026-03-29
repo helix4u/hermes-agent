@@ -3828,7 +3828,13 @@ class HermesCLI:
                                                 from tools.honcho_tools import set_session_context
                                                 set_session_context(self.agent._honcho, new_key)
                                                 from agent.display import honcho_session_line, write_tty
-                                                write_tty(honcho_session_line(hcfg.workspace_id, new_key) + "\n")
+                                                write_tty(
+                                                    honcho_session_line(
+                                                        hcfg.workspace_id,
+                                                        new_key,
+                                                        base_url=hcfg.base_url,
+                                                    ) + "\n"
+                                                )
                                                 _cprint(f"  Honcho session: {old_key} → {new_key}")
                                         except Exception:
                                             pass
@@ -6742,7 +6748,13 @@ class HermesCLI:
             if hcfg.enabled and (hcfg.api_key or hcfg.base_url) and hcfg.explicitly_configured:
                 sname = hcfg.resolve_session_name(session_id=self.session_id)
                 if sname:
-                    write_tty(honcho_session_line(hcfg.workspace_id, sname) + "\n")
+                    write_tty(
+                        honcho_session_line(
+                            hcfg.workspace_id,
+                            sname,
+                            base_url=hcfg.base_url,
+                        ) + "\n"
+                    )
         except Exception:
             pass
 

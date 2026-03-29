@@ -61,6 +61,7 @@ All notable user-visible changes to this project are documented here. Agents and
 ### Terminal and docs
 
 - **CLI activity scrollback**: In CLI `display.tool_progress` modes `new`, `all`, and `verbose`, Hermes now keeps top-level thinking/tool-start lines in scrollback instead of showing them only in the transient spinner row. `all`/`verbose` keep `read_file`, `terminal`, and similar activity visible after the live status changes, while `new` still suppresses repeated tool-name spam within the same turn.
+- **Local Honcho session labels**: The CLI no longer links local/self-hosted Honcho sessions to `app.honcho.dev`. When Honcho is pointed at a local base URL, the session indicator stays local-aware instead of pretending the session lives in the hosted Honcho app.
 - **Wall-clock run guardrail**: Hermes now supports a hard per-turn wall-clock timeout (`agent.max_wall_clock_seconds`, default `900`) so runaway turns fail gracefully with an explicit timeout instead of spinning forever. Delegated subagents inherit that timeout unless `delegation.max_wall_clock_seconds` overrides it.
 - **Cron failure classification**: Cron jobs now treat incomplete/interrupted agent results as failures instead of silently recording them as successful runs with stale progress/output.
 - **Installer targeting**: The documented install commands and bundled install scripts target `NousResearch/hermes-agent`, while keeping the Windows-native bootstrap flow and shell-selection improvements.

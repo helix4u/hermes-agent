@@ -725,9 +725,32 @@ _SKY_BLUE = "\033[38;5;117m"
 _ANSI_RESET = "\033[0m"
 
 
-def honcho_session_url(workspace: str, session_name: str) -> str:
-    """Build a Honcho app URL for a session."""
+def _honcho_is_local_base_url(base_url: str | None) -> bool:
+    """Return True when the configured Honcho endpoint is local/self-hosted."""
+    if not base_url:
+        return False
+    lowered = str(base_url).strip().lower()
+    return (
+        lowered.startswith("http://localhost")
+        or lowered.startswith("https://localhost")
+        or lowered.startswith("http://127.")
+        or lowered.startswith("https://127.")
+        or lowered.startswith("http://[::1]")
+        or lowered.startswith("https://[::1]")
+    )
+
+
+def honcho_session_url(workspace: str, session_name: str, base_url: str | None = None) -> str | None:
+    """Build a Honcho app URL for a hosted session when one is actually available."""
     from urllib.parse import quote
+
+    if _honcho_is_local_base_url(base_url):
+        return None
+
+    normalized = (base_url or "").strip().rstrip("/").lower()
+    if normalized and "honcho.dev" not in normalized:
+        return None
+
     return (
         f"https://app.honcho.dev/explore"
         f"?workspace={quote(workspace, safe='')}"
@@ -741,11 +764,15 @@ def _osc8_link(url: str, text: str) -> str:
     return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
 
 
-def honcho_session_line(workspace: str, session_name: str) -> str:
-    """One-line session indicator: `Honcho session: <clickable name>`."""
-    url = honcho_session_url(workspace, session_name)
-    linked_name = _osc8_link(url, f"{_SKY_BLUE}{session_name}{_ANSI_RESET}")
-    return f"{_DIM}Honcho session:{_ANSI_RESET} {linked_name}"
+def honcho_session_line(workspace: str, session_name: str, base_url: str | None = None) -> str:
+    """One-line session indicator for hosted or local Honcho."""
+    url = honcho_session_url(workspace, session_name, base_url=base_url)
+    if url:
+        session_display = _osc8_link(url, f"{_SKY_BLUE}{session_name}{_ANSI_RESET}")
+    else:
+        suffix = " (local)" if _honcho_is_local_base_url(base_url) else ""
+        session_display = f"{_SKY_BLUE}{session_name}{_ANSI_RESET}{suffix}"
+    return f"{_DIM}Honcho session:{_ANSI_RESET} {session_display}"
 
 
 def write_tty(text: str) -> None:

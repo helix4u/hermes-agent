@@ -1,7 +1,7 @@
-"""Tests for agent/display.py — build_tool_preview()."""
+"""Tests for agent/display.py — build_tool_preview() and Honcho display helpers."""
 
 import pytest
-from agent.display import build_tool_preview
+from agent.display import build_tool_preview, honcho_session_line, honcho_session_url
 
 
 class TestBuildToolPreview:
@@ -94,3 +94,43 @@ class TestBuildToolPreview:
         assert build_tool_preview("terminal", 0) is None
         assert build_tool_preview("terminal", "") is None
         assert build_tool_preview("terminal", []) is None
+
+
+class TestHonchoSessionDisplay:
+    def test_hosted_honcho_session_url_uses_honcho_app(self):
+        result = honcho_session_url(
+            "hermes",
+            "codex-linux",
+            base_url="https://api.honcho.dev",
+        )
+        assert result is not None
+        assert result.startswith("https://app.honcho.dev/explore")
+        assert "workspace=hermes" in result
+        assert "session=codex-linux" in result
+
+    def test_local_honcho_session_url_is_not_hosted(self):
+        assert honcho_session_url(
+            "hermes",
+            "codex-linux",
+            base_url="http://localhost:8420",
+        ) is None
+
+    def test_local_honcho_session_line_is_plain_text_with_local_marker(self):
+        result = honcho_session_line(
+            "hermes",
+            "codex-linux",
+            base_url="http://localhost:8420",
+        )
+        assert "Honcho session:" in result
+        assert "codex-linux" in result
+        assert "(local)" in result
+        assert "app.honcho.dev" not in result
+
+    def test_custom_remote_honcho_session_line_does_not_guess_hosted_app_link(self):
+        result = honcho_session_line(
+            "hermes",
+            "codex-linux",
+            base_url="https://memory.example.com",
+        )
+        assert "codex-linux" in result
+        assert "app.honcho.dev" not in result

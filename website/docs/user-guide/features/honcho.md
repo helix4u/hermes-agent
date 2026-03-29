@@ -77,6 +77,8 @@ hermes config set HONCHO_BASE_URL http://localhost:8420
 
 Hermes accepts either `baseUrl` or `base_url` in `~/.honcho/config.json`. Hermes auto-enables Honcho when either `apiKey` or a local base URL is present, so no further configuration is needed for a local instance.
 
+When Hermes is pointed at a local Honcho base URL, the CLI session indicator stays local-aware and does not link to the hosted Honcho app. Hosted Honcho keeps the clickable session link.
+
 To run Honcho locally, refer to the [Honcho self-hosting docs](https://docs.honcho.dev).
 
 ## Setup
