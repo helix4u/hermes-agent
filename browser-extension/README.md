@@ -35,6 +35,7 @@ real Hermes chat session beside the active tab.
 3. Open extension options (`Right click extension -> Options`) and save:
    - `Bridge URL`: `http://127.0.0.1:8765/inject`
    - `Bridge token`: the value from `~/.hermes/browser_bridge_token`
+   - Voice/STT settings now use dropdown defaults for local/OpenAI transcription models so saving the page does not blank out STT model config
 4. Saving settings now auto-checks bridge health.
 
 ## Use it

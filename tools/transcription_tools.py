@@ -89,7 +89,24 @@ def get_stt_model_from_config() -> Optional[str]:
         if cfg_path.exists():
             with open(cfg_path) as f:
                 data = yaml.safe_load(f) or {}
-            return data.get("stt", {}).get("model")
+            stt_cfg = data.get("stt", {}) or {}
+            direct_model = str(stt_cfg.get("model") or "").strip()
+            if direct_model:
+                return direct_model
+
+            provider = str(stt_cfg.get("provider") or "").strip().lower()
+            if provider == "openai":
+                openai_cfg = stt_cfg.get("openai") or {}
+                if isinstance(openai_cfg, dict):
+                    model = str(openai_cfg.get("model") or "").strip()
+                    if model:
+                        return model
+            elif provider == "local":
+                local_cfg = stt_cfg.get("local") or {}
+                if isinstance(local_cfg, dict):
+                    model = str(local_cfg.get("model") or "").strip()
+                    if model:
+                        return model
     except Exception:
         pass
     return None
@@ -573,23 +590,23 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
     if provider == "local":
         local_cfg = stt_config.get("local", {})
-        model_name = model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+        model_name = str(model or local_cfg.get("model") or DEFAULT_LOCAL_MODEL).strip() or DEFAULT_LOCAL_MODEL
         return _transcribe_local(file_path, model_name)
 
     if provider == "local_command":
         local_cfg = stt_config.get("local", {})
         model_name = _normalize_local_command_model(
-            model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+            str(model or local_cfg.get("model") or DEFAULT_LOCAL_MODEL).strip() or DEFAULT_LOCAL_MODEL
         )
         return _transcribe_local_command(file_path, model_name)
 
     if provider == "groq":
-        model_name = model or DEFAULT_GROQ_STT_MODEL
+        model_name = str(model or DEFAULT_GROQ_STT_MODEL).strip() or DEFAULT_GROQ_STT_MODEL
         return _transcribe_groq(file_path, model_name)
 
     if provider == "openai":
         openai_cfg = stt_config.get("openai", {})
-        model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
+        model_name = str(model or openai_cfg.get("model") or DEFAULT_STT_MODEL).strip() or DEFAULT_STT_MODEL
         return _transcribe_openai(file_path, model_name)
 
     # No provider available

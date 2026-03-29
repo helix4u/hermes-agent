@@ -57,6 +57,23 @@ const delegationProviderInput = document.getElementById("delegation-provider-inp
 const delegationModelInput = document.getElementById("delegation-model-input");
 const delegationBaseUrlInput = document.getElementById("delegation-base-url-input");
 
+const DEFAULT_LOCAL_STT_MODEL = "base";
+const DEFAULT_OPENAI_STT_MODEL = "whisper-1";
+const LOCAL_STT_MODEL_OPTIONS = [
+  "tiny",
+  "base",
+  "small",
+  "medium",
+  "large-v3",
+  "large-v3-turbo",
+  "distil-whisper-large-v3-en"
+];
+const OPENAI_STT_MODEL_OPTIONS = [
+  "whisper-1",
+  "gpt-4o-mini-transcribe",
+  "gpt-4o-transcribe"
+];
+
 const THEME_GROUP_ORDER = [
   "Monochrome dark",
   "Light themes",
@@ -156,6 +173,15 @@ function populateRuntimeModelOptions(selectedModel = "") {
   }
   const hasSelected = Array.from(runtimeModelSelect.options).some((option) => option.value === selectedModel);
   runtimeModelSelect.value = hasSelected ? selectedModel : "";
+}
+
+function setSelectValue(selectEl, value, fallback) {
+  if (!selectEl) {
+    return;
+  }
+  const normalized = String(value || "").trim();
+  const hasValue = Array.from(selectEl.options).some((option) => option.value === normalized);
+  selectEl.value = hasValue ? normalized : fallback;
 }
 
 function updateProviderAuthUi() {
@@ -261,10 +287,18 @@ async function loadRuntimeConfig(selectedProvider = "") {
     sttProviderSelect.value = String(stt.provider || "local").trim() || "local";
   }
   if (sttLocalModelInput) {
-    sttLocalModelInput.value = String(stt.local?.model || "").trim();
+    setSelectValue(
+      sttLocalModelInput,
+      String(stt.local?.model || "").trim(),
+      DEFAULT_LOCAL_STT_MODEL,
+    );
   }
   if (sttOpenaiModelInput) {
-    sttOpenaiModelInput.value = String(stt.openai?.model || "").trim();
+    setSelectValue(
+      sttOpenaiModelInput,
+      String(stt.openai?.model || "").trim(),
+      DEFAULT_OPENAI_STT_MODEL,
+    );
   }
   if (sttEnabledCheckbox) {
     sttEnabledCheckbox.checked = stt.enabled !== false;
@@ -986,10 +1020,14 @@ function buildRuntimeConfigPayload() {
       enabled: Boolean(sttEnabledCheckbox?.checked),
       provider: String(sttProviderSelect?.value || "local").trim() || "local",
       local: {
-        model: String(sttLocalModelInput?.value || "").trim(),
+        model: LOCAL_STT_MODEL_OPTIONS.includes(String(sttLocalModelInput?.value || "").trim())
+          ? String(sttLocalModelInput?.value || "").trim()
+          : DEFAULT_LOCAL_STT_MODEL,
       },
       openai: {
-        model: String(sttOpenaiModelInput?.value || "").trim(),
+        model: OPENAI_STT_MODEL_OPTIONS.includes(String(sttOpenaiModelInput?.value || "").trim())
+          ? String(sttOpenaiModelInput?.value || "").trim()
+          : DEFAULT_OPENAI_STT_MODEL,
       },
     },
     terminal: {

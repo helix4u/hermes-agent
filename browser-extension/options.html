@@ -168,13 +168,25 @@
           </label>
           <label class="field">
             <span class="field-label">Local STT model</span>
-            <input id="stt-local-model" type="text" spellcheck="false" placeholder="base">
+            <select id="stt-local-model">
+              <option value="tiny">tiny</option>
+              <option value="base">base</option>
+              <option value="small">small</option>
+              <option value="medium">medium</option>
+              <option value="large-v3">large-v3</option>
+              <option value="large-v3-turbo">large-v3-turbo</option>
+              <option value="distil-whisper-large-v3-en">distil-whisper-large-v3-en</option>
+            </select>
           </label>
         </div>
         <div class="two-column-grid">
           <label class="field">
             <span class="field-label">OpenAI STT model</span>
-            <input id="stt-openai-model" type="text" spellcheck="false" placeholder="whisper-1">
+            <select id="stt-openai-model">
+              <option value="whisper-1">whisper-1</option>
+              <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe</option>
+              <option value="gpt-4o-transcribe">gpt-4o-transcribe</option>
+            </select>
           </label>
           <label class="checkbox-row align-end">
             <input id="stt-enabled" type="checkbox">

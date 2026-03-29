@@ -830,6 +830,28 @@ class TestTranscribeAudioDispatch:
 
         assert mock_openai.call_args[0][1] == "gpt-4o-transcribe"
 
+    def test_blank_openai_model_falls_back_to_default(self, sample_ogg):
+        config = {"openai": {"model": ""}}
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="openai"), \
+             patch("tools.transcription_tools._transcribe_openai",
+                   return_value={"success": True, "transcript": "hi"}) as mock_openai:
+            from tools.transcription_tools import transcribe_audio, DEFAULT_STT_MODEL
+            transcribe_audio(sample_ogg, model=None)
+
+        assert mock_openai.call_args[0][1] == DEFAULT_STT_MODEL
+
+    def test_blank_local_model_falls_back_to_default(self, sample_ogg):
+        config = {"local": {"model": ""}}
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._transcribe_local",
+                   return_value={"success": True, "transcript": "hi"}) as mock_local:
+            from tools.transcription_tools import transcribe_audio, DEFAULT_LOCAL_MODEL
+            transcribe_audio(sample_ogg, model=None)
+
+        assert mock_local.call_args[0][1] == DEFAULT_LOCAL_MODEL
+
 
 # ============================================================================
 # get_stt_model_from_config
@@ -869,6 +891,22 @@ class TestGetSttModelFromConfig:
     def test_returns_none_when_model_key_missing(self, tmp_path, monkeypatch):
         cfg = tmp_path / "config.yaml"
         cfg.write_text("stt:\n  enabled: true\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from tools.transcription_tools import get_stt_model_from_config
+        assert get_stt_model_from_config() is None
+
+    def test_returns_provider_specific_openai_model(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("stt:\n  provider: openai\n  openai:\n    model: whisper-1\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from tools.transcription_tools import get_stt_model_from_config
+        assert get_stt_model_from_config() == "whisper-1"
+
+    def test_ignores_blank_provider_specific_model(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("stt:\n  provider: openai\n  openai:\n    model: ''\n")
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
         from tools.transcription_tools import get_stt_model_from_config
