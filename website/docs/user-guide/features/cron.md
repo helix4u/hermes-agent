@@ -117,6 +117,7 @@ Notes:
 - `--add-skill` appends to the existing list without replacing it
 - `--remove-skill` removes specific attached skills
 - `--clear-skills` removes all attached skills
+- model/provider/base_url overrides can be edited or cleared later; leaving them unset makes the job follow the current default runtime config at execution time
 
 ## Lifecycle actions
 
@@ -131,6 +132,8 @@ Cron jobs now have a fuller lifecycle than just create/remove.
 /cron run <job_id>
 /cron remove <job_id>
 ```
+
+On Discord, `/cron run` and `/cron remove` support job-id autocomplete so you can pick from the current job list instead of pasting IDs by hand.
 
 ### Standalone CLI
 

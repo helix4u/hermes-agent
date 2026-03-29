@@ -2053,6 +2053,106 @@ class DiscordAdapter(BasePlatformAdapter):
                 break
         return choices
 
+    def _current_model_provider(self) -> str:
+        """Best-effort currently configured provider for slash autocomplete."""
+        try:
+            from gateway.run import _load_gateway_config
+            from hermes_cli.models import normalize_provider
+            from hermes_cli.auth import resolve_provider
+
+            cfg = _load_gateway_config()
+            model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            provider = "openrouter"
+            if isinstance(model_cfg, dict):
+                provider = str(model_cfg.get("provider", provider) or provider).strip()
+            elif isinstance(model_cfg, str):
+                provider = "openrouter"
+            provider = normalize_provider(provider)
+            if provider == "auto":
+                provider = resolve_provider(provider)
+            return provider or "openrouter"
+        except Exception:
+            return "openrouter"
+
+    def _model_provider_choices(self) -> List[Any]:
+        """Return static provider choices for the Discord /model command."""
+        choice_cls = getattr(getattr(discord, "app_commands", None), "Choice", None)
+        if choice_cls is None:
+            return []
+
+        try:
+            from hermes_cli.models import list_available_providers
+
+            providers = list_available_providers()
+        except Exception:
+            providers = []
+
+        if not providers:
+            try:
+                from hermes_cli.models import _PROVIDER_LABELS
+
+                providers = [
+                    {"id": provider_id, "label": label, "authenticated": False}
+                    for provider_id, label in _PROVIDER_LABELS.items()
+                ]
+            except Exception:
+                return []
+
+        choices: List[Any] = []
+        for provider in providers:
+            provider_id = str(provider.get("id") or "").strip()
+            if not provider_id:
+                continue
+            label = str(provider.get("label") or provider_id).strip()
+            suffix = "configured" if provider.get("authenticated") else "not configured"
+            choice_label = f"{label} ({provider_id}, {suffix})"
+            if len(choice_label) > 100:
+                choice_label = choice_label[:97] + "..."
+            choices.append(choice_cls(name=choice_label, value=provider_id))
+            if len(choices) >= 25:
+                break
+        return choices
+
+    async def _model_name_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> List[Any]:
+        """Return model choices for the Discord /model command."""
+        choice_cls = getattr(getattr(discord, "app_commands", None), "Choice", None)
+        if choice_cls is None:
+            return []
+
+        provider = ""
+        namespace = getattr(interaction, "namespace", None)
+        if namespace is not None:
+            provider = str(getattr(namespace, "provider", "") or "").strip()
+
+        try:
+            from hermes_cli.models import curated_models_for_provider, normalize_provider
+
+            provider_id = normalize_provider(provider) if provider else self._current_model_provider()
+            models = curated_models_for_provider(provider_id)
+        except Exception:
+            return []
+
+        needle = str(current or "").strip().lower()
+        choices: List[Any] = []
+        for model_id, desc in models:
+            model_text = str(model_id or "").strip()
+            if not model_text:
+                continue
+            haystack = " ".join(part for part in (model_text, desc) if part).lower()
+            if needle and needle not in haystack:
+                continue
+            label = f"{model_text} ({desc})" if desc else model_text
+            if len(label) > 100:
+                label = label[:97] + "..."
+            choices.append(choice_cls(name=label, value=model_text))
+            if len(choices) >= 25:
+                break
+        return choices
+
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
         if not self._client:
@@ -2069,9 +2169,39 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._run_simple_slash(interaction, "/reset", "Session reset~")
 
         @tree.command(name="model", description="Show or change the model")
-        @discord.app_commands.describe(name="Model name (e.g. anthropic/claude-sonnet-4). Leave empty to see current.")
-        async def slash_model(interaction: discord.Interaction, name: str = ""):
-            await self._run_simple_slash(interaction, f"/model {name}".strip())
+        @discord.app_commands.describe(
+            provider="Optional provider to switch to (for example: nous)",
+            name="Model name. Leave both empty to show the current model.",
+        )
+        @(
+            getattr(discord.app_commands, "choices", None)(
+                provider=self._model_provider_choices(),
+            )
+            if getattr(discord.app_commands, "choices", None) is not None
+            else (lambda fn: fn)
+        )
+        @(
+            getattr(discord.app_commands, "autocomplete", None)(
+                name=self._model_name_autocomplete,
+            )
+            if getattr(discord.app_commands, "autocomplete", None) is not None
+            else (lambda fn: fn)
+        )
+        async def slash_model(
+            interaction: discord.Interaction,
+            provider: str = "",
+            name: str = "",
+        ):
+            provider = str(provider or "").strip()
+            name = str(name or "").strip()
+            command_text = "/model"
+            if provider and name:
+                command_text = f"/model {provider}:{name}"
+            elif provider:
+                command_text = f"/model {provider}"
+            elif name:
+                command_text = f"/model {name}"
+            await self._run_simple_slash(interaction, command_text)
 
         @tree.command(name="reasoning", description="Show or change reasoning effort")
         @discord.app_commands.describe(effort="Reasoning effort: xhigh, high, medium, low, minimal, or none.")
@@ -2130,6 +2260,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
             @cron.command(name="remove", description="Remove a cron job")
             @discord.app_commands.describe(job_id="Job ID from /cron list")
+            @(
+                getattr(discord.app_commands, "autocomplete", None)(job_id=self._cron_job_autocomplete)
+                if getattr(discord.app_commands, "autocomplete", None) is not None
+                else (lambda fn: fn)
+            )
             async def slash_cron_remove(interaction: discord.Interaction, job_id: str):
                 await self._run_simple_slash(
                     interaction,
@@ -2137,12 +2272,14 @@ class DiscordAdapter(BasePlatformAdapter):
                     followup_msg=None,
                     delete_original=True,
                 )
-            autocomplete = getattr(discord.app_commands, "autocomplete", None)
-            if autocomplete is not None:
-                slash_cron_remove = autocomplete(job_id=self._cron_job_autocomplete)(slash_cron_remove)
 
             @cron.command(name="run", description="Run one cron job immediately")
             @discord.app_commands.describe(job_id="Job ID from /cron list")
+            @(
+                getattr(discord.app_commands, "autocomplete", None)(job_id=self._cron_job_autocomplete)
+                if getattr(discord.app_commands, "autocomplete", None) is not None
+                else (lambda fn: fn)
+            )
             async def slash_cron_run(interaction: discord.Interaction, job_id: str):
                 await self._run_simple_slash(
                     interaction,
@@ -2150,8 +2287,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     followup_msg=None,
                     delete_original=True,
                 )
-            if autocomplete is not None:
-                slash_cron_run = autocomplete(job_id=self._cron_job_autocomplete)(slash_cron_run)
 
             if hasattr(tree, "add_command"):
                 tree.add_command(cron)

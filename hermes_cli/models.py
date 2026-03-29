@@ -399,6 +399,44 @@ def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
     return (current_provider, stripped)
 
 
+def has_explicit_provider_prefix(raw: str) -> bool:
+    """Return whether ``raw`` uses the ``provider:model`` syntax."""
+    stripped = (raw or "").strip()
+    colon = stripped.find(":")
+    if colon <= 0:
+        return False
+    provider_part = stripped[:colon].strip().lower()
+    model_part = stripped[colon + 1:].strip()
+    return bool(provider_part and model_part and provider_part in _KNOWN_PROVIDER_NAMES)
+
+
+def canonicalize_model_for_provider(model_name: str, provider: Optional[str]) -> str:
+    """Expand bare model tails to provider-native IDs when the match is unambiguous.
+
+    Example: ``gpt-5.4-mini`` on Nous Portal becomes ``openai/gpt-5.4-mini``.
+    This keeps provider-specific model switches stable without forcing users to
+    memorize full aggregator slugs.
+    """
+    normalized = (model_name or "").strip()
+    if not normalized or "/" in normalized:
+        return normalized
+
+    provider_id = normalize_provider(provider)
+    catalog = list(_PROVIDER_MODELS.get(provider_id, []))
+    if not catalog:
+        return normalized
+
+    matches = [
+        candidate
+        for candidate in catalog
+        if "/" in candidate and candidate.split("/", 1)[1].lower() == normalized.lower()
+    ]
+    unique = list(dict.fromkeys(matches))
+    if len(unique) == 1:
+        return unique[0]
+    return normalized
+
+
 def _get_custom_base_url() -> str:
     """Get the custom endpoint base_url from config.yaml."""
     try:

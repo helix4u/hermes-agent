@@ -69,6 +69,8 @@ def switch_model(
         apply the switch and format output.
     """
     from hermes_cli.models import (
+        canonicalize_model_for_provider,
+        has_explicit_provider_prefix,
         parse_model_input,
         detect_provider_for_model,
         validate_requested_model,
@@ -77,7 +79,9 @@ def switch_model(
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     # Step 1: Parse provider:model syntax
+    explicit_provider = has_explicit_provider_prefix(raw_input)
     target_provider, new_model = parse_model_input(raw_input, current_provider)
+    new_model = canonicalize_model_for_provider(new_model, target_provider)
 
     # Step 2: Detect if we're currently on a custom endpoint
     _base = current_base_url or ""
@@ -88,7 +92,7 @@ def switch_model(
     # Step 3: Auto-detect provider when no explicit provider:model syntax
     # was used.  Skip for custom providers — the model name might
     # coincidentally match a known provider's catalog.
-    if target_provider == current_provider and not is_custom:
+    if target_provider == current_provider and not is_custom and not explicit_provider:
         detected = detect_provider_for_model(new_model, current_provider)
         if detected:
             target_provider, new_model = detected

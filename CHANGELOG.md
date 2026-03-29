@@ -34,6 +34,10 @@ All notable user-visible changes to this project are documented here. Agents and
 - **Optional tool deps**: Gateway/browser-bridge startup no longer hard-fails in environments missing `fal_client`; the image-generation tool now degrades cleanly behind its own requirement checks.
 - **Discord listen controls**: Discord replies now expose separate listen buttons for the full message, tagged `ʞᴎiʜƚ` content, and the final answer content, which also improves cron-delivery listen behavior for normal text responses.
 - **Discord cron listen parity**: Detached Discord sends now include the same persistent `Listen / ʞᴎiʜƚ / Answer` buttons as normal gateway replies, and the `Answer` button now prefers the `Action / Response:` section when that marker exists.
+- **Cron override editing**: The cron job API now allows existing jobs to update or clear per-job `model`, `provider`, and `base_url` overrides, which makes it possible to unpin stale job-specific model routing and fall back to the current default runtime config without recreating the job.
+- **Discord cron run/remove autocomplete**: The grouped Discord `/cron run` and `/cron remove` slash commands now register job-id autocomplete on the live subcommands again, so job selection comes back as an actual picker instead of forcing manual ID pastes.
+- **Discord model picker cleanup**: Discord `/model` now exposes `provider` as a real dropdown choice list plus a separate autocompleted `name` field, which makes provider-targeted switches like `nous` + `openai/gpt-5.4-mini` much less error-prone than the old single freeform field.
+- **Stable explicit provider switches**: `/model` no longer auto-reroutes an explicitly requested provider/model target after parsing it, and provider-native bare tails like `gpt-5.4-mini` now expand to `openai/gpt-5.4-mini` on Nous Portal instead of drifting to another provider.
 
 ### Recall and web
 

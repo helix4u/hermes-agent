@@ -178,6 +178,109 @@ async def test_cron_job_autocomplete_returns_matching_jobs(adapter, monkeypatch)
     assert "20e9d96eabcd" in choices[0].name
 
 
+def test_registers_cron_group_autocomplete_before_command_registration(adapter, monkeypatch):
+    class FakeGroup:
+        def __init__(self, *, name, description):
+            self.name = name
+            self.description = description
+            self.commands = {}
+
+        def command(self, *, name, description):
+            def decorator(fn):
+                self.commands[name] = fn
+                return fn
+
+            return decorator
+
+    def fake_autocomplete(**kwargs):
+        def decorator(fn):
+            fn._autocomplete_kwargs = kwargs
+            return fn
+
+        return decorator
+
+    monkeypatch.setattr(
+        "gateway.platforms.discord.discord.app_commands.Group",
+        FakeGroup,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "gateway.platforms.discord.discord.app_commands.autocomplete",
+        fake_autocomplete,
+        raising=False,
+    )
+
+    adapter._register_slash_commands()
+
+    cron_group = adapter._client.tree.commands["cron"]
+    assert cron_group.commands["run"]._autocomplete_kwargs["job_id"] == adapter._cron_job_autocomplete
+    assert cron_group.commands["remove"]._autocomplete_kwargs["job_id"] == adapter._cron_job_autocomplete
+
+
+def test_registers_model_picker_before_command_registration(adapter, monkeypatch):
+    def fake_autocomplete(**kwargs):
+        def decorator(fn):
+            fn._autocomplete_kwargs = kwargs
+            return fn
+
+        return decorator
+
+    def fake_choices(**kwargs):
+        def decorator(fn):
+            fn._choice_kwargs = kwargs
+            return fn
+
+        return decorator
+
+    monkeypatch.setattr(
+        "gateway.platforms.discord.discord.app_commands.autocomplete",
+        fake_autocomplete,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "gateway.platforms.discord.discord.app_commands.choices",
+        fake_choices,
+        raising=False,
+    )
+
+    adapter._register_slash_commands()
+
+    model_command = adapter._client.tree.commands["model"]
+    assert model_command._autocomplete_kwargs["name"] == adapter._model_name_autocomplete
+    provider_choices = model_command._choice_kwargs["provider"]
+    assert any(choice.value == "nous" for choice in provider_choices)
+
+
+def test_model_provider_choices_include_nous(adapter):
+    with patch(
+        "hermes_cli.models.list_available_providers",
+        return_value=[
+            {"id": "nous", "label": "Nous Portal", "aliases": [], "authenticated": True},
+            {"id": "openrouter", "label": "OpenRouter", "aliases": [], "authenticated": True},
+        ],
+        ):
+            choices = adapter._model_provider_choices()
+
+    assert any(choice.value == "nous" for choice in choices)
+
+
+@pytest.mark.asyncio
+async def test_model_name_autocomplete_uses_selected_provider(adapter):
+    interaction = SimpleNamespace(namespace=SimpleNamespace(provider="nous"))
+
+    with patch(
+        "hermes_cli.models.curated_models_for_provider",
+        return_value=[
+            ("openai/gpt-5.4-mini", ""),
+            ("openai/gpt-5.4", ""),
+        ],
+    ):
+        choices = await adapter._model_name_autocomplete(interaction, "mini")
+
+    assert len(choices) == 1
+    assert choices[0].value == "openai/gpt-5.4-mini"
+
+
 # ------------------------------------------------------------------
 # _handle_thread_create_slash — success, session dispatch, failure
 # ------------------------------------------------------------------

@@ -309,7 +309,13 @@ class TestUpdateJob:
             ):
                 resp = await cli.patch(
                     f"/api/jobs/{VALID_JOB_ID}",
-                    json={"name": "updated-name", "schedule": "0 * * * *"},
+                    json={
+                        "name": "updated-name",
+                        "schedule": "0 * * * *",
+                        "model": "",
+                        "provider": "",
+                        "base_url": "",
+                    },
                 )
                 assert resp.status == 200
                 data = await resp.json()
@@ -320,6 +326,9 @@ class TestUpdateJob:
                 sanitized = call_args[0][1]
                 assert "name" in sanitized
                 assert "schedule" in sanitized
+                assert "model" in sanitized
+                assert "provider" in sanitized
+                assert "base_url" in sanitized
 
     @pytest.mark.asyncio
     async def test_update_job_rejects_unknown_fields(self, adapter):

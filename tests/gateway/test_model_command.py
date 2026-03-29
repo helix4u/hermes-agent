@@ -128,3 +128,66 @@ async def test_model_command_normalizes_prefixed_codex_slug(tmp_path, monkeypatc
     assert "Model changed to `gpt-5.4`" in result
     assert os.getenv("HERMES_MODEL") == "gpt-5.4"
     assert os.getenv("HERMES_INFERENCE_PROVIDER") == "openai-codex"
+
+
+def test_switch_model_keeps_explicit_nous_prefix_on_same_provider(monkeypatch):
+    from hermes_cli.model_switch import switch_model
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested=None: {
+            "api_key": "test-key",
+            "base_url": "https://inference-api.nousresearch.com/v1",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *args, **kwargs: {
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": None,
+        },
+    )
+
+    result = switch_model(
+        "nous:gpt-5.4-mini",
+        "nous",
+        current_base_url="https://inference-api.nousresearch.com/v1",
+    )
+
+    assert result.success is True
+    assert result.target_provider == "nous"
+    assert result.new_model == "openai/gpt-5.4-mini"
+    assert result.provider_changed is False
+
+
+def test_switch_model_keeps_bare_nous_model_on_current_provider(monkeypatch):
+    from hermes_cli.model_switch import switch_model
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested=None: {
+            "api_key": "test-key",
+            "base_url": "https://inference-api.nousresearch.com/v1",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *args, **kwargs: {
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": None,
+        },
+    )
+
+    result = switch_model(
+        "gpt-5.4-mini",
+        "nous",
+        current_base_url="https://inference-api.nousresearch.com/v1",
+    )
+
+    assert result.success is True
+    assert result.target_provider == "nous"
+    assert result.new_model == "openai/gpt-5.4-mini"

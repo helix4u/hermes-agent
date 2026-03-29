@@ -3,6 +3,7 @@
 from unittest.mock import patch
 
 from hermes_cli.models import (
+    canonicalize_model_for_provider,
     copilot_model_api_mode,
     fetch_github_model_catalog,
     curated_models_for_provider,
@@ -11,6 +12,7 @@ from hermes_cli.models import (
     normalize_copilot_model_id,
     normalize_provider,
     parse_model_input,
+    has_explicit_provider_prefix,
     probe_api_models,
     provider_label,
     provider_model_ids,
@@ -116,6 +118,24 @@ class TestParseModelInput:
         # Empty model after second colon → no triple match, falls through
         assert provider == "custom"
         assert model == "name:"
+
+
+class TestProviderPrefixDetection:
+    def test_detects_explicit_provider_prefix(self):
+        assert has_explicit_provider_prefix("nous:openai/gpt-5.4-mini") is True
+        assert has_explicit_provider_prefix("glm:glm-5") is True
+
+    def test_ignores_non_provider_colons(self):
+        assert has_explicit_provider_prefix("anthropic/claude-3.5-sonnet:beta") is False
+        assert has_explicit_provider_prefix("http://localhost:8080/model") is False
+
+
+class TestCanonicalizeModelForProvider:
+    def test_expands_bare_nous_openai_model_tail(self):
+        assert canonicalize_model_for_provider("gpt-5.4-mini", "nous") == "openai/gpt-5.4-mini"
+
+    def test_keeps_unqualified_models_when_no_unique_match_exists(self):
+        assert canonicalize_model_for_provider("gpt-5.4-mini", "openai-codex") == "gpt-5.4-mini"
 
 
 # -- curated_models_for_provider ---------------------------------------------
