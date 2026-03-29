@@ -37,6 +37,7 @@ All notable user-visible changes to this project are documented here. Agents and
 
 ### Gateway
 
+- **Discord paged feed progress**: Discord `display.tool_progress_style: feed` no longer sends a brand-new progress message for every update. Hermes now edits one live progress embed until it reaches the embed limit, then starts the next progress embed and keeps editing that live page.
 - **Fail-closed progress teardown**: Gateway and interactive cron progress senders now shut down by publishing a terminal `finished` / `failed` / `interrupted` / `timed out` state instead of being cancelled mid-stream, which prevents stale “running tools” messages from lingering after a turn has already died.
 - **Browser bridge progress**: While the agent runs a **browser sidecar** turn, `_run_agent` mirrors each progress line into `_browser_bridge_progress` so the extension poll sees the same stream as messaging platforms (without requiring a `Platform.LOCAL` messaging adapter).
 - **Concurrent tool progress**: Concurrent tool batches now emit each tool's completion update as soon as that tool finishes instead of waiting for the whole batch, which keeps sidecar/gateway sessions from looking dead during mixed fast/slow searches.

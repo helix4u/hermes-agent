@@ -282,7 +282,7 @@ from gateway.session import (
     build_session_key,
 )
 from gateway.delivery import DeliveryRouter
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.browser_bridge import (
     BrowserBridgeConfig,
     BrowserBridgeServer,
@@ -8522,6 +8522,7 @@ class GatewayRunner:
             "tool_calls": 0,
             "updates": 0,
             "recent_events": [],
+            "all_events": [],
             "done": False,
         }
 
@@ -8563,6 +8564,10 @@ class GatewayRunner:
                 return
             ts = datetime.now().strftime("%H:%M:%S")
             event_line = f"`{ts}` {text}"
+            all_events = progress_state.setdefault("all_events", [])
+            if all_events and all_events[-1] == event_line:
+                return
+            all_events.append(event_line)
             recent_events = progress_state.setdefault("recent_events", [])
             if recent_events and recent_events[-1] == event_line:
                 return
@@ -8665,6 +8670,43 @@ class GatewayRunner:
             if len(lone) > available:
                 lone = lone[: max(0, available - 24)] + "... [trimmed for embed]"
             return _render([lone])
+
+        def _build_progress_feed_page(lines: list[str]) -> str:
+            elapsed = int(max(0, time.monotonic() - progress_state["started_at"]))
+            phase = progress_state.get("phase", "thinking")
+            phase_label = {
+                "starting": "starting",
+                "thinking": "thinking",
+                "tool": "running commands",
+                "finalizing": "finalizing",
+                "completed": "finished",
+                "failed": "failed",
+                "interrupted": "interrupted",
+                "timed_out": "timed out",
+            }.get(phase, "working")
+            phase_emoji = {
+                "starting": "🚀",
+                "thinking": "💡",
+                "tool": "🛠️",
+                "finalizing": "🧾",
+                "completed": "✅",
+                "failed": "❌",
+                "interrupted": "⚡",
+                "timed_out": "⏱️",
+            }.get(phase, "⚙️")
+            header = f"{phase_emoji} Hermes is {phase_label}... ({elapsed}s)"
+            footer = f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
+            body = "\n".join(f"• {line}" for line in lines)
+            return f"{header}\n{body}\n{footer}"
+
+        def _trim_progress_event_for_feed(line: str) -> str:
+            header = "⚙️ Hermes is working... (9999s)"
+            footer = "Tools: 9999 | Updates: 9999"
+            overhead = len(f"{header}\n• \n{footer}")
+            available = max(80, progress_embed_max_chars - overhead)
+            if len(line) <= available:
+                return line
+            return line[: max(0, available - 24)] + "... [trimmed for embed]"
 
         def progress_callback(tool_name: str, preview: str = None, args: dict = None):
             """Callback invoked by agent when tool progress changes."""
@@ -8841,6 +8883,10 @@ class GatewayRunner:
                 return True
 
             progress_msg_id = None
+            feed_page_ids: list[str | None] = []
+            feed_page_lines: list[list[str]] = []
+            feed_page_rendered: list[str] = []
+            feed_event_index = 0
             last_rendered = ""
             last_emit_at = 0.0
 
@@ -8904,6 +8950,84 @@ class GatewayRunner:
                             )
                             if result.success and result.message_id:
                                 progress_msg_id = result.message_id
+                    elif source.platform == Platform.DISCORD:
+                        result = None
+                        all_events = list(progress_state.get("all_events") or [])
+
+                        while feed_event_index < len(all_events):
+                            line = _trim_progress_event_for_feed(all_events[feed_event_index])
+                            if not feed_page_lines:
+                                feed_page_lines.append([])
+                                feed_page_ids.append(None)
+                                feed_page_rendered.append("")
+                            candidate_lines = [*feed_page_lines[-1], line]
+                            candidate_msg = _build_progress_feed_page(candidate_lines)
+                            if feed_page_lines[-1] and len(candidate_msg) > progress_embed_max_chars:
+                                feed_page_rendered[-1] = _build_progress_feed_page(feed_page_lines[-1])
+                                feed_page_lines.append([line])
+                                feed_page_ids.append(None)
+                                feed_page_rendered.append("")
+                            else:
+                                feed_page_lines[-1] = candidate_lines
+                            feed_event_index += 1
+
+                        if not feed_page_lines:
+                            fallback = (progress_state.get("last_detail") or "Working...").strip()
+                            feed_page_lines.append([f"`{datetime.now().strftime('%H:%M:%S')}` {fallback}"])
+                            feed_page_ids.append(None)
+                            feed_page_rendered.append("")
+
+                        for idx, page_lines in enumerate(feed_page_lines):
+                            is_live_page = idx == (len(feed_page_lines) - 1)
+                            page_msg = (
+                                _build_progress_feed_page(page_lines)
+                                if is_live_page
+                                else (feed_page_rendered[idx] or _build_progress_feed_page(page_lines))
+                            )
+                            page_id = feed_page_ids[idx]
+                            if page_id is None:
+                                result = await adapter.send(
+                                    chat_id=source.chat_id,
+                                    content=page_msg,
+                                    metadata=_progress_metadata,
+                                )
+                                if result.success and result.message_id:
+                                    feed_page_ids[idx] = result.message_id
+                                    feed_page_rendered[idx] = page_msg
+                                continue
+
+                            if not is_live_page or feed_page_rendered[idx] == page_msg:
+                                result = SendResult(success=True, message_id=page_id)
+                                continue
+
+                            result = await adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=page_id,
+                                content=page_msg,
+                            )
+                            if not result.success:
+                                if _is_retryable_progress_edit_error(result.error):
+                                    logger.warning(
+                                        "Transient paged-feed edit failure for %s message %s; preserving live page: %s",
+                                        source.platform,
+                                        page_id,
+                                        result.error,
+                                    )
+                                    last_emit_at = now
+                                    await asyncio.sleep(0.25)
+                                    continue
+                                feed_page_ids[idx] = None
+                                result = await adapter.send(
+                                    chat_id=source.chat_id,
+                                    content=page_msg,
+                                    metadata=_progress_metadata,
+                                )
+                                if result.success and result.message_id:
+                                    feed_page_ids[idx] = result.message_id
+                                    feed_page_rendered[idx] = page_msg
+                                    continue
+                            if result.success:
+                                feed_page_rendered[idx] = page_msg
                     else:
                         result = await adapter.send(
                             chat_id=source.chat_id,

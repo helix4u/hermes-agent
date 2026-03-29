@@ -21,6 +21,7 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         self.sent = []
         self.edits = []
         self.typing = []
+        self._send_counter = 0
 
     async def connect(self) -> bool:
         return True
@@ -29,6 +30,7 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self._send_counter += 1
         self.sent.append(
             {
                 "chat_id": chat_id,
@@ -37,7 +39,7 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
                 "metadata": metadata,
             }
         )
-        return SendResult(success=True, message_id="progress-1")
+        return SendResult(success=True, message_id=f"progress-{self._send_counter}")
 
     async def edit_message(self, chat_id, message_id, content) -> SendResult:
         self.edits.append(
@@ -232,6 +234,26 @@ class TimeoutFakeAgent:
         }
 
 
+class LongFeedFakeAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs["tool_progress_callback"]
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        for idx in range(10):
+            preview = (
+                f"scan chunk {idx} "
+                + ("abcdefghijklmnopqrstuvwxyz0123456789 " * 8)
+            ).strip()
+            self.tool_progress_callback("terminal", preview, {"command": preview})
+            time.sleep(0.10)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 def _make_runner(adapter, platform=None):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -375,6 +397,92 @@ async def test_run_agent_progress_keeps_single_message_on_transient_edit_failure
     assert len(adapter.sent) == 1
     assert len(adapter.edits) >= 2
     assert all(edit["message_id"] == "progress-1" for edit in adapter.edits)
+
+
+@pytest.mark.asyncio
+async def test_discord_feed_edits_single_live_progress_message(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "verbose")
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_STYLE", "feed")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter, platform=Platform.DISCORD)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1234",
+        chat_type="group",
+        thread_id="7777",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-feed-1",
+        session_key="agent:main:discord:group:1234:7777",
+    )
+
+    assert result["final_response"] == "done"
+    progress_sends = [entry for entry in adapter.sent if "Hermes is" in entry["content"]]
+    assert len(progress_sends) == 1
+    assert adapter.edits
+    assert all(edit["message_id"] == "progress-1" for edit in adapter.edits)
+    rendered = [entry["content"] for entry in adapter.sent] + [entry["content"] for entry in adapter.edits]
+    assert any('terminal' in content and 'pwd' in content for content in rendered)
+    assert any('browser_navigate' in content and 'example.com' in content for content in rendered)
+
+
+@pytest.mark.asyncio
+async def test_discord_feed_rolls_over_only_when_page_is_full(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "verbose")
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_STYLE", "feed")
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_EMBED_MAX_CHARS", "1200")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = LongFeedFakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter, platform=Platform.DISCORD)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1234",
+        chat_type="group",
+        thread_id="7777",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-feed-2",
+        session_key="agent:main:discord:group:1234:7777",
+    )
+
+    assert result["final_response"] == "done"
+    progress_sends = [entry for entry in adapter.sent if "Hermes is" in entry["content"]]
+    assert len(progress_sends) >= 2
+    assert len(progress_sends) < 10
+    assert adapter.edits
 
 
 @pytest.mark.asyncio

@@ -772,7 +772,9 @@ display:
   busy_input_mode: interrupt
   # Tool progress delivery style for chat platforms (Discord/Telegram/etc.)
   #   single: Keep one live "working" message and edit it as tools run (default)
-  #   feed:   Send each progress update as a new message
+  #   feed:   Discord keeps editing a live progress embed until full, then starts
+  #           the next progress embed. Other chat platforms send each update as
+  #           a new message.
   tool_progress_style: single
 
   # Number of recent tool events to keep in the live progress window.

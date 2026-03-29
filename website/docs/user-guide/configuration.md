@@ -1294,6 +1294,17 @@ In the CLI, `new`, `all`, and `verbose` now keep tool/thinking activity lines in
 
 Cycle through these modes with `/verbose`. To use `/verbose` in messaging platforms (Telegram, Discord, Slack, etc.), set `tool_progress_command: true` in the `display` section above. The command will then cycle the mode and save to config.
 
+For messaging platforms, `display.tool_progress_style` controls how progress is delivered:
+
+```yaml
+display:
+  tool_progress_style: single   # single | feed
+  tool_progress_rolling_entries: 4
+```
+
+- `single`: keep one live progress message and edit it as the run advances.
+- `feed`: on Discord, keep editing the current progress embed until it is full, then continue in the next embed; on other chat platforms, send each progress update as a new message.
+
 ## Privacy
 
 ```yaml
