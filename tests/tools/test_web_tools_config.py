@@ -20,6 +20,7 @@ class TestFirecrawlClientConfig:
         """Reset client and env vars before each test."""
         import tools.web_tools
         tools.web_tools._firecrawl_client = None
+        tools.web_tools._firecrawl_client_config = None
         for key in ("FIRECRAWL_API_KEY", "FIRECRAWL_API_URL"):
             os.environ.pop(key, None)
 
@@ -83,6 +84,29 @@ class TestFirecrawlClientConfig:
                 assert client1 is client2
                 mock_fc.assert_called_once()  # constructed only once
 
+    def test_reinitializes_when_config_changes(self):
+        """Changing FIRECRAWL_API_KEY/FIRECRAWL_API_URL should rebuild the cached client."""
+        import tools.web_tools
+        with patch("tools.web_tools.Firecrawl") as mock_fc:
+            first_client = MagicMock(name="first_client")
+            second_client = MagicMock(name="second_client")
+            mock_fc.side_effect = [first_client, second_client]
+            from tools.web_tools import _get_firecrawl_client
+
+            with patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}, clear=True):
+                client1 = _get_firecrawl_client()
+                assert client1 is first_client
+
+            with patch.dict(os.environ, {"FIRECRAWL_API_URL": "http://localhost:3002"}, clear=True):
+                client2 = _get_firecrawl_client()
+                assert client2 is second_client
+
+            assert client1 is not client2
+            assert mock_fc.call_count == 2
+            assert mock_fc.call_args_list[0].kwargs == {"api_key": "fc-test"}
+            assert mock_fc.call_args_list[1].kwargs == {"api_url": "http://localhost:3002"}
+            assert tools.web_tools._firecrawl_client is second_client
+
     def test_constructor_failure_allows_retry(self):
         """If Firecrawl() raises, next call should retry (not return None)."""
         import tools.web_tools
@@ -120,6 +144,14 @@ class TestFirecrawlClientConfig:
                 from tools.web_tools import _get_firecrawl_client
                 with pytest.raises(ValueError):
                     _get_firecrawl_client()
+
+    def test_local_only_rejects_cloud_firecrawl(self):
+        with patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}):
+            with patch("tools.web_tools.Firecrawl"):
+                from tools.web_tools import _get_firecrawl_client
+                with patch("tools.web_tools._web_local_only", return_value=True):
+                    with pytest.raises(ValueError, match="local address"):
+                        _get_firecrawl_client()
 
 
 class TestBackendSelection:
@@ -237,6 +269,21 @@ class TestBackendSelection:
         with patch("tools.web_tools._load_web_config", return_value={"backend": "nonexistent"}), \
              patch.dict(os.environ, {"PARALLEL_API_KEY": "test-key"}):
             assert _get_backend() == "parallel"
+
+    def test_local_only_requires_local_firecrawl_url(self):
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": ""}), \
+             patch("tools.web_tools._web_local_only", return_value=True), \
+             patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}, clear=True):
+            with pytest.raises(ValueError, match="FIRECRAWL_API_URL"):
+                _get_backend()
+
+    def test_local_only_uses_firecrawl_with_local_url(self):
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": ""}), \
+             patch("tools.web_tools._web_local_only", return_value=True), \
+             patch.dict(os.environ, {"FIRECRAWL_API_URL": "http://localhost:3002"}, clear=True):
+            assert _get_backend() == "firecrawl"
 
 
 class TestParallelClientConfig:

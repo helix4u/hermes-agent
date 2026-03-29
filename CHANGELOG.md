@@ -4,6 +4,17 @@ All notable user-visible changes to this project are documented here. Agents and
 
 ## Unreleased
 
+### Configuration and routing
+
+- **Fail-closed fallback switch**: Added `fallbacks.enabled` in `config.yaml`. When set to `false`, Hermes stops silently falling back to OpenRouter, Opus, or backend auto-detection and instead fails with an explicit configuration error.
+- **Model audit command**: Added `/model audit` and `/model audit apply` in the CLI to inspect missing auxiliary/delegation provider-model slots and fill them from the user’s existing main/compression defaults.
+- **Local-only web mode**: Added `web.local_only` so Hermes can require a self-hosted/local Firecrawl URL and ignore remote backend auto-detection from stray API keys.
+- **Honcho local guard**: Added `honcho.enabled` (`auto|true|false`) and `honcho.local_only` so Hermes can explicitly disable Honcho or refuse to auto-enable against remote/global Honcho credentials.
+- **Local Honcho bootstrap**: Added `hermes honcho local setup|start|stop|status|logs` so Hermes can bootstrap and manage the bundled Docker-based local Honcho stack, write local-only config, and avoid drifting back to hosted Honcho credentials.
+- **Local Honcho LLM sync**: The local Honcho bootstrap now defaults to port `8420`, rewrites the managed `honcho-src/config.toml` from Hermes' configured provider/model, and syncs Nous-backed Gemini routes into Honcho's OpenAI-compatible `custom` provider so local Honcho no longer falls back to placeholder `llama3.2` or OpenRouter-style settings.
+- **Local Honcho model audit/apply**: Added `hermes honcho local model-audit` and `hermes honcho local model-apply [--restart]` so you can inspect the expected Nous/Gemini route, detect config drift, and re-sync the managed local Honcho server config without rerunning the full setup flow.
+- **Local Honcho audit clarity**: `hermes honcho local model-audit` and related local-stack messages now distinguish the main Hermes chat model from the auxiliary sync source that Honcho follows, reducing confusion when Hermes chats on `gpt-5.4-mini` while Honcho intentionally tracks the Gemini Flash auxiliary route.
+
 ### Authentication
 
 - **Codex re-auth ownership**: Expired OpenAI Codex sessions no longer silently import fresh credentials from `~/.codex` during runtime refresh or status/model checks. Hermes now treats Hermes-owned re-auth as the authoritative recovery path and keeps shared Codex auth import limited to explicit import flows.
@@ -13,6 +24,7 @@ All notable user-visible changes to this project are documented here. Agents and
 ### Browser sidecar (Chrome extension)
 
 - **Control room**: Upgraded the built-in full-page `control-room.html` into an operator console with live session selection, follow-up chat, image attachments, voice-note transcription, reply TTS playback, audit-event browsing, delegation branch summaries, tool benchmarks, system prompt view, tool inventory, path metadata, and untruncated inspect JSON in one page.
+- **Control room runtime config crash fix**: Opening the Control Room runtime-config view no longer crashes with `name 'sys' is not defined` when probing Codex auth status; the browser bridge runtime-config action now returns cleanly even when Codex auth is stale or invalid.
 - **Control room compatibility**: When the gateway/browser bridge does not support the newer `/session inspect` action yet, the control room now falls back to transcript-only inspection instead of flashing repeated `Unsupported browser bridge action: inspect` errors.
 - **Control room cleanup**: Removed the broken **Raw session trace** panel and fully retired the old log-setup page and saved log-URL flow. The control room is now the built-in audit surface rather than a launcher for an external dashboard.
 - **Control room launcher**: Added a top-level **Control room** button beside **Options** in the sidepanel so the full operator console is one click away instead of buried in the settings page.
@@ -25,6 +37,7 @@ All notable user-visible changes to this project are documented here. Agents and
 
 ### Gateway
 
+- **Fail-closed progress teardown**: Gateway and interactive cron progress senders now shut down by publishing a terminal `finished` / `failed` / `interrupted` / `timed out` state instead of being cancelled mid-stream, which prevents stale “running tools” messages from lingering after a turn has already died.
 - **Browser bridge progress**: While the agent runs a **browser sidecar** turn, `_run_agent` mirrors each progress line into `_browser_bridge_progress` so the extension poll sees the same stream as messaging platforms (without requiring a `Platform.LOCAL` messaging adapter).
 - **Concurrent tool progress**: Concurrent tool batches now emit each tool's completion update as soon as that tool finishes instead of waiting for the whole batch, which keeps sidecar/gateway sessions from looking dead during mixed fast/slow searches.
 - **Long-tool heartbeats**: Gateway progress now emits periodic `still running` updates for long-lived tools, so browser sidecar and console users can see that Hermes is alive even when a search or shell task is taking a while.
@@ -46,6 +59,9 @@ All notable user-visible changes to this project are documented here. Agents and
 
 ### Terminal and docs
 
+- **CLI activity scrollback**: In CLI `display.tool_progress` modes `new`, `all`, and `verbose`, Hermes now keeps top-level thinking/tool-start lines in scrollback instead of showing them only in the transient spinner row. `all`/`verbose` keep `read_file`, `terminal`, and similar activity visible after the live status changes, while `new` still suppresses repeated tool-name spam within the same turn.
+- **Wall-clock run guardrail**: Hermes now supports a hard per-turn wall-clock timeout (`agent.max_wall_clock_seconds`, default `900`) so runaway turns fail gracefully with an explicit timeout instead of spinning forever. Delegated subagents inherit that timeout unless `delegation.max_wall_clock_seconds` overrides it.
+- **Cron failure classification**: Cron jobs now treat incomplete/interrupted agent results as failures instead of silently recording them as successful runs with stale progress/output.
 - **Installer targeting**: The documented install commands and bundled install scripts target `NousResearch/hermes-agent`, while keeping the Windows-native bootstrap flow and shell-selection improvements.
 - **Live tool budget metadata**: The agent now injects a transient tool-use runtime status note on API calls with tools enabled, so the model can see whether tool calls are still usable on the current response, how many follow-up iterations remain, and whether any configured soft tool-call budget is exhausted.
 - **Discord progress cleanup**: Discord gateway progress now defaults to action-oriented updates when `display.tool_progress` is unset and suppresses low-signal `thinking` chatter unless you explicitly enable verbose progress, which makes long tool turns much easier to follow.

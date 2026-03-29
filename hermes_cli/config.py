@@ -135,9 +135,15 @@ def ensure_hermes_home():
 
 DEFAULT_CONFIG = {
     "model": "anthropic/claude-opus-4.6",
+    "fallbacks": {
+        # When false, Hermes fails fast instead of silently switching
+        # providers, models, or backends behind the user's back.
+        "enabled": True,
+    },
     "toolsets": ["hermes-cli"],
     "agent": {
         "max_turns": 90,
+        "max_wall_clock_seconds": 900,
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false
@@ -193,6 +199,9 @@ DEFAULT_CONFIG = {
 
     "web": {
         "backend": "",
+        # Local-only mode disables backend auto-detection from remote API keys
+        # and requires a self-hosted Firecrawl URL (for example localhost).
+        "local_only": False,
         "archive_fallback": {
             "enabled": False,
             "service": "archive.today",
@@ -394,6 +403,7 @@ DEFAULT_CONFIG = {
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
+        "max_wall_clock_seconds": 0,  # 0 = inherit agent.max_wall_clock_seconds
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -404,7 +414,11 @@ DEFAULT_CONFIG = {
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
     # This section is only needed for hermes-specific overrides; everything else
     # (apiKey, workspace, peerName, sessions, enabled) comes from the global config.
-    "honcho": {},
+    "honcho": {
+        "enabled": "auto",   # auto | true | false
+        "local_only": False,
+        "base_url": "",
+    },
 
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York").
     # Empty string means use server-local time.
@@ -457,7 +471,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 12,
+    "_config_version": 13,
 }
 
 # =============================================================================
@@ -1353,6 +1367,66 @@ def load_config() -> Dict[str, Any]:
     return _expand_env_vars(_normalize_max_turns_config(config))
 
 
+def _boolish(value: Any, default: bool = False) -> bool:
+    """Parse permissive bool-ish config values."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def fallbacks_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return True when implicit runtime fallbacks are allowed."""
+    cfg = config if isinstance(config, dict) else load_config()
+    fallbacks = cfg.get("fallbacks", {})
+    if isinstance(fallbacks, dict):
+        return _boolish(fallbacks.get("enabled"), default=True)
+    return _boolish(fallbacks, default=True)
+
+
+def web_local_only(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return True when web tooling should avoid remote hosted backends."""
+    cfg = config if isinstance(config, dict) else load_config()
+    web_cfg = cfg.get("web", {})
+    if isinstance(web_cfg, dict):
+        return _boolish(web_cfg.get("local_only"), default=False)
+    return False
+
+
+def honcho_enabled_mode(config: Optional[Dict[str, Any]] = None) -> str:
+    """Return Honcho enablement mode: auto, true, or false."""
+    cfg = config if isinstance(config, dict) else load_config()
+    honcho_cfg = cfg.get("honcho", {})
+    if not isinstance(honcho_cfg, dict):
+        return "auto"
+    raw = honcho_cfg.get("enabled", "auto")
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"true", "false", "auto"}:
+            return normalized
+    if isinstance(raw, bool):
+        return "true" if raw else "false"
+    return "auto"
+
+
+def honcho_local_only(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return True when Hermes should only use self-hosted/local Honcho."""
+    cfg = config if isinstance(config, dict) else load_config()
+    honcho_cfg = cfg.get("honcho", {})
+    if isinstance(honcho_cfg, dict):
+        return _boolish(honcho_cfg.get("local_only"), default=False)
+    return False
+
+
 _SECURITY_COMMENT = """
 # ── Security ──────────────────────────────────────────────────────────
 # API keys, tokens, and passwords are redacted from tool output by default.
@@ -1370,6 +1444,14 @@ _SECURITY_COMMENT = """
 """
 
 _FALLBACK_COMMENT = """
+# ── Fallback Switch ───────────────────────────────────────────────────
+# Set fallbacks.enabled: false to fail closed when a provider/model/backend
+# is missing instead of silently routing to OpenRouter, Opus, or other
+# automatic backups.
+#
+# fallbacks:
+#   enabled: false
+#
 # ── Fallback Model ────────────────────────────────────────────────────
 # Automatic provider failover when primary is unavailable.
 # Uncomment and configure to enable. Triggers on rate limits (429),
@@ -1406,6 +1488,14 @@ _FALLBACK_COMMENT = """
 
 
 _COMMENTED_SECTIONS = """
+# ── Fallback Switch ───────────────────────────────────────────────────
+# Set fallbacks.enabled: false to fail closed when a provider/model/backend
+# is missing instead of silently routing to OpenRouter, Opus, or other
+# automatic backups.
+#
+# fallbacks:
+#   enabled: false
+#
 # ── Security ──────────────────────────────────────────────────────────
 # API keys, tokens, and passwords are redacted from tool output by default.
 # Set to false to see full values (useful for debugging auth issues).

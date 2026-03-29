@@ -6,6 +6,8 @@ Never push to a remote unless the user explicitly asks. Human testing is require
 
 On the design principle: we want one host-aware path layer so Windows, Linux, and macOS all work out of the box.
 
+Hermes core should never carry user-specific behavior. If a workflow, persona scaffold, validator, memory ritual, or formatting rule belongs to one user's local setup, keep it in that user's config/context layer rather than hardcoding it into shared product behavior.
+
 Always update docs. At the time of writing this there is a large lack of documentation, including the readme. We also need install scripts for windows. A .bat is fine for me, a .ps1 is fine too, but we need a way to get this installable from windows as well without the need for wsl if necissary.
 
 ## Development Environment

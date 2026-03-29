@@ -28,6 +28,44 @@ logger = logging.getLogger("gateway.stream_consumer")
 _DONE = object()
 
 
+def _is_retryable_edit_error(error_text: str | None) -> bool:
+    """Return True for transient edit failures where we should keep one live message."""
+    err = (error_text or "").lower()
+    permanent_markers = (
+        "unknown message",
+        "not found",
+        "forbidden",
+        "missing access",
+        "missing permissions",
+        "cannot edit",
+        "error code: 10008",
+        "error code: 50013",
+    )
+    if any(marker in err for marker in permanent_markers):
+        return False
+    transient_markers = (
+        "503",
+        "502",
+        "504",
+        "service unavailable",
+        "gateway timeout",
+        "upstream connect error",
+        "remote connection failure",
+        "reset before headers",
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "connection reset",
+        "server disconnected",
+        "try again",
+        "rate limit",
+        "429",
+    )
+    if any(marker in err for marker in transient_markers):
+        return True
+    return True
+
+
 @dataclass
 class StreamConsumerConfig:
     """Runtime config for a single stream consumer instance."""
@@ -174,6 +212,14 @@ class GatewayStreamConsumer:
                         self._already_sent = True
                         self._last_sent_text = text
                     else:
+                        if _is_retryable_edit_error(result.error):
+                            logger.warning(
+                                "Transient stream edit failure for %s message %s; preserving live message: %s",
+                                type(self.adapter).__name__,
+                                self._message_id,
+                                result.error,
+                            )
+                            return
                         # Edit not supported by this adapter — stop streaming,
                         # let the normal send path handle the final response.
                         # Without this guard, adapters like Signal/Email would

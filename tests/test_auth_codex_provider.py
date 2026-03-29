@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+import hermes_cli.auth as auth_mod
 
 from hermes_cli.auth import (
     AuthError,
@@ -160,6 +161,22 @@ def test_import_codex_cli_tokens(tmp_path, monkeypatch):
 def test_import_codex_cli_tokens_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent"))
     assert _import_codex_cli_tokens() is None
+
+
+def test_codex_can_prompt_for_reauth_checks_ttys_without_nameerror(monkeypatch):
+    class _DummyStream:
+        def __init__(self, is_tty: bool):
+            self._is_tty = is_tty
+
+        def isatty(self):
+            return self._is_tty
+
+    monkeypatch.setattr(auth_mod.sys, "stdin", _DummyStream(True), raising=False)
+    monkeypatch.setattr(auth_mod.sys, "stdout", _DummyStream(True), raising=False)
+    monkeypatch.setattr(auth_mod.sys, "__stdin__", _DummyStream(True), raising=False)
+    monkeypatch.setattr(auth_mod.sys, "__stdout__", _DummyStream(True), raising=False)
+
+    assert auth_mod._codex_can_prompt_for_reauth() is True
 
 
 def test_resolve_codex_runtime_credentials_does_not_auto_migrate_shared_codex_auth(tmp_path, monkeypatch):

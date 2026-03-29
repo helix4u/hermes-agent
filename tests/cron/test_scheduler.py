@@ -392,6 +392,81 @@ class TestRunJobSessionPersistence:
         assert final_response == ""
         assert "(No response generated)" in output
 
+    def test_run_job_treats_incomplete_agent_result_as_failure(self, tmp_path):
+        job = {
+            "id": "timeout-job",
+            "name": "timeout test",
+            "prompt": "do work",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "Operation timed out after 60 seconds.",
+                "completed": False,
+                "interrupted": True,
+                "interrupt_reason": "timeout",
+                "error": "Operation timed out after 60 seconds.",
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == "Operation timed out after 60 seconds."
+        assert error == "Operation timed out after 60 seconds."
+        assert "FAILED" in output
+        assert "Operation timed out after 60 seconds." in output
+
+    def test_run_job_passes_agent_wall_clock_timeout(self, tmp_path):
+        config_yaml = tmp_path / "config.yaml"
+        config_yaml.write_text("agent:\n  max_wall_clock_seconds: 321\n", encoding="utf-8")
+        job = {
+            "id": "wall-clock-job",
+            "name": "wall clock",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok", "completed": True}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert mock_agent_cls.call_args.kwargs["max_wall_clock_seconds"] == 321
+
     def test_run_job_forwards_progress_callbacks_and_overrides(self, tmp_path):
         job = {
             "id": "test-job",

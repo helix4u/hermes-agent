@@ -7,7 +7,10 @@ services:
       context: ${HONCHO_SOURCE_DIR:-./honcho-src}
       dockerfile: Dockerfile
     working_dir: /app
-    entrypoint: ["sh", "docker/entrypoint.sh"]
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - /app/.venv/bin/python scripts/provision_db.py && exec /app/.venv/bin/fastapi run --host 0.0.0.0 src/main.py
     depends_on:
       database:
         condition: service_healthy
@@ -19,11 +22,12 @@ services:
     env_file:
       - .env
     ports:
-      - "${HONCHO_HTTP_PORT:-8000}:8000"
+      - "${HONCHO_HTTP_PORT:-8420}:8000"
     restart: unless-stopped
 
   deriver:
     image: honcho-local:latest
+    profiles: ["deriver"]
     build:
       context: ${HONCHO_SOURCE_DIR:-./honcho-src}
       dockerfile: Dockerfile

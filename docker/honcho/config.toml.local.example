@@ -1,0 +1,65 @@
+# Managed by Hermes local Honcho setup.
+#
+# This template keeps the Honcho server local while aligning its LLM route with
+# Hermes' configured defaults. Hermes rewrites `honcho-src/config.toml` from the
+# active Hermes model configuration during `hermes honcho local setup` and
+# `hermes honcho local start`, so this file is a documented baseline rather than
+# the live runtime copy.
+#
+# The default generated route mirrors Hermes' Gemini Flash auxiliary settings.
+# If Hermes is using `provider: nous`, the local Honcho stack uses Honcho's
+# OpenAI-compatible `custom` client and injects the live Nous API key/base URL
+# through `docker/honcho/.env`.
+
+[app]
+EMBED_MESSAGES = false
+
+[llm]
+# Embeddings stay disabled in the default local stack. This field remains
+# explicit so Honcho never drifts back to an OpenRouter default.
+EMBEDDING_PROVIDER = "openai"
+
+[deriver]
+ENABLED = false
+PROVIDER = "custom"
+MODEL = "google/gemini-3-flash-preview"
+
+[summary]
+ENABLED = false
+PROVIDER = "custom"
+MODEL = "google/gemini-3-flash-preview"
+
+[dream]
+ENABLED = false
+PROVIDER = "custom"
+MODEL = "google/gemini-3-flash-preview"
+
+[dialectic.levels.minimal]
+PROVIDER = "custom"
+MODEL = "google/gemini-3-flash-preview"
+THINKING_BUDGET_TOKENS = 0
+MAX_TOOL_ITERATIONS = 1
+
+[dialectic.levels.low]
+PROVIDER = "custom"
+MODEL = "google/gemini-3-flash-preview"
+THINKING_BUDGET_TOKENS = 0
+MAX_TOOL_ITERATIONS = 5
+
+[dialectic.levels.medium]
+PROVIDER = "custom"
+MODEL = "google/gemini-3-flash-preview"
+THINKING_BUDGET_TOKENS = 1024
+MAX_TOOL_ITERATIONS = 2
+
+[dialectic.levels.high]
+PROVIDER = "custom"
+MODEL = "google/gemini-3-flash-preview"
+THINKING_BUDGET_TOKENS = 1024
+MAX_TOOL_ITERATIONS = 4
+
+[dialectic.levels.max]
+PROVIDER = "custom"
+MODEL = "google/gemini-3-flash-preview"
+THINKING_BUDGET_TOKENS = 2048
+MAX_TOOL_ITERATIONS = 10

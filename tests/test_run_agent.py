@@ -8,6 +8,7 @@ are made.
 import json
 import logging
 import re
+import time
 import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -622,6 +623,24 @@ class TestInterrupt:
         with patch("run_agent._set_interrupt"):
             agent.interrupt()
             assert agent.is_interrupted is True
+
+    def test_timeout_watchdog_sets_timeout_interrupt_reason(self, agent):
+        agent.max_wall_clock_seconds = 0.01
+
+        with (
+            patch("run_agent._set_interrupt"),
+            patch.object(agent, "_emit_status") as emit_status,
+            patch.object(agent, "_audit_emit_error") as audit_error,
+        ):
+            stop_watchdog = agent._start_run_timeout_watchdog()
+            time.sleep(0.05)
+            stop_watchdog()
+
+        assert agent._interrupt_requested is True
+        assert agent._interrupt_reason == "timeout"
+        assert "timed out" in (agent._interrupt_message or "").lower()
+        emit_status.assert_called_once()
+        audit_error.assert_called_once()
 
 
 class TestHydrateTodoStore:

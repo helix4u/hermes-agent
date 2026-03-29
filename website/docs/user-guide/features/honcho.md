@@ -29,10 +29,37 @@ Set `memoryMode` to `honcho` to use Honcho exclusively. See [Memory Modes](#memo
 
 Hermes supports a local Honcho instance (e.g. via Docker) in addition to the hosted API. Point it at your instance using `HONCHO_BASE_URL` — no API key required.
 
+**Recommended path: let Hermes bootstrap the local stack**
+
+```bash
+hermes honcho local setup --start
+```
+
+That command:
+
+- prepares `docker/honcho/.env`
+- clones the Honcho server source into `docker/honcho/honcho-src` when needed
+- syncs Honcho's LLM route from Hermes' configured provider/model
+- enables local-only Honcho in `~/.hermes/config.yaml`
+- writes a `hosts.hermes` block to `~/.honcho/config.json`
+- starts the Docker stack when `--start` is passed
+
+By default the local setup uses `recallMode = "tools"` and publishes the API at `http://localhost:8420`, which is less collision-prone than the old `8000` default. Hermes also rewrites the managed `honcho-src/config.toml` so the local Honcho stack follows the provider/model you've already configured in Hermes instead of drifting back to placeholder defaults. If Hermes is using `provider: nous`, Honcho uses its OpenAI-compatible `custom` provider under the hood with the current Hermes-managed Nous credentials.
+
+Useful follow-up commands:
+
+```bash
+hermes honcho local status
+hermes honcho local logs api --tail 100
+hermes honcho local model-audit
+hermes honcho local model-apply --restart
+hermes honcho local stop
+```
+
 **Via `hermes config`:**
 
 ```bash
-hermes config set HONCHO_BASE_URL http://localhost:8000
+hermes config set HONCHO_BASE_URL http://localhost:8420
 ```
 
 **Via `~/.honcho/config.json`:**
@@ -41,14 +68,14 @@ hermes config set HONCHO_BASE_URL http://localhost:8000
 {
   "hosts": {
     "hermes": {
-      "base_url": "http://localhost:8000",
+      "baseUrl": "http://localhost:8420",
       "enabled": true
     }
   }
 }
 ```
 
-Hermes auto-enables Honcho when either `apiKey` or `base_url` is present, so no further configuration is needed for a local instance.
+Hermes accepts either `baseUrl` or `base_url` in `~/.honcho/config.json`. Hermes auto-enables Honcho when either `apiKey` or a local base URL is present, so no further configuration is needed for a local instance.
 
 To run Honcho locally, refer to the [Honcho self-hosting docs](https://docs.honcho.dev).
 

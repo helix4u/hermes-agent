@@ -508,6 +508,7 @@ class AIAgent:
         args: list[str] | None = None,
         model: str = "anthropic/claude-opus-4.6",  # OpenRouter format
         max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+        max_wall_clock_seconds: float = None,
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
@@ -559,6 +560,7 @@ class AIAgent:
             api_mode (str): API mode override: "chat_completions" or "codex_responses"
             model (str): Model name to use (default: "anthropic/claude-opus-4.6")
             max_iterations (int): Maximum number of tool calling iterations (default: 90)
+            max_wall_clock_seconds (float): Optional wall-clock timeout for one conversation turn.
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
             enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
             disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
@@ -596,7 +598,28 @@ class AIAgent:
         _install_safe_stdio()
 
         self.model = model
+        try:
+            from hermes_cli.config import fallbacks_enabled as _fallbacks_enabled
+            self._implicit_fallbacks_enabled = _fallbacks_enabled()
+        except Exception:
+            self._implicit_fallbacks_enabled = True
         self.max_iterations = max_iterations
+        if max_wall_clock_seconds is None:
+            raw_wall_clock = (os.getenv("HERMES_MAX_WALL_CLOCK_SECONDS") or "").strip()
+            if raw_wall_clock:
+                try:
+                    max_wall_clock_seconds = float(raw_wall_clock)
+                except ValueError:
+                    logger.warning(
+                        "Invalid HERMES_MAX_WALL_CLOCK_SECONDS=%r. Ignoring wall-clock timeout.",
+                        raw_wall_clock,
+                    )
+                    max_wall_clock_seconds = None
+        self.max_wall_clock_seconds = (
+            float(max_wall_clock_seconds)
+            if isinstance(max_wall_clock_seconds, (int, float)) and float(max_wall_clock_seconds) > 0
+            else None
+        )
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
@@ -680,6 +703,7 @@ class AIAgent:
         # Interrupt mechanism for breaking out of tool loops
         self._interrupt_requested = False
         self._interrupt_message = None  # Optional message that triggered interrupt
+        self._interrupt_reason = None
         self._client_lock = threading.RLock()
         
         # Subagent delegation state
@@ -896,6 +920,11 @@ class AIAgent:
                             f"was found. Set the {_explicit.upper()}_API_KEY environment "
                             f"variable, or switch to a different provider with `hermes model`."
                         )
+                    if not self._implicit_fallbacks_enabled:
+                        raise RuntimeError(
+                            "No runtime provider credentials were resolved and implicit fallbacks are disabled. "
+                            "Set the provider/model explicitly in config.yaml instead of relying on OpenRouter fallback."
+                        )
                     # Final fallback: try raw OpenRouter key
                     client_kwargs = {
                         "api_key": os.getenv("OPENROUTER_API_KEY", ""),
@@ -946,7 +975,11 @@ class AIAgent:
         # Provider fallback — a single backup model/provider tried when the
         # primary is exhausted (rate-limit, overload, connection failure).
         # Config shape: {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
-        self._fallback_model = fallback_model if isinstance(fallback_model, dict) else None
+        self._fallback_model = (
+            fallback_model
+            if self._implicit_fallbacks_enabled and isinstance(fallback_model, dict)
+            else None
+        )
         self._fallback_activated = False
         if self._fallback_model:
             fb_p = self._fallback_model.get("provider", "")
@@ -2427,6 +2460,7 @@ class AIAgent:
         """
         self._interrupt_requested = True
         self._interrupt_message = message
+        self._interrupt_reason = "user"
         # Signal all tools to abort any in-flight operations immediately
         _set_interrupt(True)
         # Propagate interrupt to any running child agents (subagent delegation)
@@ -2439,12 +2473,79 @@ class AIAgent:
                 logger.debug("Failed to propagate interrupt to child agent: %s", e)
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
-    
+
+    def _interrupt_with_reason(self, *, reason: str, message: str = None) -> None:
+        """Internal interrupt path for timeout/cancel watchdogs."""
+        self._interrupt_requested = True
+        self._interrupt_message = message
+        self._interrupt_reason = reason or "user"
+        # Signal all tools to abort any in-flight operations immediately
+        _set_interrupt(True)
+        # Propagate interrupt to any running child agents (subagent delegation)
+        with self._active_children_lock:
+            children_copy = list(self._active_children)
+        for child in children_copy:
+            try:
+                child._interrupt_with_reason(reason=self._interrupt_reason, message=message)
+            except Exception as e:
+                logger.debug("Failed to propagate interrupt to child agent: %s", e)
+        if not self.quiet_mode:
+            print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
+
     def clear_interrupt(self) -> None:
         """Clear any pending interrupt request and the global tool interrupt signal."""
         self._interrupt_requested = False
         self._interrupt_message = None
+        self._interrupt_reason = None
         _set_interrupt(False)
+
+    def _start_run_timeout_watchdog(self) -> callable:
+        """Interrupt the current turn if it exceeds the configured wall-clock timeout."""
+        timeout_seconds = self.max_wall_clock_seconds
+        if not isinstance(timeout_seconds, (int, float)) or float(timeout_seconds) <= 0:
+            return lambda: None
+
+        timeout_seconds = float(timeout_seconds)
+        stop_event = threading.Event()
+
+        def _format_seconds(value: float) -> str:
+            rounded = int(round(float(value)))
+            if abs(float(value) - rounded) < 1e-9:
+                return f"{rounded}"
+            return f"{float(value):g}"
+
+        def _watchdog() -> None:
+            if stop_event.wait(timeout_seconds):
+                return
+            if self._interrupt_requested:
+                return
+            timeout_text = f"Operation timed out after {_format_seconds(timeout_seconds)} seconds."
+            logger.warning(
+                "Conversation wall-clock timeout after %ss (session=%s model=%s)",
+                _format_seconds(timeout_seconds),
+                self.session_id,
+                self.model,
+            )
+            self._emit_status(f"⏱️ {timeout_text}")
+            self._audit_emit_error(
+                "Conversation timed out",
+                timeout_text,
+                payload={"timeout_seconds": timeout_seconds},
+            )
+            self._interrupt_with_reason(reason="timeout", message=timeout_text)
+
+        threading.Thread(
+            target=_watchdog,
+            name=f"agent-timeout-{self.session_id or 'session'}",
+            daemon=True,
+        ).start()
+        return stop_event.set
+
+    def _interrupt_response_text(self, default_message: str = "Operation interrupted.") -> str:
+        """Return a user-facing interruption message with timeout-aware wording."""
+        if self._interrupt_reason == "timeout":
+            return str(self._interrupt_message or default_message or "Operation timed out.").strip()
+        return str(default_message or "Operation interrupted.").strip()
     
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
@@ -4730,6 +4831,8 @@ class AIAgent:
         auth resolution and client construction — no duplicated provider→key
         mappings.
         """
+        if not self._implicit_fallbacks_enabled:
+            return False
         if self._fallback_activated or not self._fallback_model:
             return False
 
@@ -7055,6 +7158,14 @@ class AIAgent:
         
         # Clear any stale interrupt state at start
         self.clear_interrupt()
+        _stop_turn_timeout_watchdog = self._start_run_timeout_watchdog()
+
+        def _finish_run(payload: dict) -> dict:
+            try:
+                _stop_turn_timeout_watchdog()
+            except Exception:
+                pass
+            return payload
         
         while api_call_count < self.max_iterations and self.iteration_budget.remaining > 0:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
@@ -7386,13 +7497,13 @@ class AIAgent:
                             self._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
                             logging.error(f"{self.log_prefix}Invalid API response after {max_retries} retries.")
                             self._persist_session(messages, conversation_history)
-                            return {
+                            return _finish_run({
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
                                 "error": "Invalid API response shape. Likely rate limited or malformed provider response.",
                                 "failed": True  # Mark as failure for filtering
-                            }
+                            })
                         
                         # Longer backoff for rate limiting (likely cause of None choices)
                         wait_time = min(5 * (2 ** (retry_count - 1)), 120)  # 5s, 10s, 20s, 40s, 80s, 120s
@@ -7405,14 +7516,19 @@ class AIAgent:
                             if self._interrupt_requested:
                                 self._vprint(f"{self.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                                 self._persist_session(messages, conversation_history)
+                                _interrupt_reason = self._interrupt_reason
+                                _interrupt_response = self._interrupt_response_text(
+                                    f"Operation interrupted: retrying API call after rate limit (retry {retry_count}/{max_retries})."
+                                )
                                 self.clear_interrupt()
-                                return {
-                                    "final_response": f"Operation interrupted: retrying API call after rate limit (retry {retry_count}/{max_retries}).",
+                                return _finish_run({
+                                    "final_response": _interrupt_response,
                                     "messages": messages,
                                     "api_calls": api_call_count,
                                     "completed": False,
                                     "interrupted": True,
-                                }
+                                    "interrupt_reason": _interrupt_reason,
+                                })
                             time.sleep(0.2)
                         continue  # Retry the API call
 
@@ -7485,14 +7601,14 @@ class AIAgent:
                             )
                             self._cleanup_task_resources(effective_task_id)
                             self._persist_session(messages, conversation_history)
-                            return {
+                            return _finish_run({
                                 "final_response": _exhaust_response,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
                                 "error": _exhaust_error,
-                            }
+                            })
 
                         if self.api_mode == "chat_completions":
                             assistant_message = response.choices[0].message
@@ -7525,14 +7641,14 @@ class AIAgent:
                                 partial_response = self._strip_think_blocks(truncated_response_prefix).strip()
                                 self._cleanup_task_resources(effective_task_id)
                                 self._persist_session(messages, conversation_history)
-                                return {
+                                return _finish_run({
                                     "final_response": partial_response or None,
                                     "messages": messages,
                                     "api_calls": api_call_count,
                                     "completed": False,
                                     "partial": True,
                                     "error": "Response remained truncated after 3 continuation attempts",
-                                }
+                                })
 
                         # If we have prior messages, roll back to last complete state
                         if len(messages) > 1:
@@ -7542,26 +7658,26 @@ class AIAgent:
                             self._cleanup_task_resources(effective_task_id)
                             self._persist_session(messages, conversation_history)
 
-                            return {
+                            return _finish_run({
                                 "final_response": None,
                                 "messages": rolled_back_messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
                                 "error": "Response truncated due to output length limit"
-                            }
+                            })
                         else:
                             # First message was truncated - mark as failed
                             self._vprint(f"{self.log_prefix}❌ First response truncated - cannot recover", force=True)
                             self._persist_session(messages, conversation_history)
-                            return {
+                            return _finish_run({
                                 "final_response": None,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "failed": True,
                                 "error": "First response truncated due to output length limit"
-                            }
+                            })
                     
                     # Track actual token usage from response for context management
                     if hasattr(response, 'usage') and response.usage:
@@ -7671,9 +7787,11 @@ class AIAgent:
                     self._vprint(f"{self.log_prefix}⚡ Interrupted during API call.", force=True)
                     self._persist_session(messages, conversation_history)
                     interrupted = True
-                    final_response = f"Operation interrupted: waiting for model response ({api_elapsed:.1f}s elapsed)."
+                    final_response = self._interrupt_response_text(
+                        f"Operation interrupted: waiting for model response ({api_elapsed:.1f}s elapsed)."
+                    )
                     self._audit_emit_error(
-                        "Conversation interrupted",
+                        "Conversation timed out" if self._interrupt_reason == "timeout" else "Conversation interrupted",
                         final_response,
                         payload={"api_elapsed_seconds": round(api_elapsed, 2)},
                     )
@@ -7785,14 +7903,19 @@ class AIAgent:
                     if self._interrupt_requested:
                         self._vprint(f"{self.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                         self._persist_session(messages, conversation_history)
+                        _interrupt_reason = self._interrupt_reason
+                        _interrupt_response = self._interrupt_response_text(
+                            f"Operation interrupted: handling API error ({error_type}: {self._clean_error_message(str(api_error))})."
+                        )
                         self.clear_interrupt()
-                        return {
-                            "final_response": f"Operation interrupted: handling API error ({error_type}: {self._clean_error_message(str(api_error))}).",
+                        return _finish_run({
+                            "final_response": _interrupt_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "interrupted": True,
-                        }
+                            "interrupt_reason": _interrupt_reason,
+                        })
                     
                     # Check for 413 payload-too-large BEFORE generic 4xx handler.
                     # A 413 is a payload-size error — the correct response is to
@@ -7830,13 +7953,13 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
                             logging.error(f"{self.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
                             self._persist_session(messages, conversation_history)
-                            return {
+                            return _finish_run({
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
                                 "error": f"Request payload too large: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True
-                            }
+                            })
                         self._emit_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                         original_len = len(messages)
@@ -7856,13 +7979,13 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Payload too large and cannot compress further.", force=True)
                             logging.error(f"{self.log_prefix}413 payload too large. Cannot compress further.")
                             self._persist_session(messages, conversation_history)
-                            return {
+                            return _finish_run({
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
                                 "error": "Request payload too large (413). Cannot compress further.",
                                 "partial": True
-                            }
+                            })
 
                     # Check for context-length errors BEFORE generic 4xx handler.
                     # Local backends (LM Studio, Ollama, llama.cpp) often return
@@ -7932,13 +8055,13 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
                             self._persist_session(messages, conversation_history)
-                            return {
+                            return _finish_run({
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
                                 "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True
-                            }
+                            })
                         self._vprint(f"{self.log_prefix}   🗜️  Context compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                         original_len = len(messages)
@@ -7961,13 +8084,13 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}   💡 The conversation has accumulated too much content.", force=True)
                             logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
                             self._persist_session(messages, conversation_history)
-                            return {
+                            return _finish_run({
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
                                 "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
                                 "partial": True
-                            }
+                            })
 
                     # Check for non-retryable client errors (4xx HTTP status codes).
                     # These indicate a problem with the request itself (bad model ID,
@@ -8035,14 +8158,14 @@ class AIAgent:
                             )
                         else:
                             self._persist_session(messages, conversation_history)
-                        return {
+                        return _finish_run({
                             "final_response": None,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
                             "error": _strip_cli_ansi(str(api_error)),
-                        }
+                        })
 
                     if retry_count >= max_retries:
                         # Try fallback before giving up entirely
@@ -8102,14 +8225,14 @@ class AIAgent:
                                 "execute_code with Python's open() for large "
                                 "files, or to write in smaller sections."
                             )
-                        return {
+                        return _finish_run({
                             "final_response": _final_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
                             "error": _final_summary,
-                        }
+                        })
 
                     wait_time = min(2 ** retry_count, 60)  # Exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s, 60s
                     self._emit_status(f"⏳ Retrying in {wait_time}s (attempt {retry_count}/{max_retries})...")
@@ -8128,14 +8251,19 @@ class AIAgent:
                         if self._interrupt_requested:
                             self._vprint(f"{self.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             self._persist_session(messages, conversation_history)
+                            _interrupt_reason = self._interrupt_reason
+                            _interrupt_response = self._interrupt_response_text(
+                                f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
+                            )
                             self.clear_interrupt()
-                            return {
-                                "final_response": f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries}).",
+                            return _finish_run({
+                                "final_response": _interrupt_response,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "interrupted": True,
-                            }
+                                "interrupt_reason": _interrupt_reason,
+                            })
                         time.sleep(0.2)  # Check interrupt every 200ms
             
             # If the API call was interrupted, skip response processing
@@ -8243,14 +8371,14 @@ class AIAgent:
                         self._cleanup_task_resources(effective_task_id)
                         self._persist_session(messages, conversation_history)
                         
-                        return {
+                        return _finish_run({
                             "final_response": None,
                             "messages": rolled_back_messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
                             "error": "Incomplete REASONING_SCRATCHPAD after 2 retries"
-                        }
+                        })
                 
                 # Reset incomplete scratchpad counter on clean response
                 if hasattr(self, '_incomplete_scratchpad_retries'):
@@ -8295,14 +8423,14 @@ class AIAgent:
 
                     self._codex_incomplete_retries = 0
                     self._persist_session(messages, conversation_history)
-                    return {
+                    return _finish_run({
                         "final_response": None,
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "partial": True,
                         "error": "Codex response remained incomplete after 3 continuation attempts",
-                    }
+                    })
                 elif hasattr(self, "_codex_incomplete_retries"):
                     self._codex_incomplete_retries = 0
                 
@@ -8343,14 +8471,14 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True)
                             self._invalid_tool_retries = 0
                             self._persist_session(messages, conversation_history)
-                            return {
+                            return _finish_run({
                                 "final_response": None,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
                                 "error": f"Model generated invalid tool call: {invalid_preview}"
-                            }
+                            })
 
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                         messages.append(assistant_msg)
@@ -8645,14 +8773,14 @@ class AIAgent:
                                 payload={"api_calls": api_call_count},
                             )
 
-                            return {
+                            return _finish_run({
                                 "final_response": final_response or None,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
                                 "error": "Model generated only think blocks with no actual response after 3 retries"
-                            }
+                            })
                     
                     # Reset retry counter on successful content
                     if hasattr(self, '_empty_content_retries'):
@@ -8693,7 +8821,7 @@ class AIAgent:
                     
                     # Strip <think> blocks from user-facing response (keep raw in messages for trajectory)
                     final_response = self._strip_think_blocks(final_response).strip()
-                    
+
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
                     
                     messages.append(final_msg)
@@ -8760,6 +8888,9 @@ class AIAgent:
                     )
                     break
         
+        if interrupted and final_response is None and self._interrupt_reason == "timeout":
+            final_response = self._interrupt_response_text("Operation timed out.")
+
         if final_response is None and (
             api_call_count >= self.max_iterations
             or self.iteration_budget.remaining <= 0
@@ -8774,7 +8905,7 @@ class AIAgent:
             )
         
         # Determine if conversation completed successfully
-        completed = final_response is not None and api_call_count < self.max_iterations
+        completed = final_response is not None and api_call_count < self.max_iterations and not interrupted
 
         # Save trajectory if enabled
         self._save_trajectory(messages, user_message, completed)
@@ -8830,6 +8961,8 @@ class AIAgent:
                 break
 
         # Build result with interrupt info if applicable
+        interrupt_reason = self._interrupt_reason
+
         result = {
             "final_response": final_response,
             "last_reasoning": last_reasoning,
@@ -8860,6 +8993,10 @@ class AIAgent:
         # Include interrupt message if one triggered the interrupt
         if interrupted and self._interrupt_message:
             result["interrupt_message"] = self._interrupt_message
+        if interrupted and interrupt_reason:
+            result["interrupt_reason"] = interrupt_reason
+        if interrupted and interrupt_reason == "timeout" and final_response and "error" not in result:
+            result["error"] = final_response
         
         # Clear interrupt state after handling
         self.clear_interrupt()
@@ -8903,7 +9040,7 @@ class AIAgent:
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
 
-        return result
+        return _finish_run(result)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

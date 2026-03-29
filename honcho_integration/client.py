@@ -18,6 +18,7 @@ import os
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
 from typing import Any, TYPE_CHECKING
@@ -76,6 +77,12 @@ def _resolve_memory_mode(
         overrides = {}
 
     return {"memory_mode": default, "peer_memory_modes": overrides}
+
+
+def _is_local_base_url(value: str | None) -> bool:
+    parsed = urlparse(str(value or "").strip())
+    host = (parsed.hostname or "").strip().lower()
+    return host in {"localhost", "127.0.0.1", "::1", "host.docker.internal"}
 
 
 @dataclass
@@ -139,13 +146,32 @@ class HonchoClientConfig:
         """Create config from environment variables (fallback)."""
         api_key = os.environ.get("HONCHO_API_KEY")
         base_url = os.environ.get("HONCHO_BASE_URL", "").strip() or None
-        return cls(
+        config = cls(
             workspace_id=workspace_id,
             api_key=api_key,
             environment=os.environ.get("HONCHO_ENVIRONMENT", "production"),
             base_url=base_url,
             enabled=bool(api_key or base_url),
         )
+        try:
+            from hermes_cli.config import load_config, honcho_enabled_mode, honcho_local_only
+
+            hermes_cfg = load_config()
+            honcho_cfg = hermes_cfg.get("honcho", {}) if isinstance(hermes_cfg, dict) else {}
+            if isinstance(honcho_cfg, dict):
+                explicit_base = str(honcho_cfg.get("base_url") or "").strip()
+                if explicit_base:
+                    config.base_url = explicit_base
+            mode = honcho_enabled_mode(hermes_cfg)
+            if mode == "true":
+                config.enabled = True
+            elif mode == "false":
+                config.enabled = False
+            if honcho_local_only(hermes_cfg) and not _is_local_base_url(config.base_url):
+                config.enabled = False
+        except Exception:
+            pass
+        return config
 
     @classmethod
     def from_global_config(
@@ -198,7 +224,10 @@ class HonchoClientConfig:
         )
 
         base_url = (
-            raw.get("baseUrl")
+            host_block.get("baseUrl")
+            or host_block.get("base_url")
+            or raw.get("baseUrl")
+            or raw.get("base_url")
             or os.environ.get("HONCHO_BASE_URL", "").strip()
             or None
         )
@@ -241,7 +270,7 @@ class HonchoClientConfig:
             else raw.get("sessionPeerPrefix", False)
         )
 
-        return cls(
+        config = cls(
             host=host,
             workspace_id=workspace,
             api_key=api_key,
@@ -279,6 +308,25 @@ class HonchoClientConfig:
             raw=raw,
             explicitly_configured=_explicitly_configured,
         )
+        try:
+            from hermes_cli.config import load_config, honcho_enabled_mode, honcho_local_only
+
+            hermes_cfg = load_config()
+            honcho_cfg = hermes_cfg.get("honcho", {}) if isinstance(hermes_cfg, dict) else {}
+            if isinstance(honcho_cfg, dict):
+                explicit_base = str(honcho_cfg.get("base_url") or "").strip()
+                if explicit_base:
+                    config.base_url = explicit_base
+            mode = honcho_enabled_mode(hermes_cfg)
+            if mode == "true":
+                config.enabled = True
+            elif mode == "false":
+                config.enabled = False
+            if honcho_local_only(hermes_cfg) and not _is_local_base_url(config.base_url):
+                config.enabled = False
+        except Exception:
+            pass
+        return config
 
     @staticmethod
     def _git_repo_name(cwd: str) -> str | None:
@@ -387,7 +435,7 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
             "Honcho API key not found. "
             "Get your API key at https://app.honcho.dev, "
             "then run 'hermes honcho setup' or set HONCHO_API_KEY. "
-            "For local instances, set HONCHO_BASE_URL instead."
+            "For local instances, run 'hermes honcho local setup' or set HONCHO_BASE_URL instead."
         )
 
     try:
@@ -419,11 +467,7 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
 
     # Local Honcho instances don't require an API key, but the SDK
     # expects a non-empty string.  Use a placeholder for local URLs.
-    _is_local = resolved_base_url and (
-        "localhost" in resolved_base_url
-        or "127.0.0.1" in resolved_base_url
-        or "::1" in resolved_base_url
-    )
+    _is_local = _is_local_base_url(resolved_base_url)
     effective_api_key = config.api_key or ("local" if _is_local else None)
 
     kwargs: dict = {

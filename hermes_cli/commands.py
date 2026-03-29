@@ -64,8 +64,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
-    CommandDef("model", "Show or change the current model", "Configuration",
-               args_hint="[name]"),
+    CommandDef("model", "Show, change, or audit the current model defaults", "Configuration",
+               args_hint="[name|audit|audit apply]"),
     CommandDef("provider", "Show available providers and current provider",
                "Configuration"),
     CommandDef("prompt", "View/set custom system prompt", "Configuration",

@@ -19,6 +19,12 @@ Usage:
     hermes cron status         # Check if cron scheduler is running
     hermes doctor              # Check configuration and dependencies
     hermes honcho setup                    # Configure Honcho AI memory integration
+    hermes honcho local setup             # Configure a local Docker Honcho stack
+    hermes honcho local start             # Start the local Docker Honcho stack
+    hermes honcho local stop              # Stop the local Docker Honcho stack
+    hermes honcho local status            # Show local Docker Honcho service status
+    hermes honcho local model-audit       # Inspect the local Honcho LLM route Hermes expects
+    hermes honcho local model-apply       # Rewrite the local Honcho LLM route from Hermes config
     hermes honcho status                   # Show Honcho config and connection status
     hermes honcho sessions                 # List directory → session name mappings
     hermes honcho map <name>               # Map current directory to a session name
@@ -3878,6 +3884,178 @@ For more help on a command:
     honcho_subparsers.add_parser("setup", help="Interactive setup wizard for Honcho integration")
     honcho_subparsers.add_parser("status", help="Show current Honcho config and connection status")
     honcho_subparsers.add_parser("sessions", help="List known Honcho session mappings")
+
+    honcho_local = honcho_subparsers.add_parser(
+        "local",
+        help="Bootstrap and manage a local Docker Honcho stack",
+    )
+    honcho_local_subparsers = honcho_local.add_subparsers(dest="honcho_local_command")
+
+    honcho_local_setup = honcho_local_subparsers.add_parser(
+        "setup",
+        help="Prepare local Honcho config and optionally clone/start the Docker stack",
+    )
+    honcho_local_setup.add_argument(
+        "--start",
+        action="store_true",
+        help="Build and start the local Docker stack after configuring it",
+    )
+    honcho_local_setup.add_argument(
+        "--no-clone",
+        action="store_true",
+        help="Do not auto-clone the Honcho server source when it is missing",
+    )
+    honcho_local_setup.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Host port for the local Honcho API (default: 8420)",
+    )
+    honcho_local_setup.add_argument(
+        "--source-dir",
+        default=None,
+        help="Path to a local Honcho server checkout (defaults to docker/honcho/honcho-src)",
+    )
+    honcho_local_setup.add_argument(
+        "--git-url",
+        default="https://github.com/plastic-labs/honcho.git",
+        help="Git URL to clone when the source tree is missing",
+    )
+    honcho_local_setup.add_argument(
+        "--workspace",
+        default="hermes",
+        help="Workspace ID to save in the Hermes Honcho config",
+    )
+    honcho_local_setup.add_argument(
+        "--user-name",
+        default=None,
+        help="User peer name to save in the Hermes Honcho config",
+    )
+    honcho_local_setup.add_argument(
+        "--memory-mode",
+        choices=("hybrid", "honcho"),
+        default="hybrid",
+        help="Memory mode for Hermes when using local Honcho",
+    )
+    honcho_local_setup.add_argument(
+        "--recall-mode",
+        choices=("hybrid", "context", "tools"),
+        default="tools",
+        help="Recall mode for Hermes when using local Honcho",
+    )
+    honcho_local_setup.add_argument(
+        "--session-strategy",
+        choices=("per-session", "per-repo", "per-directory", "global"),
+        default="per-directory",
+        help="Session naming strategy for local Honcho",
+    )
+
+    honcho_local_start = honcho_local_subparsers.add_parser(
+        "start",
+        help="Build and start the local Docker Honcho stack",
+    )
+    honcho_local_start.add_argument(
+        "--no-clone",
+        action="store_true",
+        help="Do not auto-clone the Honcho server source when it is missing",
+    )
+    honcho_local_start.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Host port for the local Honcho API (default: 8420)",
+    )
+    honcho_local_start.add_argument(
+        "--source-dir",
+        default=None,
+        help="Path to a local Honcho server checkout (defaults to docker/honcho/honcho-src)",
+    )
+    honcho_local_start.add_argument(
+        "--git-url",
+        default="https://github.com/plastic-labs/honcho.git",
+        help="Git URL to clone when the source tree is missing",
+    )
+    honcho_local_start.add_argument(
+        "--wait",
+        type=int,
+        default=60,
+        help="Seconds to wait for the local Honcho HTTP endpoint to respond",
+    )
+
+    honcho_local_stop = honcho_local_subparsers.add_parser(
+        "stop",
+        help="Stop the local Docker Honcho stack",
+    )
+    honcho_local_stop.add_argument(
+        "--volumes",
+        action="store_true",
+        help="Also remove the local Postgres and Redis volumes",
+    )
+
+    honcho_local_subparsers.add_parser(
+        "status",
+        help="Show docker compose status for the local Honcho stack",
+    )
+
+    honcho_local_logs = honcho_local_subparsers.add_parser(
+        "logs",
+        help="Show logs for a local Honcho service",
+    )
+    honcho_local_logs.add_argument(
+        "service",
+        nargs="?",
+        default="api",
+        choices=("api", "deriver", "database", "redis"),
+        help="Service to tail logs from (default: api)",
+    )
+    honcho_local_logs.add_argument(
+        "--tail",
+        type=int,
+        default=100,
+        help="Number of log lines to show",
+    )
+
+    honcho_local_model_audit = honcho_local_subparsers.add_parser(
+        "model-audit",
+        help="Show the local Honcho LLM route Hermes expects and what is currently configured",
+    )
+    honcho_local_model_audit.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Host port for the local Honcho API (default: 8420)",
+    )
+    honcho_local_model_audit.add_argument(
+        "--source-dir",
+        default=None,
+        help="Path to a local Honcho server checkout (defaults to docker/honcho/honcho-src)",
+    )
+    honcho_local_model_audit.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the audit result as JSON",
+    )
+
+    honcho_local_model_apply = honcho_local_subparsers.add_parser(
+        "model-apply",
+        help="Rewrite the local Honcho LLM route from Hermes' current model settings",
+    )
+    honcho_local_model_apply.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Host port for the local Honcho API (default: 8420)",
+    )
+    honcho_local_model_apply.add_argument(
+        "--source-dir",
+        default=None,
+        help="Path to a local Honcho server checkout (defaults to docker/honcho/honcho-src)",
+    )
+    honcho_local_model_apply.add_argument(
+        "--restart",
+        action="store_true",
+        help="Restart the local Honcho Docker stack after applying the config",
+    )
 
     honcho_map = honcho_subparsers.add_parser(
         "map", help="Map current directory to a Honcho session name (no arg = list mappings)"

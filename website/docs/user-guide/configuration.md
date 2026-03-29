@@ -107,6 +107,15 @@ The OpenAI Codex provider authenticates via device code (open a URL, enter a cod
 Even when using Nous Portal, Codex, or a custom endpoint, some tools (vision, web summarization, MoA) use a separate "auxiliary" model — by default Gemini Flash via OpenRouter. An `OPENROUTER_API_KEY` enables these tools automatically. You can also configure which model and provider these tools use — see [Auxiliary Models](#auxiliary-models) below.
 :::
 
+If you want Hermes to fail closed instead of silently drifting to a different provider or model, set:
+
+```yaml
+fallbacks:
+  enabled: false
+```
+
+Then use `/model audit` or `/model audit apply` in the CLI to inspect and fill missing auxiliary/delegation model defaults explicitly.
+
 ### Anthropic (Native)
 
 Use Claude models directly through the Anthropic API — no OpenRouter proxy needed. Supports three auth methods:
@@ -603,6 +612,28 @@ You can switch between providers at any time with `hermes model` — no restart 
 | RL Training | [Tinker](https://tinker-console.thinkingmachines.ai/) + [WandB](https://wandb.ai/) | `TINKER_API_KEY`, `WANDB_API_KEY` |
 | Cross-session user modeling | [Honcho](https://honcho.dev/) | `HONCHO_API_KEY` |
 
+To prevent Hermes from auto-enabling Honcho from global credentials, set:
+
+```yaml
+honcho:
+  enabled: false
+```
+
+If you only want self-hosted Honcho, use:
+
+```yaml
+honcho:
+  enabled: auto
+  local_only: true
+  base_url: http://localhost:8000
+```
+
+Or let Hermes bootstrap the local Docker stack and write those settings for you:
+
+```bash
+hermes honcho local setup --start
+```
+
 ### Self-Hosting Firecrawl
 
 By default, Hermes uses the [Firecrawl cloud API](https://firecrawl.dev/) for web search and scraping. If you prefer to run Firecrawl locally, you can point Hermes at a self-hosted instance instead. See Firecrawl's [SELF_HOST.md](https://github.com/firecrawl/firecrawl/blob/main/SELF_HOST.md) for complete setup instructions.
@@ -961,9 +992,12 @@ Warnings are injected into the last tool result's JSON (as a `_budget_warning` f
 ```yaml
 agent:
   max_turns: 90                # Max iterations per conversation turn (default: 90)
+  max_wall_clock_seconds: 900  # Hard wall-clock timeout per turn (default: 15 minutes)
 ```
 
 Budget pressure is enabled by default. The agent sees warnings naturally as part of tool results, encouraging it to consolidate its work and deliver a response before running out of iterations.
+
+`agent.max_wall_clock_seconds` is a separate fail-safe from `max_turns`. It caps total elapsed time for one turn, interrupts the run if it gets stuck in retries/tools/subagents for too long, and returns a timeout message instead of silently hanging forever. Set it to `0` or omit it to disable the wall-clock guard.
 
 Hermes also injects a separate transient tool-use runtime status note on API calls when tools are enabled. That note tells the model whether tool calls are still usable on the current response, how many follow-up iterations remain after tool results come back, and whether any configured soft tool-call budget is exhausted. It is request-only metadata, so it does not alter the cached system prompt or leak stale counters into future turns.
 
@@ -1256,7 +1290,9 @@ This works with any skin — built-in or custom. Skin authors can provide `color
 | `all` | Every tool call with a short preview (default) |
 | `verbose` | Full args, results, and debug logs |
 
-In the CLI, cycle through these modes with `/verbose`. To use `/verbose` in messaging platforms (Telegram, Discord, Slack, etc.), set `tool_progress_command: true` in the `display` section above. The command will then cycle the mode and save to config.
+In the CLI, `new`, `all`, and `verbose` now keep tool/thinking activity lines in scrollback instead of only showing them in the transient spinner row. The spinner still reflects the live current status, but reads, shell commands, and similar tool starts no longer disappear once the next status arrives.
+
+Cycle through these modes with `/verbose`. To use `/verbose` in messaging platforms (Telegram, Discord, Slack, etc.), set `tool_progress_command: true` in the `display` section above. The command will then cycle the mode and save to config.
 
 ## Privacy
 
@@ -1454,6 +1490,7 @@ The `web_search`, `web_extract`, and `web_crawl` tools support three backend pro
 ```yaml
 web:
   backend: firecrawl    # firecrawl | parallel | tavily
+  local_only: true      # Optional: refuse remote hosted backends and require local Firecrawl
 ```
 
 | Backend | Env Var | Search | Extract | Crawl |
@@ -1463,6 +1500,8 @@ web:
 | **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ | ✔ |
 
 **Backend selection:** If `web.backend` is not set, the backend is auto-detected from available API keys. If only `TAVILY_API_KEY` is set, Tavily is used. If only `PARALLEL_API_KEY` is set, Parallel is used. Otherwise Firecrawl is the default.
+
+If you set `fallbacks.enabled: false`, Hermes stops auto-detecting a web backend from stray API keys. Set `web.backend` explicitly instead. If you also set `web.local_only: true`, Hermes requires `FIRECRAWL_API_URL` to point at a local/self-hosted Firecrawl instance and rejects remote-only cloud config.
 
 **Self-hosted Firecrawl:** Set `FIRECRAWL_API_URL` to point at your own instance. When a custom URL is set, the API key becomes optional (set `USE_DB_AUTHENTICATION=false` on the server to disable auth).
 
@@ -1549,6 +1588,7 @@ delegation:
   # provider: "openrouter"                  # Override provider (empty = inherit parent)
   # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
   # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
+  # max_wall_clock_seconds: 0               # 0 = inherit agent.max_wall_clock_seconds
 ```
 
 **Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
@@ -1558,6 +1598,8 @@ delegation:
 The delegation provider uses the same credential resolution as CLI/gateway startup. All configured providers are supported: `openrouter`, `nous`, `copilot`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`. When a provider is set, the system automatically resolves the correct base URL, API key, and API mode — no manual credential wiring needed.
 
 **Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
+
+By default, subagents inherit the parent's wall-clock timeout. Set `delegation.max_wall_clock_seconds` to a positive number if you want delegated work to fail faster than the main turn.
 
 ## Clarify
 

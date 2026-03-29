@@ -500,6 +500,9 @@ def run_job(
 
         # Max iterations
         max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        max_wall_clock_seconds = _cfg.get("agent", {}).get("max_wall_clock_seconds")
+        if not isinstance(max_wall_clock_seconds, (int, float)) or float(max_wall_clock_seconds) <= 0:
+            max_wall_clock_seconds = None
 
         # Provider routing
         pr = _cfg.get("provider_routing", {})
@@ -549,6 +552,7 @@ def run_job(
             acp_command=turn_route["runtime"].get("command"),
             acp_args=turn_route["runtime"].get("args"),
             max_iterations=max_iterations,
+            max_wall_clock_seconds=max_wall_clock_seconds,
             reasoning_config=reasoning_config,
             prefill_messages=prefill_messages,
             providers_allowed=pr.get("only"),
@@ -565,12 +569,64 @@ def run_job(
         )
         
         result = agent.run_conversation(prompt)
-        
+
         final_response = result.get("final_response", "") or ""
+        interrupted = bool(result.get("interrupted", False))
+        result_error = str(result.get("error") or "").strip()
+        completed_flag = result.get("completed")
+        completed = (
+            bool(completed_flag)
+            if completed_flag is not None
+            else not interrupted and not result_error
+        )
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
-        
+
+        if interrupted or not completed:
+            error_msg = (
+                result_error
+                or final_response
+                or "Cron agent did not complete successfully."
+            )
+            logger.error("Job '%s' ended without completion: %s", job_name, error_msg)
+            _emit_audit_event(
+                audit_store,
+                effective_session_id,
+                kind="cron",
+                phase="done",
+                status="error",
+                is_error=True,
+                title="Cron job failed",
+                preview=error_msg[:220],
+                payload={
+                    "job_id": job_id,
+                    "error": error_msg,
+                    "interrupted": interrupted,
+                    "completed": completed,
+                },
+            )
+
+            output = f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Prompt
+
+{prompt}
+
+## Response
+
+{logged_response}
+
+## Error
+
+{error_msg}
+"""
+            return False, output, final_response, error_msg
+
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
@@ -585,7 +641,7 @@ def run_job(
 
 {logged_response}
 """
-        
+
         logger.info("Job '%s' completed successfully", job_name)
         _emit_audit_event(
             audit_store,

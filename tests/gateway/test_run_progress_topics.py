@@ -82,6 +82,32 @@ class TransientEditFailureAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class CronTransientEditFailureAdapter(ProgressCaptureAdapter):
+    def __init__(self):
+        super().__init__(platform=Platform.DISCORD)
+        self._edit_attempts = 0
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self._edit_attempts += 1
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+            }
+        )
+        if self._edit_attempts == 1:
+            return SendResult(
+                success=False,
+                message_id=message_id,
+                error=(
+                    "503 Service Unavailable (error code: 0): upstream connect error "
+                    "or disconnect/reset before headers"
+                ),
+            )
+        return SendResult(success=True, message_id=message_id)
+
+
 class FakeAgent:
     def __init__(self, **kwargs):
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
@@ -184,6 +210,25 @@ class WaitingFakeAgent:
             "final_response": "done",
             "messages": [],
             "api_calls": 1,
+        }
+
+
+class TimeoutFakeAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs["tool_progress_callback"]
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback("terminal", "blogwatcher scan")
+        time.sleep(0.30)
+        return {
+            "final_response": "Operation timed out after 60 seconds.",
+            "messages": [],
+            "api_calls": 1,
+            "completed": False,
+            "interrupted": True,
+            "interrupt_reason": "timeout",
+            "error": "Operation timed out after 60 seconds.",
         }
 
 
@@ -502,6 +547,80 @@ async def test_gateway_terminal_logs_progress_updates(monkeypatch, tmp_path, cap
 
 
 @pytest.mark.asyncio
+async def test_run_agent_progress_finalizes_timeout_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TimeoutFakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-timeout",
+        session_key="agent:main:telegram:group:-1001:17585",
+    )
+
+    assert result["final_response"] == "Operation timed out after 60 seconds."
+    rendered = [entry["content"] for entry in adapter.sent] + [entry["content"] for entry in adapter.edits]
+    assert any("timed out after 60 seconds" in content for content in rendered)
+
+
+@pytest.mark.asyncio
+async def test_interactive_cron_run_finalizes_failed_progress(monkeypatch):
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter, platform=Platform.DISCORD)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1234",
+        chat_type="group",
+        thread_id="7777",
+    )
+    job = {
+        "id": "20e9d96e4430",
+        "name": "Run the heartbeat workflow",
+        "deliver": "origin",
+        "origin": {"platform": "discord", "chat_id": "1234", "thread_id": "7777"},
+    }
+
+    def fake_run_job(job_arg, **kwargs):
+        assert job_arg is job
+        kwargs["tool_progress_callback"]("terminal", "python heartbeat.py")
+        time.sleep(0.30)
+        return False, "# output", "", "Operation timed out after 60 seconds."
+
+    with patch("cron.jobs.save_job_output", return_value="out.md"), \
+         patch("cron.jobs.mark_job_run") as mark_job_run_mock, \
+         patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+         patch("cron.scheduler._resolve_delivery_target", return_value=None), \
+         patch("cron.scheduler._deliver_result"):
+        await runner._run_cron_job_interactive(job, source)
+
+    rendered = [entry["content"] for entry in adapter.sent] + [entry["content"] for entry in adapter.edits]
+    assert any("Operation timed out after 60 seconds." in content for content in rendered)
+    assert adapter.sent[-1]["content"].startswith("⚠️ Cron job 'Run the heartbeat workflow' failed:")
+    mark_job_run_mock.assert_called_once_with("20e9d96e4430", False, "Operation timed out after 60 seconds.")
+
+
+@pytest.mark.asyncio
 async def test_cron_run_command_starts_interactive_runner(monkeypatch):
     adapter = ProgressCaptureAdapter()
     runner = _make_runner(adapter, platform=Platform.DISCORD)
@@ -589,3 +708,52 @@ async def test_interactive_cron_run_streams_progress_and_completion(monkeypatch)
     save_output_mock.assert_called_once()
     mark_job_run_mock.assert_called_once_with("20e9d96e4430", True, None)
     deliver_result_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interactive_cron_run_keeps_single_progress_message_on_transient_edit_failure(monkeypatch):
+    adapter = CronTransientEditFailureAdapter()
+    runner = _make_runner(adapter, platform=Platform.DISCORD)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1234",
+        chat_type="group",
+        thread_id="7777",
+    )
+    job = {
+        "id": "20e9d96e4430",
+        "name": "Run the heartbeat workflow",
+        "deliver": "origin",
+        "origin": {"platform": "discord", "chat_id": "1234", "thread_id": "7777"},
+    }
+
+    def fake_run_job(job_arg, **kwargs):
+        assert job_arg is job
+        kwargs["tool_progress_callback"]("terminal", "python heartbeat.py")
+        time.sleep(0.30)
+        kwargs["tool_progress_callback"](
+            "_tool_result",
+            "terminal",
+            {
+                "tool": "terminal",
+                "duration_seconds": 0.42,
+                "is_error": False,
+                "status_suffix": "[ok]",
+                "result": json.dumps({"status": "ok", "details": "heartbeat refreshed"}),
+            },
+        )
+        time.sleep(0.30)
+        return True, "# output", "Heartbeat complete.", None
+
+    with patch("cron.jobs.save_job_output", return_value="out.md"), \
+         patch("cron.jobs.mark_job_run") as mark_job_run_mock, \
+         patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+         patch("cron.scheduler._resolve_delivery_target", return_value=None), \
+         patch("cron.scheduler._deliver_result"):
+        await runner._run_cron_job_interactive(job, source)
+
+    progress_sends = [entry for entry in adapter.sent if "Hermes is" in entry["content"]]
+    assert len(progress_sends) == 1
+    assert adapter._edit_attempts >= 2
+    assert adapter.sent[-1]["content"] == "Heartbeat complete."
+    mark_job_run_mock.assert_called_once_with("20e9d96e4430", True, None)

@@ -507,6 +507,32 @@ class TestDelegateObservability(unittest.TestCase):
             result = json.loads(delegate_task(goal="Test max iter", parent_agent=parent))
             self.assertEqual(result["results"][0]["exit_reason"], "max_iterations")
 
+    def test_exit_reason_timeout(self):
+        """Timed-out child should surface an explicit timed_out exit reason."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "Operation timed out after 60 seconds.",
+                "completed": False,
+                "interrupted": True,
+                "interrupt_reason": "timeout",
+                "error": "Operation timed out after 60 seconds.",
+                "api_calls": 4,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test timeout", parent_agent=parent))
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "timed_out")
+            self.assertEqual(entry["exit_reason"], "timed_out")
+            self.assertIn("timed out", entry["error"])
+
 
 class TestBlockedTools(unittest.TestCase):
     def test_blocked_tools_constant(self):

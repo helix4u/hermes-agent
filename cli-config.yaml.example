@@ -67,6 +67,16 @@ model:
 #     model: google/gemini-2.5-flash
 
 # =============================================================================
+# Fallback Kill Switch
+# =============================================================================
+# Disable silent provider/model/backend fallback. When false, Hermes fails
+# closed instead of routing to OpenRouter, Opus, or whatever API key happens
+# to be present.
+#
+# fallbacks:
+#   enabled: false
+
+# =============================================================================
 # Git Worktree Isolation
 # =============================================================================
 # When enabled, each CLI session creates an isolated git worktree so multiple
@@ -441,6 +451,11 @@ agent:
   # Higher = more room for complex tasks, but costs more tokens
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 60
+
+  # Hard wall-clock timeout per conversation turn (seconds)
+  # When reached, Hermes interrupts the turn and returns a timeout message
+  # instead of leaving the run stuck indefinitely
+  max_wall_clock_seconds: 900
   
   # Enable verbose logging
   verbose: false
@@ -713,6 +728,7 @@ code_execution:
 # Supports single tasks and batch mode (up to 3 parallel).
 delegation:
   max_iterations: 50                          # Max tool-calling turns per child (default: 50)
+  max_wall_clock_seconds: 0                   # 0 = inherit agent.max_wall_clock_seconds
   default_toolsets: ["terminal", "file", "web"]  # Default toolsets for subagents
   # model: "google/gemini-3-flash-preview"    # Override model for subagents (empty = inherit parent)
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
@@ -742,9 +758,10 @@ display:
 
   # Tool progress display level (CLI and gateway)
   #   off:     Silent — no tool activity shown, just the final response
-  #   new:     Show a tool indicator only when the tool changes (skip repeats)
-  #   all:     Show every tool call with a short preview (default)
+  #   new:     Persist a tool line only when the tool changes (skip repeats)
+  #   all:     Persist every tool call with a short preview (default)
   #   verbose: Full args, results, and debug logs (same as /verbose)
+  # In the CLI these lines stay in scrollback; the spinner still shows the live status.
   # Toggle at runtime with /verbose in the CLI
   tool_progress: all
 

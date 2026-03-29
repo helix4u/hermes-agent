@@ -103,3 +103,54 @@ class TestHonchoClientConfigAutoEnable:
 
         assert cfg.api_key == "fallback-key"
         assert cfg.enabled is True  # from_env() sets enabled=True
+
+    def test_hermes_config_can_force_honcho_off(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"apiKey": "test-api-key-12345"}))
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("honcho:\n  enabled: false\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        cfg = HonchoClientConfig.from_global_config(config_path=config_path)
+
+        assert cfg.enabled is False
+
+    def test_hermes_local_only_disables_remote_honcho(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"apiKey": "test-api-key-12345"}))
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("honcho:\n  local_only: true\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        cfg = HonchoClientConfig.from_global_config(config_path=config_path)
+
+        assert cfg.enabled is False
+
+    def test_honcho_host_block_accepts_base_url(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({
+            "hosts": {
+                "hermes": {
+                    "base_url": "http://localhost:8000",
+                    "enabled": True,
+                }
+            }
+        }))
+
+        cfg = HonchoClientConfig.from_global_config(config_path=config_path)
+
+        assert cfg.base_url == "http://localhost:8000"
+        assert cfg.enabled is True
+
+    def test_honcho_root_config_accepts_base_url_alias(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({
+            "base_url": "http://localhost:9000",
+        }))
+
+        cfg = HonchoClientConfig.from_global_config(config_path=config_path)
+
+        assert cfg.base_url == "http://localhost:9000"
+        assert cfg.enabled is True

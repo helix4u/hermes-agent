@@ -77,6 +77,30 @@ def _load_archive_fallback_config() -> dict:
     return archive_cfg if isinstance(archive_cfg, dict) else {}
 
 
+def _web_local_only() -> bool:
+    try:
+        from hermes_cli.config import web_local_only
+
+        return web_local_only()
+    except Exception:
+        return False
+
+
+def _fallbacks_enabled() -> bool:
+    try:
+        from hermes_cli.config import fallbacks_enabled
+
+        return fallbacks_enabled()
+    except Exception:
+        return True
+
+
+def _is_local_service_url(url: str) -> bool:
+    parsed = urlparse(str(url or "").strip())
+    host = (parsed.hostname or "").strip().lower()
+    return host in {"localhost", "127.0.0.1", "::1", "host.docker.internal"}
+
+
 def _normalize_archive_domains(value: Any) -> List[str]:
     if isinstance(value, str):
         domains = [part.strip().lower() for part in value.split(",")]
@@ -143,8 +167,26 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
+    local_only = _web_local_only()
     if configured in ("parallel", "firecrawl", "tavily", "exa"):
+        if local_only and configured != "firecrawl":
+            raise ValueError(
+                "web.local_only=true only supports a self-hosted Firecrawl backend. "
+                "Set web.backend=firecrawl and FIRECRAWL_API_URL to a local URL."
+            )
         return configured
+
+    if local_only:
+        if _has_env("FIRECRAWL_API_URL"):
+            return "firecrawl"
+        raise ValueError(
+            "web.local_only=true requires FIRECRAWL_API_URL to point to your local Firecrawl instance."
+        )
+
+    if not _fallbacks_enabled():
+        raise ValueError(
+            "Web backend auto-fallback is disabled. Set web.backend explicitly in config.yaml."
+        )
 
     # Fallback for manual / legacy config — use whichever key is present.
     has_firecrawl = _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")
@@ -164,37 +206,52 @@ def _get_backend() -> str:
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
 
 _firecrawl_client = None
+_firecrawl_client_config = None
+
 
 def _get_firecrawl_client():
     """Get or create the Firecrawl client (lazy initialization).
 
     Uses the cloud API by default (requires FIRECRAWL_API_KEY).
-    Set FIRECRAWL_API_URL to point at a self-hosted instance instead —
-    in that case the API key is optional (set USE_DB_AUTHENTICATION=false
+    Set FIRECRAWL_API_URL to point at a self-hosted instance instead -
+    in that case the API key is optional (set USE_DB_AUTHENTICATION=***
     on your Firecrawl server to disable auth entirely).
     """
     global _firecrawl_client
-    if _firecrawl_client is None:
-        if Firecrawl is None:
+    global _firecrawl_client_config
+
+    api_key = (os.getenv("FIRECRAWL_API_KEY") or "").strip()
+    api_url = (os.getenv("FIRECRAWL_API_URL") or "").strip()
+    current_config = (api_key, api_url)
+
+    if _firecrawl_client is not None and _firecrawl_client_config == current_config:
+        return _firecrawl_client
+
+    if Firecrawl is None:
+        raise ValueError(
+            "Firecrawl Python package is not installed. "
+            "Install the firecrawl client or switch web.backend to a different provider."
+        )
+    if _web_local_only():
+        if not api_url or not _is_local_service_url(api_url):
             raise ValueError(
-                "Firecrawl Python package is not installed. "
-                "Install the firecrawl client or switch web.backend to a different provider."
+                "web.local_only=true requires FIRECRAWL_API_URL to use a local address "
+                "(for example http://localhost:3002)."
             )
-        api_key = os.getenv("FIRECRAWL_API_KEY")
-        api_url = os.getenv("FIRECRAWL_API_URL")
-        if not api_key and not api_url:
-            logger.error("Firecrawl client initialization failed: missing configuration.")
-            raise ValueError(
-                "Firecrawl client not configured. "
-                "Set FIRECRAWL_API_KEY (cloud) or FIRECRAWL_API_URL (self-hosted). "
-                "This tool requires Firecrawl to be available."
-            )
-        kwargs = {}
-        if api_key:
-            kwargs["api_key"] = api_key
-        if api_url:
-            kwargs["api_url"] = api_url
-        _firecrawl_client = Firecrawl(**kwargs)
+    if not api_key and not api_url:
+        logger.error("Firecrawl client initialization failed: missing configuration.")
+        raise ValueError(
+            "Firecrawl client not configured. "
+            "Set FIRECRAWL_API_KEY (cloud) or FIRECRAWL_API_URL (self-hosted). "
+            "This tool requires Firecrawl to be available."
+        )
+    kwargs = {}
+    if api_key:
+        kwargs["api_key"] = api_key
+    if api_url:
+        kwargs["api_url"] = api_url
+    _firecrawl_client = Firecrawl(**kwargs)
+    _firecrawl_client_config = current_config
     return _firecrawl_client
 
 # ─── Parallel Client ─────────────────────────────────────────────────────────

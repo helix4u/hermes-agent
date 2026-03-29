@@ -988,3 +988,18 @@ class TestAuxiliaryMaxTokensParam:
              patch("agent.auxiliary_client._read_codex_access_token", return_value=None):
             result = auxiliary_max_tokens_param(1024)
         assert result == {"max_tokens": 1024}
+
+
+def test_resolve_auto_respects_main_provider_when_fallbacks_disabled(monkeypatch):
+    sentinel_client = object()
+    monkeypatch.setattr("agent.auxiliary_client._implicit_fallbacks_enabled", lambda: False)
+    monkeypatch.setattr("agent.auxiliary_client._read_main_provider", lambda: "nous")
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda provider, *args, **kwargs: (sentinel_client, "openai/gpt-5.4-mini") if provider == "nous" else (None, None),
+    )
+    with patch("agent.auxiliary_client._try_openrouter", side_effect=AssertionError("should not probe openrouter")):
+        client, model = _resolve_auto()
+
+    assert client is sentinel_client
+    assert model == "openai/gpt-5.4-mini"

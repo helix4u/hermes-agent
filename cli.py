@@ -1131,8 +1131,13 @@ class HermesCLI:
         # env vars would stomp each other.
         _model_config = CLI_CONFIG.get("model", {})
         _config_model = (_model_config.get("default") or _model_config.get("model") or "") if isinstance(_model_config, dict) else (_model_config or "")
+        try:
+            from hermes_cli.config import fallbacks_enabled as _fallbacks_enabled
+            self._implicit_fallbacks_enabled = _fallbacks_enabled(CLI_CONFIG)
+        except Exception:
+            self._implicit_fallbacks_enabled = True
         _FALLBACK_MODEL = "anthropic/claude-opus-4.6"
-        self.model = model or _config_model or _FALLBACK_MODEL
+        self.model = model or _config_model or (_FALLBACK_MODEL if self._implicit_fallbacks_enabled else "")
         # Auto-detect model from local server if still on fallback
         if self.model == _FALLBACK_MODEL:
             _base_url = (_model_config.get("base_url") or "") if isinstance(_model_config, dict) else ""
@@ -1145,7 +1150,7 @@ class HermesCLI:
         # to the global default.  Provider-specific normalisation may override
         # the default silently but should warn when overriding an explicit choice.
         self._model_is_default = not model and (
-            not _config_model or _config_model == _FALLBACK_MODEL
+            not _config_model or (_config_model == _FALLBACK_MODEL and self._implicit_fallbacks_enabled)
         )
 
         self._explicit_api_key = api_key
@@ -1188,6 +1193,18 @@ class HermesCLI:
             self.max_turns = int(os.getenv("HERMES_MAX_ITERATIONS"))
         else:
             self.max_turns = 90
+        raw_wall_clock_seconds = (
+            CLI_CONFIG.get("agent", {}).get("max_wall_clock_seconds")
+            if isinstance(CLI_CONFIG.get("agent"), dict)
+            else None
+        )
+        if raw_wall_clock_seconds in (None, "", 0, "0"):
+            raw_wall_clock_seconds = os.getenv("HERMES_MAX_WALL_CLOCK_SECONDS")
+        try:
+            parsed_wall_clock_seconds = float(raw_wall_clock_seconds)
+        except (TypeError, ValueError):
+            parsed_wall_clock_seconds = 0.0
+        self.max_wall_clock_seconds = parsed_wall_clock_seconds if parsed_wall_clock_seconds > 0 else None
         
         # Parse and validate toolsets
         self.enabled_toolsets = toolsets
@@ -1233,7 +1250,9 @@ class HermesCLI:
         
         # Fallback model config — tried when primary provider fails after retries
         fb = CLI_CONFIG.get("fallback_model") or {}
-        self._fallback_model = fb if fb.get("provider") and fb.get("model") else None
+        self._fallback_model = (
+            fb if self._implicit_fallbacks_enabled and fb.get("provider") and fb.get("model") else None
+        )
 
         # Optional cheap-vs-strong routing for simple turns
         self._smart_model_routing = CLI_CONFIG.get("smart_model_routing", {}) or {}
@@ -1294,6 +1313,8 @@ class HermesCLI:
         self._active_tool_status: dict[str, list[str]] = {}
         self._active_tool_count = 0
         self._last_tool_status: str = ""
+        self._persistent_tool_progress_seen: set[str] = set()
+        self._last_persistent_thinking: str = ""
         self._command_running = False
         self._command_status = ""
         self._attached_images: list[Path] = []
@@ -1574,12 +1595,71 @@ class HermesCLI:
         if not text:
             self._flush_reasoning_preview(force=True)
         if text:
+            self._emit_persistent_thinking_status(text)
             self._spinner_text = text
-        elif self._active_tool_status:
+        elif getattr(self, "_active_tool_status", None):
             self._refresh_tool_spinner_text()
         else:
             self._spinner_text = ""
         self._invalidate()
+
+    def _tool_progress_mode_name(self) -> str:
+        """Return the normalized CLI tool progress mode."""
+        mode = str(getattr(self, "tool_progress_mode", "all") or "all").strip().lower()
+        if mode in {"off", "new", "all", "verbose"}:
+            return mode
+        return "all"
+
+    def _emit_persistent_thinking_status(self, text: str) -> None:
+        """Keep top-level thinking updates in scrollback instead of only the spinner."""
+        mode = self._tool_progress_mode_name()
+        if mode not in {"all", "verbose"}:
+            return
+        cleaned = str(text or "").strip()
+        if not cleaned or cleaned == getattr(self, "_last_persistent_thinking", ""):
+            return
+        self._last_persistent_thinking = cleaned
+        _cprint(f"  ┊ 💭 {cleaned}")
+
+    def _emit_persistent_tool_status(self, function_name: str, preview: str, function_args: dict) -> None:
+        """Print a durable CLI activity line for tool starts."""
+        mode = self._tool_progress_mode_name()
+        if mode == "off":
+            return
+
+        if function_name == "_thinking":
+            self._emit_persistent_thinking_status(preview)
+            return
+
+        if function_name.startswith("_"):
+            return
+
+        if mode == "new":
+            seen = getattr(self, "_persistent_tool_progress_seen", None)
+            if seen is None:
+                seen = set()
+                self._persistent_tool_progress_seen = seen
+            if function_name in seen:
+                return
+            seen.add(function_name)
+
+        from agent.display import get_tool_emoji
+
+        emoji = get_tool_emoji(function_name, default="⚡")
+        detail = str(preview or "").strip()
+        if not detail and function_args:
+            detail = str(
+                function_args.get("command")
+                or function_args.get("path")
+                or function_args.get("query")
+                or function_args.get("url")
+                or ""
+            ).strip()
+
+        if detail:
+            _cprint(f"  ┊ {emoji} {function_name}: {detail}")
+        else:
+            _cprint(f"  ┊ {emoji} {function_name}")
 
     def _refresh_tool_spinner_text(self) -> None:
         """Render live concurrent-tool status into the TUI spinner line."""
@@ -1915,6 +1995,8 @@ class HermesCLI:
         self._active_tool_status.clear()
         self._active_tool_count = 0
         self._last_tool_status = ""
+        self._persistent_tool_progress_seen.clear()
+        self._last_persistent_thinking = ""
         self._spinner_text = ""
         self._invalidate()
 
@@ -2134,6 +2216,7 @@ class HermesCLI:
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 max_iterations=self.max_turns,
+                max_wall_clock_seconds=self.max_wall_clock_seconds,
                 enabled_toolsets=self.enabled_toolsets,
                 verbose_logging=self.verbose,
                 quiet_mode=not self.verbose,
@@ -3784,6 +3867,42 @@ class HermesCLI:
             # Use original case so model names like "Anthropic/Claude-Opus-4" are preserved
             parts = cmd_original.split(maxsplit=1)
             if len(parts) > 1:
+                audit_arg = parts[1].strip().lower()
+                if audit_arg == "audit" or audit_arg == "audit apply":
+                    from hermes_cli.model_audit import build_model_audit, apply_model_audit_defaults
+
+                    if audit_arg == "audit apply":
+                        result = apply_model_audit_defaults(persist=True)
+                        changes = result.get("changes", [])
+                        if changes:
+                            print("(^_^) Applied model audit defaults:")
+                            for change in changes:
+                                print(f"  - {change}")
+                        else:
+                            print("(^_^) Model audit found no missing defaults to apply.")
+                        return True
+
+                    report = build_model_audit()
+                    print("\nModel audit:")
+                    print(f"  Main: {report.get('main_provider') or '(unset)'} / {report.get('main_model') or '(unset)'}")
+                    print(
+                        "  Recommended auxiliary default: "
+                        f"{report.get('recommended_aux_provider') or '(unset)'} / "
+                        f"{report.get('recommended_aux_model') or '(unset)'}"
+                    )
+                    for entry in report.get("entries", []):
+                        provider = entry.get("provider") or "(unset)"
+                        model_name = entry.get("model") or "(unset)"
+                        recommendation = ""
+                        if entry.get("needs_provider") or entry.get("needs_model"):
+                            recommendation = (
+                                f" -> recommend {entry.get('recommended_provider') or provider} / "
+                                f"{entry.get('recommended_model') or model_name}"
+                            )
+                        print(f"  - {entry.get('name')}: {provider} / {model_name}{recommendation}")
+                    print("  Use /model audit apply to fill missing provider/model defaults.")
+                    return True
+
                 from hermes_cli.model_switch import switch_model, switch_to_custom_provider
 
                 raw_input = parts[1].strip()
@@ -4172,6 +4291,7 @@ class HermesCLI:
                     provider=self.provider,
                     api_mode=self.api_mode,
                     max_iterations=self.max_turns,
+                    max_wall_clock_seconds=self.max_wall_clock_seconds,
                     enabled_toolsets=self.enabled_toolsets,
                     quiet_mode=True,
                     verbose_logging=False,
@@ -4815,9 +4935,9 @@ class HermesCLI:
         from hermes_cli.colors import Colors as _Colors
         labels = {
             "off": f"{_Colors.DIM}Tool progress: OFF{_Colors.RESET} — silent mode, just the final response.",
-            "new": f"{_Colors.YELLOW}Tool progress: NEW{_Colors.RESET} — show each new tool (skip repeats).",
-            "all": f"{_Colors.GREEN}Tool progress: ALL{_Colors.RESET} — show every tool call.",
-            "verbose": f"{_Colors.BOLD}{_Colors.GREEN}Tool progress: VERBOSE{_Colors.RESET} — full args, results, think blocks, and debug logs.",
+            "new": f"{_Colors.YELLOW}Tool progress: NEW{_Colors.RESET} — keep one scrollback line per tool kind (skip repeats).",
+            "all": f"{_Colors.GREEN}Tool progress: ALL{_Colors.RESET} — keep every tool call in scrollback.",
+            "verbose": f"{_Colors.BOLD}{_Colors.GREEN}Tool progress: VERBOSE{_Colors.RESET} — scrollback + full args, results, think blocks, and debug logs.",
         }
         _cprint(labels.get(self.tool_progress_mode, ""))
 
@@ -5208,6 +5328,8 @@ class HermesCLI:
                 self._last_tool_status = f"completed {tool_name}"
             self._refresh_tool_spinner_text()
             return
+
+        self._emit_persistent_tool_status(function_name, preview, function_args)
 
         # Skip internal/thinking tools for active-tool tracking
         if function_name.startswith("_"):

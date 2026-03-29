@@ -206,6 +206,7 @@ Delegation has a **depth limit of 2** — a parent (depth 0) can spawn children 
 # In ~/.hermes/config.yaml
 delegation:
   max_iterations: 50                        # Max turns per child (default: 50)
+  max_wall_clock_seconds: 0                 # 0 = inherit agent.max_wall_clock_seconds
   default_toolsets: ["terminal", "file", "web"]  # Default toolsets
   model: "google/gemini-3-flash-preview"             # Optional provider/model override
   provider: "openrouter"                             # Optional built-in provider
@@ -216,6 +217,8 @@ delegation:
   base_url: "http://localhost:1234/v1"
   api_key: "local-key"
 ```
+
+Subagents inherit the parent turn's wall-clock timeout by default. If a delegated branch gets stuck, it now returns an explicit `timed_out` result instead of leaving the parent hanging on indefinite progress.
 
 :::tip
 The agent handles delegation automatically based on the task complexity. You don't need to explicitly ask it to delegate — it will do so when it makes sense.

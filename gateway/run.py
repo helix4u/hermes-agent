@@ -237,6 +237,8 @@ if _config_path.exists():
         if _agent_cfg and isinstance(_agent_cfg, dict):
             if "max_turns" in _agent_cfg:
                 os.environ["HERMES_MAX_ITERATIONS"] = str(_agent_cfg["max_turns"])
+            if "max_wall_clock_seconds" in _agent_cfg:
+                os.environ["HERMES_MAX_WALL_CLOCK_SECONDS"] = str(_agent_cfg["max_wall_clock_seconds"])
         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
         # HERMES_TIMEZONE from .env takes precedence (already in os.environ).
         _tz_cfg = _cfg.get("timezone", "")
@@ -466,7 +468,7 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     back to the hardcoded default ("anthropic/claude-opus-4.6") which fails
     when the active provider is openai-codex.
     """
-    model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
+    model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or ""
     cfg = config if config is not None else _load_gateway_config()
     requested_provider = ""
     model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
@@ -490,6 +492,20 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
             resolved_provider = _resolve_provider(resolved_provider)
     except Exception:
         resolved_provider = (requested_provider or "").strip().lower()
+
+    if not model:
+        try:
+            from hermes_cli.config import fallbacks_enabled as _fallbacks_enabled
+            allow_fallbacks = _fallbacks_enabled(cfg if isinstance(cfg, dict) else None)
+        except Exception:
+            allow_fallbacks = True
+        if allow_fallbacks:
+            model = "anthropic/claude-opus-4.6"
+        else:
+            raise RuntimeError(
+                "No model is configured for the gateway and implicit fallbacks are disabled. "
+                "Set model.default explicitly in config.yaml."
+            )
 
     return _normalize_gateway_model_for_provider(model, resolved_provider)
 
@@ -5314,6 +5330,7 @@ class GatewayRunner:
             "tool_calls": 0,
             "updates": 0,
             "recent_events": [],
+            "done": False,
         }
 
         def _push_recent_event(detail: str) -> None:
@@ -5381,12 +5398,20 @@ class GatewayRunner:
                 "thinking": "thinking",
                 "tool": "running tools",
                 "finalizing": "finalizing",
+                "completed": "finished",
+                "failed": "failed",
+                "interrupted": "interrupted",
+                "timed_out": "timed out",
             }.get(phase, "working")
             phase_emoji = {
                 "starting": "🚀",
                 "thinking": "💡",
                 "tool": "🛠️",
                 "finalizing": "🧾",
+                "completed": "✅",
+                "failed": "❌",
+                "interrupted": "⚡",
+                "timed_out": "⏱️",
             }.get(phase, "⚙️")
             header = f"{phase_emoji} Hermes is {phase_label} on cron job `{job.get('id', '?')}`... ({elapsed}s)"
             footer = f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
@@ -5443,18 +5468,63 @@ class GatewayRunner:
             progress_metadata["thread_id"] = source.thread_id
 
         async def send_progress_messages() -> None:
+            def _is_retryable_progress_edit_error(error_text: str | None) -> bool:
+                """Treat transient transport/server edit failures as retryable.
+
+                Interactive cron runs should preserve a single live progress
+                message through flaky Discord API responses instead of creating
+                a fresh message on every failed edit attempt.
+                """
+                err = (error_text or "").lower()
+                permanent_markers = (
+                    "unknown message",
+                    "not found",
+                    "forbidden",
+                    "missing access",
+                    "missing permissions",
+                    "cannot edit",
+                    "error code: 10008",
+                    "error code: 50013",
+                )
+                if any(marker in err for marker in permanent_markers):
+                    return False
+                transient_markers = (
+                    "503",
+                    "502",
+                    "504",
+                    "service unavailable",
+                    "gateway timeout",
+                    "upstream connect error",
+                    "remote connection failure",
+                    "reset before headers",
+                    "timeout",
+                    "timed out",
+                    "temporarily unavailable",
+                    "connection reset",
+                    "server disconnected",
+                    "try again",
+                    "rate limit",
+                    "429",
+                )
+                if any(marker in err for marker in transient_markers):
+                    return True
+                return True
+
             progress_msg_id = None
             last_rendered = ""
             while True:
                 try:
                     updated = False
+                    stop_requested = False
                     while True:
                         try:
-                            progress_queue.get_nowait()
+                            item = progress_queue.get_nowait()
                             updated = True
+                            if item == "__stop__":
+                                stop_requested = True
                         except queue.Empty:
                             break
-                    if not updated and progress_state["updates"] <= 0:
+                    if not updated and progress_state["updates"] <= 0 and not stop_requested:
                         await asyncio.sleep(0.25)
                         continue
                     msg = _build_progress_message()
@@ -5465,6 +5535,15 @@ class GatewayRunner:
                             content=msg,
                         )
                         if not result.success:
+                            if _is_retryable_progress_edit_error(result.error):
+                                logger.warning(
+                                    "Transient interactive cron progress edit failure for %s message %s; preserving live progress message: %s",
+                                    source.platform,
+                                    progress_msg_id,
+                                    result.error,
+                                )
+                                await asyncio.sleep(0.25)
+                                continue
                             progress_msg_id = None
                     if progress_msg_id is None:
                         result = await adapter.send(
@@ -5476,6 +5555,11 @@ class GatewayRunner:
                             progress_msg_id = result.message_id
                     last_rendered = msg
                     await adapter.send_typing(source.chat_id, metadata=progress_metadata)
+                    if stop_requested or progress_state.get("done"):
+                        with contextlib.suppress(Exception):
+                            if hasattr(adapter, "stop_typing"):
+                                await adapter.stop_typing(source.chat_id)
+                        return
                     await asyncio.sleep(0.25)
                 except asyncio.CancelledError:
                     if progress_msg_id and last_rendered:
@@ -5492,6 +5576,17 @@ class GatewayRunner:
                 except Exception as exc:
                     logger.error("Interactive cron progress error: %s", exc)
                     await asyncio.sleep(1)
+
+        async def _finalize_progress(phase: str, detail: str) -> None:
+            progress_state["done"] = True
+            _set_progress_state(phase=phase, detail=detail, tool_call=False)
+            progress_queue.put("__stop__")
+            try:
+                await asyncio.wait_for(progress_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                progress_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await progress_task
 
         progress_task = asyncio.create_task(send_progress_messages())
         job_id = str(job.get("id") or "?")
@@ -5521,9 +5616,13 @@ class GatewayRunner:
             error = str(exc)
             logger.error("Interactive cron run failed for %s: %s", job_id, exc, exc_info=True)
         finally:
-            progress_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await progress_task
+            if success:
+                await _finalize_progress("completed", "✅ Cron job finished.")
+            else:
+                failure_detail = str(error or final_response or "Cron job failed.").strip()
+                if len(failure_detail) > 220:
+                    failure_detail = failure_detail[:217] + "..."
+                await _finalize_progress("failed", f"❌ {failure_detail or 'Cron job failed.'}")
 
         output_file = save_job_output(job_id, output or f"# Cron Job: {job.get('name', job_id)}\n\n(No output captured)")
         deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job_id)}' failed:\n{error or 'unknown error'}"
@@ -8423,6 +8522,7 @@ class GatewayRunner:
             "tool_calls": 0,
             "updates": 0,
             "recent_events": [],
+            "done": False,
         }
 
         def _summarize_result_for_status(result_text: str, is_error: bool) -> str:
@@ -8522,12 +8622,20 @@ class GatewayRunner:
                 "thinking": "thinking",
                 "tool": "running commands",
                 "finalizing": "finalizing",
+                "completed": "finished",
+                "failed": "failed",
+                "interrupted": "interrupted",
+                "timed_out": "timed out",
             }.get(phase, "working")
             phase_emoji = {
                 "starting": "🚀",
                 "thinking": "💡",
                 "tool": "🛠️",
                 "finalizing": "🧾",
+                "completed": "✅",
+                "failed": "❌",
+                "interrupted": "⚡",
+                "timed_out": "⏱️",
             }.get(phase, "⚙️")
             header = f"{phase_emoji} Hermes is {phase_label}... ({elapsed}s)"
             footer = f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
@@ -8739,17 +8847,20 @@ class GatewayRunner:
             while True:
                 try:
                     updated = False
+                    stop_requested = False
                     while True:
                         try:
-                            progress_queue.get_nowait()
+                            item = progress_queue.get_nowait()
                             updated = True
+                            if item == "__stop__":
+                                stop_requested = True
                         except queue.Empty:
                             break
 
                     now = time.monotonic()
                     heartbeat_due = (now - last_emit_at) >= 1.0
-                    should_emit = updated or (progress_style == "single" and heartbeat_due)
-                    if progress_state["updates"] <= 0 and not updated:
+                    should_emit = updated or stop_requested or (progress_style == "single" and heartbeat_due)
+                    if progress_state["updates"] <= 0 and not updated and not stop_requested:
                         await asyncio.sleep(0.25)
                         continue
                     if not should_emit:
@@ -8804,6 +8915,11 @@ class GatewayRunner:
                         last_rendered = msg
                     last_emit_at = now
                     await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+                    if stop_requested or progress_state.get("done"):
+                        with contextlib.suppress(Exception):
+                            if hasattr(adapter, "stop_typing"):
+                                await adapter.stop_typing(source.chat_id)
+                        return
                     await asyncio.sleep(0.25)
                 except asyncio.CancelledError:
                     if progress_msg_id and last_rendered:
@@ -8822,6 +8938,61 @@ class GatewayRunner:
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
                     await asyncio.sleep(1)
+
+        async def _finalize_progress(phase: str, detail: str) -> None:
+            if not progress_task:
+                return
+            progress_state["done"] = True
+            _set_progress_state(phase=phase, detail=detail, tool_call=False)
+            if progress_queue:
+                progress_queue.put("__stop__")
+            try:
+                await asyncio.wait_for(progress_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                progress_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await progress_task
+
+        def _resolve_terminal_progress(result: dict | None, pending_message: str | None = None) -> tuple[str, str]:
+            if not isinstance(result, dict):
+                return "failed", "❌ Request failed."
+
+            interrupted = bool(result.get("interrupted"))
+            interrupt_reason = str(result.get("interrupt_reason") or "").strip().lower()
+            final_text = str(result.get("final_response") or "").strip()
+            error_text = str(result.get("error") or "").strip()
+
+            if interrupted:
+                if interrupt_reason == "timeout":
+                    detail = final_text or error_text or "Request timed out."
+                    if len(detail) > 220:
+                        detail = detail[:217] + "..."
+                    if not detail.startswith("⏱️"):
+                        detail = f"⏱️ {detail}"
+                    return "timed_out", detail
+                if pending_message:
+                    return "interrupted", "⚡ Interrupted by a newer message."
+                detail = final_text or "Operation interrupted."
+                if len(detail) > 220:
+                    detail = detail[:217] + "..."
+                if not detail.startswith("⚡"):
+                    detail = f"⚡ {detail}"
+                return "interrupted", detail
+
+            if result.get("completed"):
+                detail = final_text or "Reply ready."
+                if len(detail) > 220:
+                    detail = detail[:217] + "..."
+                if not detail.startswith("✅"):
+                    detail = f"✅ {detail}"
+                return "completed", detail
+
+            detail = error_text or final_text or "Request failed."
+            if len(detail) > 220:
+                detail = detail[:217] + "..."
+            if not detail.startswith("❌"):
+                detail = f"❌ {detail}"
+            return "failed", detail
         
         # We need to share the agent instance for interrupt support
         agent_holder = [None]  # Mutable container for the agent instance
@@ -9248,6 +9419,8 @@ class GatewayRunner:
                         break
         
         interrupt_monitor = asyncio.create_task(monitor_for_interrupt())
+        response = None
+        pending = None
         
         try:
             # Run in thread pool to not block
@@ -9280,7 +9453,6 @@ class GatewayRunner:
             
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
-            pending = None
             if result and adapter and session_key:
                 if result.get("interrupted"):
                     # Interrupted — consume the interrupt message
@@ -9350,9 +9522,17 @@ class GatewayRunner:
                     interrupt_depth=interrupt_depth + 1,
                 )
         finally:
-            # Stop progress sender and interrupt monitor
             if progress_task:
-                progress_task.cancel()
+                active_exc = sys.exc_info()[1]
+                if active_exc is not None:
+                    error_text = str(active_exc).strip() or type(active_exc).__name__
+                    if len(error_text) > 220:
+                        error_text = error_text[:217] + "..."
+                    await _finalize_progress("failed", f"❌ {error_text}")
+                else:
+                    phase, detail = _resolve_terminal_progress(result_holder[0], pending)
+                    await _finalize_progress(phase, detail)
+
             interrupt_monitor.cancel()
             
             # Clean up tracking
@@ -9361,7 +9541,7 @@ class GatewayRunner:
                 del self._running_agents[session_key]
             
             # Wait for cancelled tasks
-            for task in [progress_task, interrupt_monitor, tracking_task]:
+            for task in [interrupt_monitor, tracking_task]:
                 if task:
                     try:
                         await task

@@ -302,8 +302,11 @@ class TestReasoningPreviewBuffering(unittest.TestCase):
 
         cli = HermesCLI.__new__(HermesCLI)
         cli.verbose = True
+        cli.tool_progress_mode = "all"
         cli._spinner_text = ""
         cli._reasoning_preview_buf = ""
+        cli._persistent_tool_progress_seen = set()
+        cli._last_persistent_thinking = ""
         cli._invalidate = lambda *args, **kwargs: None
         return cli
 
@@ -364,6 +367,78 @@ class TestReasoningPreviewBuffering(unittest.TestCase):
         cli._reasoning_preview_buf = "a" * 30
         cli._flush_reasoning_preview(force=False)
         self.assertEqual(cli._reasoning_preview_buf, "a" * 30)
+
+    @patch("cli._cprint")
+    def test_thinking_status_is_persisted_in_all_mode(self, mock_cprint):
+        cli = self._make_cli()
+
+        cli._on_thinking("◉_◉ deliberating...")
+
+        self.assertEqual(cli._spinner_text, "◉_◉ deliberating...")
+        self.assertEqual(mock_cprint.call_count, 1)
+        rendered = mock_cprint.call_args[0][0]
+        self.assertIn("💭", rendered)
+        self.assertIn("deliberating", rendered)
+
+    @patch("cli._cprint")
+    def test_duplicate_thinking_status_is_not_repeated(self, mock_cprint):
+        cli = self._make_cli()
+
+        cli._on_thinking("(¬‿¬) processing...")
+        cli._on_thinking("(¬‿¬) processing...")
+
+        self.assertEqual(mock_cprint.call_count, 1)
+
+
+class TestPersistentToolProgress(unittest.TestCase):
+    def _make_cli(self, *, mode="all"):
+        from cli import HermesCLI
+
+        cli = HermesCLI.__new__(HermesCLI)
+        cli.tool_progress_mode = mode
+        cli._voice_mode = False
+        cli._spinner_text = ""
+        cli._active_tool_status = {}
+        cli._active_tool_count = 0
+        cli._last_tool_status = ""
+        cli._persistent_tool_progress_seen = set()
+        cli._last_persistent_thinking = ""
+        cli._invalidate = lambda *args, **kwargs: None
+        return cli
+
+    @patch("cli._cprint")
+    def test_tool_start_is_persisted_in_all_mode(self, mock_cprint):
+        cli = self._make_cli(mode="all")
+
+        cli._on_tool_progress("read_file", "/tmp/demo.txt", {"path": "/tmp/demo.txt"})
+
+        self.assertEqual(cli._active_tool_count, 1)
+        self.assertEqual(mock_cprint.call_count, 1)
+        rendered = mock_cprint.call_args[0][0]
+        self.assertIn("read_file", rendered)
+        self.assertIn("/tmp/demo.txt", rendered)
+
+    @patch("cli._cprint")
+    def test_new_mode_skips_repeated_tool_names(self, mock_cprint):
+        cli = self._make_cli(mode="new")
+
+        cli._on_tool_progress("read_file", "/tmp/one.txt", {"path": "/tmp/one.txt"})
+        cli._on_tool_progress("read_file", "/tmp/two.txt", {"path": "/tmp/two.txt"})
+
+        self.assertEqual(mock_cprint.call_count, 1)
+
+    @patch("cli._cprint")
+    def test_tool_result_does_not_duplicate_completion_line(self, mock_cprint):
+        cli = self._make_cli(mode="all")
+
+        cli._on_tool_progress(
+            "_tool_result",
+            "read_file",
+            {"tool": "read_file", "duration_seconds": 0.42},
+        )
+
+        self.assertEqual(mock_cprint.call_count, 0)
+        self.assertIn("completed read_file", cli._spinner_text)
 
 
 class TestReasoningDisplayModeSelection(unittest.TestCase):

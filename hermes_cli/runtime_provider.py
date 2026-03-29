@@ -369,6 +369,28 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
+    if provider == "custom":
+        runtime = _resolve_openrouter_runtime(
+            requested_provider=requested_provider,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+        )
+        model_cfg = _get_model_config()
+        has_custom_target = bool(
+            (explicit_base_url or "").strip()
+            or str(model_cfg.get("base_url") or "").strip()
+            or os.getenv("OPENAI_BASE_URL", "").strip()
+        )
+        base_url = str(runtime.get("base_url") or "").strip().rstrip("/")
+        if has_custom_target and base_url:
+            runtime["requested_provider"] = requested_provider
+            return runtime
+        raise AuthError(
+            "Custom endpoint requested but no custom base_url/api_key is configured. "
+            "Set model.base_url plus OPENAI_API_KEY (or model.api_key), or choose a different provider.",
+            code="custom_not_configured",
+        )
+
     # Anthropic (native Messages API)
     if provider == "anthropic":
         from agent.anthropic_adapter import resolve_anthropic_token

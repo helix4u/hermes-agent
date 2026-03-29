@@ -561,6 +561,41 @@ def _get_auxiliary_env_override(task: str, suffix: str) -> Optional[str]:
     return None
 
 
+def _implicit_fallbacks_enabled() -> bool:
+    try:
+        from hermes_cli.config import fallbacks_enabled
+
+        return fallbacks_enabled()
+    except Exception:
+        return True
+
+
+def _read_main_provider() -> str:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        model_cfg = cfg.get("model", {})
+        if isinstance(model_cfg, dict):
+            provider = str(model_cfg.get("provider") or "").strip().lower()
+            if provider and provider != "auto":
+                return provider
+    except Exception:
+        pass
+
+    env_provider = os.getenv("HERMES_INFERENCE_PROVIDER", "").strip().lower()
+    if env_provider and env_provider != "auto":
+        return env_provider
+
+    try:
+        from hermes_cli.auth import resolve_provider
+
+        provider = resolve_provider("auto")
+        return str(provider or "").strip().lower()
+    except Exception:
+        return ""
+
+
 def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
     or_key = os.getenv("OPENROUTER_API_KEY")
     if not or_key:
@@ -741,6 +776,14 @@ def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
     """Full auto-detection chain: OpenRouter → Nous → custom → Codex → API-key → None."""
     global auxiliary_is_nous
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
+    if not _implicit_fallbacks_enabled():
+        preferred = _read_main_provider()
+        if preferred:
+            client, model = resolve_provider_client(preferred)
+            if client is not None:
+                return client, model
+        logger.debug("Auxiliary client: implicit fallbacks disabled, auto provider unresolved")
+        return None, None
     for try_fn in (_try_openrouter, _try_nous, _try_custom_endpoint,
                    _try_codex, _resolve_api_key_provider):
         client, model = try_fn()
@@ -1137,6 +1180,13 @@ def resolve_vision_provider_client(
         return "custom", client, final_model
 
     if requested == "auto":
+        if not _implicit_fallbacks_enabled():
+            preferred = _preferred_main_vision_provider()
+            if preferred:
+                sync_client, default_model = _resolve_strict_vision_backend(preferred)
+                return _finalize(preferred, sync_client, default_model)
+            logger.debug("Auxiliary vision client: implicit fallbacks disabled, no preferred backend")
+            return None, None, None
         ordered = list(_VISION_AUTO_PROVIDER_ORDER)
         preferred = _preferred_main_vision_provider()
         if preferred in ordered:
@@ -1596,7 +1646,12 @@ def call_llm(
             api_key=api_key,
             async_mode=False,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and resolved_provider != "auto"
+            and not resolved_base_url
+            and _implicit_fallbacks_enabled()
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -1631,7 +1686,7 @@ def call_llm(
                     f"variable, or switch to a different provider with `hermes model`."
                 )
             # For auto/custom, fall back to OpenRouter
-            if not resolved_base_url:
+            if not resolved_base_url and _implicit_fallbacks_enabled():
                 logger.warning("Provider %s unavailable, falling back to openrouter",
                                resolved_provider)
                 client, final_model = _get_cached_client(
@@ -1746,7 +1801,12 @@ async def async_call_llm(
             api_key=api_key,
             async_mode=True,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and resolved_provider != "auto"
+            and not resolved_base_url
+            and _implicit_fallbacks_enabled()
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -1778,7 +1838,7 @@ async def async_call_llm(
                     f"was found. Set the {_explicit.upper()}_API_KEY environment "
                     f"variable, or switch to a different provider with `hermes model`."
                 )
-            if not resolved_base_url:
+            if not resolved_base_url and _implicit_fallbacks_enabled():
                 logger.warning("Provider %s unavailable, falling back to openrouter",
                                resolved_provider)
                 client, final_model = _get_cached_client(

@@ -299,3 +299,26 @@ async def test_browser_bridge_runtime_config_save_and_recall_search(tmp_path, mo
 
     assert recall_result["ok"] is True
     assert recall_result["date_awareness"] == "off"
+
+
+@pytest.mark.asyncio
+async def test_browser_bridge_runtime_config_get_survives_codex_status_probe(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+
+    result = await runner._handle_browser_bridge_session(
+        {
+            "action": "runtime_config_get",
+            "selected_provider": "nous",
+        }
+    )
+
+    provider_status = {
+        entry["id"]: entry.get("status", {})
+        for entry in result["providers"]
+        if isinstance(entry, dict) and entry.get("id")
+    }
+
+    assert result["ok"] is True
+    assert "openai-codex" in provider_status

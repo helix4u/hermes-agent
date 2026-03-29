@@ -155,6 +155,7 @@ def _build_child_agent(
     model: Optional[str],
     max_iterations: int,
     parent_agent,
+    max_wall_clock_seconds: Optional[float] = None,
     # Credential overrides from delegation config (provider:model resolution)
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
@@ -215,6 +216,7 @@ def _build_child_agent(
         acp_command=effective_acp_command,
         acp_args=effective_acp_args,
         max_iterations=max_iterations,
+        max_wall_clock_seconds=max_wall_clock_seconds,
         max_tokens=getattr(parent_agent, "max_tokens", None),
         reasoning_config=getattr(parent_agent, "reasoning_config", None),
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
@@ -285,9 +287,12 @@ def _run_single_child(
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
+        interrupt_reason = str(result.get("interrupt_reason") or "").strip().lower()
         api_calls = result.get("api_calls", 0)
 
-        if interrupted:
+        if interrupted and interrupt_reason == "timeout":
+            status = "timed_out"
+        elif interrupted:
             status = "interrupted"
         elif completed and summary:
             status = "completed"
@@ -333,7 +338,9 @@ def _run_single_child(
                         tool_trace[-1].update(result_meta)
 
         # Determine exit reason
-        if interrupted:
+        if interrupted and interrupt_reason == "timeout":
+            exit_reason = "timed_out"
+        elif interrupted:
             exit_reason = "interrupted"
         elif completed:
             exit_reason = "completed"
@@ -359,8 +366,12 @@ def _run_single_child(
             },
             "tool_trace": tool_trace,
         }
-        if status == "failed":
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+        if status in {"failed", "timed_out"}:
+            entry["error"] = (
+                result.get("error")
+                or summary
+                or "Subagent did not produce a response."
+            )
 
         return entry
 
@@ -377,6 +388,12 @@ def _run_single_child(
         }
 
     finally:
+        if child_progress_cb and hasattr(child_progress_cb, '_flush'):
+            try:
+                child_progress_cb._flush()
+            except Exception as e:
+                logger.debug("Progress callback flush failed in finally: %s", e)
+
         # Restore the parent's tool names so the process-global is correct
         # for any subsequent execute_code calls or other consumers.
         import model_tools
@@ -431,6 +448,16 @@ def delegate_task(
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     effective_max_iter = max_iterations or default_max_iter
+    configured_timeout = cfg.get("max_wall_clock_seconds")
+    if isinstance(configured_timeout, (int, float)) and float(configured_timeout) > 0:
+        effective_timeout = float(configured_timeout)
+    else:
+        parent_timeout = getattr(parent_agent, "max_wall_clock_seconds", None)
+        effective_timeout = (
+            float(parent_timeout)
+            if isinstance(parent_timeout, (int, float)) and float(parent_timeout) > 0
+            else None
+        )
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -480,7 +507,9 @@ def delegate_task(
             child = _build_child_agent(
                 task_index=i, goal=t["goal"], context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets, model=creds["model"],
-                max_iterations=effective_max_iter, parent_agent=parent_agent,
+                max_iterations=effective_max_iter,
+                max_wall_clock_seconds=effective_timeout,
+                parent_agent=parent_agent,
                 override_provider=creds["provider"], override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],

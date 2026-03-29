@@ -20,6 +20,7 @@ import logging
 import os
 import shutil
 import shlex
+import sys
 import stat
 import base64
 import hashlib
@@ -736,6 +737,20 @@ def resolve_provider(
                 return active
     except Exception as e:
         logger.debug("Could not detect active auth provider: %s", e)
+
+    try:
+        from hermes_cli.config import fallbacks_enabled as _fallbacks_enabled
+        implicit_fallbacks = _fallbacks_enabled()
+    except Exception:
+        implicit_fallbacks = True
+
+    if not implicit_fallbacks:
+        raise AuthError(
+            "Implicit provider fallbacks are disabled. "
+            "Set model.provider explicitly, log in to the provider you want, "
+            "or re-enable fallbacks in config.yaml.",
+            code="fallbacks_disabled",
+        )
 
     if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
         return "openrouter"
