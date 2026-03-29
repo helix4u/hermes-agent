@@ -965,6 +965,8 @@ agent:
 
 Budget pressure is enabled by default. The agent sees warnings naturally as part of tool results, encouraging it to consolidate its work and deliver a response before running out of iterations.
 
+Hermes also injects a separate transient tool-use runtime status note on API calls when tools are enabled. That note tells the model whether tool calls are still usable on the current response, how many follow-up iterations remain after tool results come back, and whether any configured soft tool-call budget is exhausted. It is request-only metadata, so it does not alter the cached system prompt or leak stale counters into future turns.
+
 ## Context Pressure Warnings
 
 Separate from iteration budget pressure, context pressure tracks how close the conversation is to the **compaction threshold** — the point where context compression fires to summarize older messages. This helps both you and the agent understand when the conversation is getting long.

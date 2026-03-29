@@ -262,11 +262,57 @@ class TestHandleUpdateCommand:
              patch("subprocess.Popen", mock_popen):
             result = await runner._handle_update_command(event)
 
-        # Verify bash -c nohup fallback was used
         call_args = mock_popen.call_args[0][0]
-        assert call_args[0] == "bash"
-        assert "nohup" in call_args[2]
-        assert ".update_exit_code" in call_args[2]
+        if os.name == "nt":
+            assert call_args[0] == os.sys.executable
+            assert call_args[1] == "-c"
+            assert str(hermes_home / ".update_exit_code") in call_args
+        else:
+            assert call_args[0] == "bash"
+            assert "nohup" in call_args[2]
+            assert ".update_exit_code" in call_args[2]
+        assert "Starting Hermes update" in result
+
+    @pytest.mark.asyncio
+    async def test_windows_fallback_uses_detached_python_runner(self, tmp_path):
+        """Windows fallback avoids bash/nohup and uses a detached Python runner."""
+        runner = _make_runner()
+        event = _make_event()
+
+        fake_root = tmp_path / "project"
+        fake_root.mkdir()
+        (fake_root / ".git").mkdir()
+        (fake_root / "gateway").mkdir()
+        (fake_root / "gateway" / "run.py").touch()
+        fake_file = str(fake_root / "gateway" / "run.py")
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        mock_popen = MagicMock()
+
+        def which_windows(x):
+            if x == "hermes":
+                return r"C:\Hermes\hermes.exe"
+            if x == "systemd-run":
+                return None
+            return None
+
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("gateway.run.__file__", fake_file), \
+             patch("gateway.run.os.name", "nt"), \
+             patch("shutil.which", side_effect=which_windows), \
+             patch("subprocess.Popen", mock_popen):
+            result = await runner._handle_update_command(event)
+
+        call_args = mock_popen.call_args[0][0]
+        call_kwargs = mock_popen.call_args[1]
+        assert call_args[0] == os.sys.executable
+        assert call_args[1] == "-c"
+        assert "subprocess.run(hermes + ['update']" in call_args[2]
+        assert str(hermes_home / ".update_output.txt") in call_args
+        assert str(hermes_home / ".update_exit_code") in call_args
+        assert call_kwargs["creationflags"] != 0
+        assert call_kwargs["stdin"] is not None
         assert "Starting Hermes update" in result
 
     @pytest.mark.asyncio
@@ -401,7 +447,8 @@ class TestSendUpdateNotification:
         }
         (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
         (hermes_home / ".update_output.txt").write_text(
-            "→ Found 3 new commit(s)\n✓ Code updated!\n✓ Update complete!"
+            "→ Found 3 new commit(s)\n✓ Code updated!\n✓ Update complete!",
+            encoding="utf-8",
         )
         (hermes_home / ".update_exit_code").write_text("0")
 
@@ -428,7 +475,8 @@ class TestSendUpdateNotification:
         pending = {"platform": "telegram", "chat_id": "111", "user_id": "222"}
         (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
         (hermes_home / ".update_output.txt").write_text(
-            "\x1b[32m✓ Code updated!\x1b[0m\n\x1b[1mDone\x1b[0m"
+            "\x1b[32m✓ Code updated!\x1b[0m\n\x1b[1mDone\x1b[0m",
+            encoding="utf-8",
         )
         (hermes_home / ".update_exit_code").write_text("0")
 
@@ -523,7 +571,7 @@ class TestSendUpdateNotification:
         pending_path.write_text(json.dumps({
             "platform": "telegram", "chat_id": "111", "user_id": "222",
         }))
-        output_path.write_text("✓ Done")
+        output_path.write_text("✓ Done", encoding="utf-8")
         exit_code_path.write_text("0")
 
         mock_adapter = AsyncMock()
@@ -549,7 +597,7 @@ class TestSendUpdateNotification:
         pending_path.write_text(json.dumps({
             "platform": "telegram", "chat_id": "111", "user_id": "222",
         }))
-        output_path.write_text("✓ Done")
+        output_path.write_text("✓ Done", encoding="utf-8")
         exit_code_path.write_text("0")
 
         # Adapter send raises

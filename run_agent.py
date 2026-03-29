@@ -46,6 +46,32 @@ from datetime import datetime
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+try:
+    from hermes_cli.colors import strip_ansi as _strip_cli_ansi
+except Exception:
+    def _strip_cli_ansi(text):
+        return text
+
+
+def _ensure_project_root_precedence() -> None:
+    """Put this project root first on sys.path to avoid cwd shadowing."""
+    project_root = Path(__file__).resolve().parent
+    target = os.path.normcase(os.path.normpath(str(project_root)))
+    cleaned = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        try:
+            norm = os.path.normcase(os.path.normpath(entry))
+        except Exception:
+            norm = entry
+        if norm == target:
+            continue
+        cleaned.append(entry)
+    sys.path[:] = [str(project_root), *cleaned]
+
+
+_ensure_project_root_precedence()
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -137,6 +163,15 @@ class _SafeWriter:
     def write(self, data):
         try:
             return self._inner.write(data)
+        except UnicodeEncodeError:
+            if isinstance(data, str):
+                encoding = getattr(self._inner, "encoding", None) or "utf-8"
+                safe = data.encode(encoding, errors="replace").decode(encoding, errors="replace")
+                try:
+                    return self._inner.write(safe)
+                except Exception:
+                    return len(safe)
+            return 0
         except (OSError, ValueError):
             return len(data) if isinstance(data, str) else 0
 
@@ -238,6 +273,10 @@ _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
 
 # Maximum number of concurrent worker threads for parallel tool execution.
 _MAX_TOOL_WORKERS = 8
+
+# Emit periodic "still running" progress updates for long-lived tools so
+# gateway/sidecar users are not left staring at a silent spinner.
+_TOOL_PROGRESS_HEARTBEAT_SECONDS = 5.0
 
 # Patterns that indicate a terminal command may modify/delete files.
 _DESTRUCTIVE_PATTERNS = re.compile(
@@ -494,6 +533,7 @@ class AIAgent:
         tool_gen_callback: callable = None,
         status_callback: callable = None,
         max_tokens: int = None,
+        max_tool_calls_per_run: int = None,
         reasoning_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
@@ -537,6 +577,7 @@ class AIAgent:
             clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
                 Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
             max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
+            max_tool_calls_per_run (int): Soft tool-call budget used for guidance prompts (optional).
             reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
                 If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
             prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
@@ -624,6 +665,12 @@ class AIAgent:
         self.stream_delta_callback = stream_delta_callback
         self.status_callback = status_callback
         self.tool_gen_callback = tool_gen_callback
+        self.max_tool_calls_per_run = (
+            max_tool_calls_per_run
+            if isinstance(max_tool_calls_per_run, int) and max_tool_calls_per_run > 0
+            else None
+        )
+        self._tool_calls_executed_total = 0
         self._last_reported_tool = None  # Track for "new tool" mode
         
         # Tool execution state — allows _vprint during tool execution
@@ -983,6 +1030,7 @@ class AIAgent:
         
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
+        self._audit_store = None
         self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
         if self._session_db:
             try:
@@ -1007,6 +1055,23 @@ class AIAgent:
                 logger.warning(
                     "Session DB create_session failed (session_search still available): %s", e
                 )
+            try:
+                from hermes_state import AuditEventStore
+                self._audit_store = AuditEventStore(self._session_db)
+                self._audit_emit(
+                    kind="system",
+                    phase="starting",
+                    status="ok",
+                    title="Session started",
+                    preview=f"model={self.model}",
+                    payload={
+                        "model": self.model,
+                        "provider": self.provider,
+                        "platform": self.platform or "cli",
+                    },
+                )
+            except Exception as e:
+                logger.debug("Audit event store setup failed: %s", e)
         
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
@@ -1290,9 +1355,19 @@ class AIAgent:
         """
         if not force and getattr(self, "_mute_post_response", False):
             return
+            return
         if not force and self._has_stream_consumers() and not self._executing_tools:
             return
-        self._safe_print(*args, **kwargs)
+        try:
+            from hermes_cli.colors import strip_ansi
+
+            sanitized_args = tuple(
+                strip_ansi(arg) if isinstance(arg, str) else arg
+                for arg in args
+            )
+        except Exception:
+            sanitized_args = args
+        self._safe_print(*sanitized_args, **kwargs)
 
     def _emit_status(self, message: str) -> None:
         """Emit a lifecycle status message to both CLI and gateway channels.
@@ -1739,6 +1814,125 @@ class AIAgent:
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+
+    def _audit_emit(
+        self,
+        *,
+        kind: str,
+        phase: str = None,
+        span_id: str = None,
+        parent_span_id: str = None,
+        tool_name: str = None,
+        status: str = None,
+        duration_ms: int = None,
+        is_error: bool = False,
+        title: str = None,
+        preview: str = None,
+        payload: Any = None,
+    ) -> None:
+        """Persist an audit event when session DB logging is available."""
+        if not self._audit_store or not self.session_id:
+            return
+        try:
+            self._audit_store.append(
+                self.session_id,
+                kind=kind,
+                phase=phase,
+                span_id=span_id,
+                parent_span_id=parent_span_id,
+                tool_name=tool_name,
+                status=status,
+                duration_ms=duration_ms,
+                is_error=is_error,
+                title=title,
+                preview=preview,
+                payload=payload,
+                source_platform=self.platform or "cli",
+                source_surface=self.platform or "cli",
+            )
+        except Exception as e:
+            logger.debug("Audit event append failed: %s", e)
+
+    def _audit_emit_thinking(self, text: str) -> None:
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return
+        self._audit_emit(
+            kind="thinking",
+            phase="thinking",
+            status="running",
+            title="Thinking",
+            preview=cleaned,
+            payload={"text": cleaned},
+        )
+
+    def _audit_emit_tool_start(self, tool_name: str, tool_args: Dict[str, Any], span_id: str) -> None:
+        preview = _build_tool_preview(tool_name, tool_args) or tool_name
+        self._audit_emit(
+            kind="tool_start",
+            phase="tool",
+            span_id=span_id,
+            tool_name=tool_name,
+            status="running",
+            title=f"{tool_name} started",
+            preview=preview,
+            payload={"args": tool_args},
+        )
+
+    def _audit_emit_tool_finish(
+        self,
+        tool_name: str,
+        tool_result: str,
+        duration_seconds: float,
+        span_id: str,
+        *,
+        is_error: bool,
+        status_suffix: str = "",
+    ) -> None:
+        status = "error" if is_error else "ok"
+        preview = tool_result[:400] if isinstance(tool_result, str) else str(tool_result)
+        if status_suffix:
+            preview = f"{status_suffix.strip()} {preview}".strip()
+        self._audit_emit(
+            kind="tool_finish",
+            phase="tool",
+            span_id=span_id,
+            tool_name=tool_name,
+            status=status,
+            duration_ms=max(0, int((duration_seconds or 0.0) * 1000)),
+            is_error=is_error,
+            title=f"{tool_name} finished",
+            preview=preview,
+            payload={
+                "result": tool_result[:4000] if isinstance(tool_result, str) else str(tool_result),
+                "status_suffix": status_suffix.strip(),
+            },
+        )
+
+    def _audit_emit_message(self, content: str, *, status: str = "ok") -> None:
+        text = (content or "").strip()
+        if not text:
+            return
+        self._audit_emit(
+            kind="message",
+            phase="done",
+            status=status,
+            is_error=status == "error",
+            title="Assistant response" if status == "ok" else "Assistant error response",
+            preview=text[:220],
+            payload={"content": text[:4000]},
+        )
+
+    def _audit_emit_error(self, title: str, error_text: str, *, payload: Any = None) -> None:
+        self._audit_emit(
+            kind="error",
+            phase="finalizing",
+            status="error",
+            is_error=True,
+            title=title,
+            preview=(error_text or "")[:220],
+            payload=payload or {"error": error_text},
+        )
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -2833,6 +3027,110 @@ class AIAgent:
                 logger.warning("Removed duplicate tool call: %s", tc.function.name)
         return unique if len(unique) < len(tool_calls) else tool_calls
 
+    def _build_environment_hint(self) -> str:
+        """
+        Build a per-call environment hint describing the local shell/OS.
+
+        This is injected via the ephemeral system prompt so shell switching
+        (for example `HERMES_WINDOWS_SHELL=cmd` vs `powershell` vs `wsl`)
+        takes effect on the very next turn without requiring a new session.
+        """
+        # Only add explicit hints for Windows hosts; POSIX shells are usually
+        # unambiguous from command behavior.
+        if os.name != "nt":
+            return ""
+
+        from tools.environments.shell_utils import (
+            get_local_shell_mode,
+            resolve_windows_shell_override,
+        )
+
+        mode = get_local_shell_mode()
+        override = resolve_windows_shell_override()
+        stale_shell_warning = (
+            "If memory, Honcho context, or prior observations mention WSL, `/mnt/c/...`, "
+            "Cygwin, or a mixed shell context that conflicts with this runtime, treat those "
+            "notes as stale and ignore them for this turn. Prefer paths rooted in the active "
+            "workspace/current shell context, and do not guess alternate home-directory copies "
+            "of project files. "
+        )
+
+        if mode == "powershell":
+            return (
+                "Environment: You are running on a Windows host with a PowerShell local terminal "
+                f"(HERMES_WINDOWS_SHELL={override}). For commands that run in the local terminal, "
+                "use PowerShell syntax and Windows-style paths. Prefer `Get-ChildItem` over `ls`, "
+                "`Select-String` over `grep`, and `New-Item -ItemType Directory -Force` over "
+                "`mkdir -p`. Do not assume POSIX command behavior unless a tool explicitly targets "
+                "a Unix/containerized environment. "
+                f"{stale_shell_warning}"
+                "To verify the active shell, run: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell — "
+                "When the user gives a direct terminal action, do that action first before memory "
+                "or worldview file reads."
+            )
+        if mode == "wsl":
+            return (
+                "Environment: You are on a Windows host but the local terminal is WSL (Linux) "
+                f"(HERMES_WINDOWS_SHELL={override}). Commands run in a POSIX shell with tools like "
+                "`ls`, `grep`, and `mkdir -p` available. Use POSIX paths inside WSL (for example "
+                "`/mnt/c/Users/...`) instead of raw `C:\\` paths. "
+                "When the user gives a direct terminal action, do that action first before memory "
+                "or worldview file reads."
+            )
+        if mode == "cmd":
+            return (
+                "Environment: You are running on Windows with a cmd.exe local terminal "
+                f"(HERMES_WINDOWS_SHELL={override}). Run commands directly in cmd: use `dir`, "
+                "`type`, `cd`, `mkdir`, and `%VAR%` env-var expansion with Windows `C:\\` paths. "
+                "Do NOT use PowerShell syntax and do NOT assume POSIX commands like `pwd`, `uname`, "
+                "`ls`, or `grep`. "
+                f"{stale_shell_warning}"
+                "To verify the active shell, run: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell — "
+                "When the user gives a direct terminal action, do that action first before memory "
+                "or worldview file reads."
+            )
+
+        return (
+            f"Environment: You are running on Windows with local shell mode '{mode}' "
+            f"(HERMES_WINDOWS_SHELL={override}). Choose syntax for this shell and do not assume "
+            "Unix/POSIX command behavior. When the user gives a direct terminal action, do that "
+            "action first before memory or worldview file reads."
+        )
+
+    def _build_skill_routing_hint(self, user_message: str) -> str:
+        """
+        Build a narrow per-turn skill-routing hint for requests that match an
+        installed skill very clearly.
+        """
+        if "skill_view" not in (self.valid_tool_names or set()):
+            return ""
+
+        text = str(user_message or "").strip().lower()
+        if not text:
+            return ""
+
+        kokoro_markers = (
+            "kokoro",
+            "kokoro-fastapi",
+            "localhost:8880",
+            "/v1/audio/voices",
+            "/v1/audio/speech",
+            "af_bella",
+            "af_sky",
+            "af_nicole",
+            "af_v0",
+        )
+        if any(marker in text for marker in kokoro_markers):
+            return (
+                "Skill routing hint for this turn: this request strongly matches the installed "
+                "skill `kokoro-tts`. Load it with skill_view('kokoro-tts') before broad "
+                "research. Prefer the local Kokoro FastAPI workflow and the built-in "
+                "`text_to_speech` provider `kokoro` over generic web_search/web_extract unless "
+                "the local service or voice discovery step fails."
+            )
+
+        return ""
+
     def _repair_tool_call(self, tool_name: str) -> str | None:
         """Attempt to repair a mismatched tool name before aborting.
 
@@ -3646,7 +3944,17 @@ class AIAgent:
         try:
             from hermes_cli.auth import resolve_codex_runtime_credentials
 
-            creds = resolve_codex_runtime_credentials(force_refresh=force)
+            allow_device_auth = None
+            platform_key = (self.platform or "").lower().strip()
+            if platform_key == "cron":
+                allow_device_auth = False
+            elif platform_key == "cli":
+                allow_device_auth = True
+
+            creds = resolve_codex_runtime_credentials(
+                force_refresh=force,
+                allow_device_auth=allow_device_auth,
+            )
         except Exception as exc:
             logger.debug("Codex credential refresh failed: %s", exc)
             return False
@@ -5150,11 +5458,44 @@ class AIAgent:
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
 
-        compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+        anchor_key = "_hermes_current_turn_user"
+        compression_input = messages
+        anchored_idx = getattr(self, "_persist_user_message_idx", None)
+        if isinstance(anchored_idx, int) and 0 <= anchored_idx < len(messages):
+            anchored_msg = messages[anchored_idx]
+            if isinstance(anchored_msg, dict) and anchored_msg.get("role") == "user":
+                compression_input = [msg.copy() if isinstance(msg, dict) else msg for msg in messages]
+                compression_input[anchored_idx][anchor_key] = True
+
+        compressed = self.context_compressor.compress(compression_input, current_tokens=approx_tokens)
+
+        new_current_turn_idx = None
+        for idx, msg in enumerate(compressed):
+            if isinstance(msg, dict) and msg.pop(anchor_key, False):
+                new_current_turn_idx = idx
+                break
+        if new_current_turn_idx is not None:
+            self._persist_user_message_idx = new_current_turn_idx
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
-            compressed.append({"role": "user", "content": todo_snapshot})
+            todo_msg = {"role": "user", "content": todo_snapshot}
+            if new_current_turn_idx is not None:
+                # Keep the task snapshot ahead of the live user ask so the
+                # newest real request remains the latest user turn even when
+                # tool chatter already follows it.
+                insert_at = new_current_turn_idx
+            else:
+                insert_at = len(compressed)
+                while insert_at > 0 and compressed[insert_at - 1].get("role") == "user":
+                    insert_at -= 1
+            compressed.insert(insert_at, todo_msg)
+            if (
+                isinstance(new_current_turn_idx, int)
+                and isinstance(self._persist_user_message_idx, int)
+                and self._persist_user_message_idx >= insert_at
+            ):
+                self._persist_user_message_idx += 1
 
         self._invalidate_system_prompt()
         new_system_prompt = self._build_system_prompt(system_message)
@@ -5287,6 +5628,42 @@ class AIAgent:
                 honcho_session_key=self._honcho_session_key,
             )
 
+    def _start_tool_progress_heartbeat(self, function_name: str, function_args: dict):
+        """Emit periodic progress callbacks while a long-running tool is still active."""
+        if not self.tool_progress_callback or _TOOL_PROGRESS_HEARTBEAT_SECONDS <= 0:
+            return lambda: None
+
+        stop_event = threading.Event()
+        preview = _build_tool_preview(function_name, function_args) or function_name
+        started_at = time.monotonic()
+
+        def _heartbeat_worker():
+            while not stop_event.wait(_TOOL_PROGRESS_HEARTBEAT_SECONDS):
+                elapsed = time.monotonic() - started_at
+                try:
+                    self.tool_progress_callback(
+                        "_tool_waiting",
+                        function_name,
+                        {
+                            "tool": function_name,
+                            "elapsed_seconds": elapsed,
+                            "preview": preview,
+                        },
+                    )
+                except Exception:
+                    logging.debug(
+                        "Tool progress waiting callback failed for %s",
+                        function_name,
+                        exc_info=True,
+                    )
+
+        threading.Thread(
+            target=_heartbeat_worker,
+            name=f"tool-heartbeat-{function_name}",
+            daemon=True,
+        ).start()
+        return stop_event.set
+
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute multiple tool calls concurrently using a thread pool.
 
@@ -5362,7 +5739,11 @@ class AIAgent:
                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
                     print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
-        for _, name, args in parsed_calls:
+        tool_span_ids = []
+        for tc, name, args in parsed_calls:
+            span_id = getattr(tc, "id", None) or f"{name}_{len(tool_span_ids) + 1}"
+            tool_span_ids.append(span_id)
+            self._audit_emit_tool_start(name, args, span_id)
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
@@ -5371,24 +5752,62 @@ class AIAgent:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
         # ── Concurrent execution ─────────────────────────────────────────
-        # Each slot holds (function_name, function_args, function_result, duration, error_flag)
+        # Each slot holds:
+        # (function_name, function_args, function_result, duration, error_flag, status_suffix)
         results = [None] * num_tools
+        progress_reported = [False] * num_tools
 
         def _run_tool(index, tool_call, function_name, function_args):
             """Worker function executed in a thread."""
             start = time.time()
+            stop_heartbeat = self._start_tool_progress_heartbeat(function_name, function_args)
             try:
                 result = self._invoke_tool(function_name, function_args, effective_task_id)
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+            finally:
+                stop_heartbeat()
             duration = time.time() - start
-            is_error, _ = _detect_tool_failure(function_name, result)
-            results[index] = (function_name, function_args, result, duration, is_error)
+            is_error, status_suffix = _detect_tool_failure(function_name, result)
+            results[index] = (function_name, function_args, result, duration, is_error, status_suffix)
+
+        def _emit_progress_result(index: int) -> None:
+            if not self.tool_progress_callback or progress_reported[index]:
+                return
+
+            r = results[index]
+            _, name, _ = parsed_calls[index]
+            if r is None:
+                function_result = f"Error executing tool '{name}': thread did not return a result"
+                tool_duration = 0.0
+                is_error = True
+                status_suffix = ""
+            else:
+                _, _, function_result, tool_duration, is_error, status_suffix = r
+
+            progress_result = function_result
+            if len(progress_result) > 4000:
+                progress_result = progress_result[:4000] + "\n...[truncated for progress]"
+            try:
+                self.tool_progress_callback(
+                    "_tool_result",
+                    name,
+                    {
+                        "tool": name,
+                        "duration_seconds": tool_duration,
+                        "is_error": is_error,
+                        "status_suffix": status_suffix.strip(),
+                        "result": progress_result,
+                    },
+                )
+                progress_reported[index] = True
+            except Exception:
+                logging.debug("Tool progress completion callback failed for %s", name, exc_info=True)
 
         # Start spinner for CLI mode (skip when TUI handles tool progress)
         spinner = None
-        if self.quiet_mode and not self.tool_progress_callback:
+        if self.quiet_mode and not (self.thinking_callback or self.tool_progress_callback):
             face = random.choice(KawaiiSpinner.KAWAII_WAITING)
             spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots', print_fn=self._print_fn)
             spinner.start()
@@ -5396,13 +5815,18 @@ class AIAgent:
         try:
             max_workers = min(num_tools, _MAX_TOOL_WORKERS)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
+                future_to_index = {}
                 for i, (tc, name, args) in enumerate(parsed_calls):
                     f = executor.submit(_run_tool, i, tc, name, args)
-                    futures.append(f)
+                    future_to_index[f] = i
 
-                # Wait for all to complete (exceptions are captured inside _run_tool)
-                concurrent.futures.wait(futures)
+                for future in concurrent.futures.as_completed(future_to_index):
+                    index = future_to_index[future]
+                    try:
+                        future.result()
+                    except Exception:
+                        logger.debug("Concurrent tool future failed unexpectedly", exc_info=True)
+                    _emit_progress_result(index)
         finally:
             if spinner:
                 # Build a summary message for the spinner stop
@@ -5413,12 +5837,15 @@ class AIAgent:
         # ── Post-execution: display per-tool results ─────────────────────
         for i, (tc, name, args) in enumerate(parsed_calls):
             r = results[i]
+            span_id = tool_span_ids[i] if i < len(tool_span_ids) else getattr(tc, "id", None) or f"{name}_{i + 1}"
             if r is None:
                 # Shouldn't happen, but safety fallback
                 function_result = f"Error executing tool '{name}': thread did not return a result"
                 tool_duration = 0.0
+                is_error = True
+                status_suffix = ""
             else:
-                function_name, function_args, function_result, tool_duration, is_error = r
+                function_name, function_args, function_result, tool_duration, is_error, status_suffix = r
 
                 if is_error:
                     result_preview = function_result[:200] if len(function_result) > 200 else function_result
@@ -5427,6 +5854,16 @@ class AIAgent:
                 if self.verbose_logging:
                     logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                     logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+
+            _emit_progress_result(i)
+            self._audit_emit_tool_finish(
+                name,
+                function_result,
+                tool_duration,
+                span_id,
+                is_error=is_error,
+                status_suffix=status_suffix,
+            )
 
             # Print cute message per tool
             if self.quiet_mode:
@@ -5457,6 +5894,7 @@ class AIAgent:
                 "tool_call_id": tc.id,
             }
             messages.append(tool_msg)
+            self._tool_calls_executed_total += 1
 
         # ── Budget pressure injection ────────────────────────────────────
         budget_warning = self._get_budget_warning(api_call_count)
@@ -5511,6 +5949,8 @@ class AIAgent:
                 function_args = {}
             if not isinstance(function_args, dict):
                 function_args = {}
+            span_id = getattr(tool_call, "id", None) or f"{function_name}_{i}"
+            self._audit_emit_tool_start(function_name, function_args, span_id)
 
             if not self.quiet_mode:
                 args_str = json.dumps(function_args, ensure_ascii=False)
@@ -5614,7 +6054,7 @@ class AIAgent:
                     goal_preview = (function_args.get("goal") or "")[:30]
                     spinner_label = f"🔀 {goal_preview}" if goal_preview else "🔀 delegating"
                 spinner = None
-                if self.quiet_mode and not self.tool_progress_callback:
+                if self.quiet_mode and not (self.thinking_callback or self.tool_progress_callback):
                     face = random.choice(KawaiiSpinner.KAWAII_WAITING)
                     spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots', print_fn=self._print_fn)
                     spinner.start()
@@ -5638,16 +6078,14 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self.quiet_mode:
                         self._vprint(f"  {cute_msg}")
-            elif self.quiet_mode:
-                spinner = None
-                if not self.tool_progress_callback:
-                    face = random.choice(KawaiiSpinner.KAWAII_WAITING)
-                    emoji = _get_tool_emoji(function_name)
-                    preview = _build_tool_preview(function_name, function_args) or function_name
-                    if len(preview) > 30:
-                        preview = preview[:27] + "..."
-                    spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
-                    spinner.start()
+            elif self.quiet_mode and not (self.thinking_callback or self.tool_progress_callback):
+                face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+                emoji = _get_tool_emoji(function_name)
+                preview = _build_tool_preview(function_name, function_args) or function_name
+                if len(preview) > 30:
+                    preview = preview[:27] + "..."
+                spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
+                spinner.start()
                 _spinner_result = None
                 try:
                     function_result = handle_function_call(
@@ -5668,6 +6106,7 @@ class AIAgent:
                     else:
                         self._vprint(f"  {cute_msg}")
             else:
+                stop_heartbeat = self._start_tool_progress_heartbeat(function_name, function_args)
                 try:
                     function_result = handle_function_call(
                         function_name, function_args, effective_task_id,
@@ -5678,6 +6117,8 @@ class AIAgent:
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                finally:
+                    stop_heartbeat()
                 tool_duration = time.time() - tool_start_time
 
             result_preview = function_result if self.verbose_logging else (
@@ -5686,9 +6127,36 @@ class AIAgent:
 
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
-            _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+            _is_error_result, _status_suffix = _detect_tool_failure(function_name, function_result)
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+
+            if self.tool_progress_callback:
+                progress_result = function_result
+                if len(progress_result) > 4000:
+                    progress_result = progress_result[:4000] + "\n...[truncated for progress]"
+                try:
+                    self.tool_progress_callback(
+                        "_tool_result",
+                        function_name,
+                        {
+                            "tool": function_name,
+                            "duration_seconds": tool_duration,
+                            "is_error": _is_error_result,
+                            "status_suffix": _status_suffix.strip(),
+                            "result": progress_result,
+                        },
+                    )
+                except Exception:
+                    logging.debug("Tool progress completion callback failed for %s", function_name, exc_info=True)
+            self._audit_emit_tool_finish(
+                function_name,
+                function_result,
+                tool_duration,
+                span_id,
+                is_error=_is_error_result,
+                status_suffix=_status_suffix,
+            )
 
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
@@ -5713,6 +6181,7 @@ class AIAgent:
                 "tool_call_id": tool_call.id
             }
             messages.append(tool_msg)
+            self._tool_calls_executed_total += 1
 
             if not self.quiet_mode:
                 if self.verbose_logging:
@@ -5758,6 +6227,97 @@ class AIAgent:
                 remaining = self.max_iterations - api_call_count
                 tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
                 print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
+
+    def _resolve_soft_tool_call_budget(self) -> Optional[int]:
+        """Return the configured soft tool-call cap for this run, if any."""
+        max_tool_calls = self.max_tool_calls_per_run
+        if isinstance(max_tool_calls, int) and max_tool_calls > 0:
+            return max_tool_calls
+
+        raw_limit = (
+            os.getenv("HERMES_MAX_TOOL_CALLS_PER_RUN")
+            or os.getenv("HERMES_MAX_TOOL_CALLS_PER_RESPONSE")
+            or "0"
+        )
+        try:
+            parsed_limit = int(str(raw_limit).strip() or "0")
+        except (TypeError, ValueError):
+            parsed_limit = 0
+        return parsed_limit if parsed_limit > 0 else None
+
+    def _get_tool_budget_status(self, api_call_count: int) -> Dict[str, Any]:
+        """Return live tool-budget metadata for the current API turn.
+
+        The current API call has already consumed one iteration before this
+        method runs, so ``follow_up_iterations_remaining`` is the real number of
+        future model turns still available if this response emits tool calls.
+        """
+        del api_call_count  # The live IterationBudget is more accurate than the loop counter.
+
+        hard_total = max(int(getattr(self.iteration_budget, "max_total", self.max_iterations) or 0), 0)
+        hard_used = max(int(getattr(self.iteration_budget, "used", 0) or 0), 0)
+        follow_up_iterations_remaining = max(int(getattr(self.iteration_budget, "remaining", 0) or 0), 0)
+
+        soft_limit = self._resolve_soft_tool_call_budget()
+        used_tool_calls = max(int(getattr(self, "_tool_calls_executed_total", 0) or 0), 0)
+        remaining_tool_calls = None if soft_limit is None else max(soft_limit - used_tool_calls, 0)
+        soft_budget_exhausted = bool(soft_limit is not None and remaining_tool_calls == 0)
+
+        return {
+            "tool_calls_available_this_turn": bool(self.valid_tool_names) and follow_up_iterations_remaining > 0,
+            "hard_iteration_budget_total": hard_total,
+            "hard_iteration_budget_used": hard_used,
+            "follow_up_iterations_remaining": follow_up_iterations_remaining,
+            "soft_tool_call_budget_total": soft_limit,
+            "soft_tool_calls_used": used_tool_calls,
+            "soft_tool_calls_remaining": remaining_tool_calls,
+            "soft_tool_call_budget_exhausted": soft_budget_exhausted,
+        }
+
+    def _append_tool_budget_guidance(self, api_messages: list, api_call_count: int) -> list:
+        """Attach a transient budget note so the model can pace tool usage.
+
+        This message is request-only and is never written to conversation history.
+        """
+        if not api_messages or not self.valid_tool_names:
+            return api_messages
+
+        enabled = os.getenv("HERMES_TOOL_BUDGET_GUIDANCE", "auto").strip().lower()
+        if enabled in {"0", "false", "no", "off"}:
+            return api_messages
+
+        status = self._get_tool_budget_status(api_call_count)
+        soft_total = status["soft_tool_call_budget_total"]
+        if soft_total is None:
+            soft_budget_line = "- Soft tool-call budget for this run: not configured"
+            soft_exhausted_line = "- Soft tool-call budget exhausted: no"
+        else:
+            soft_budget_line = (
+                "- Soft tool-call budget for this run: "
+                f"{status['soft_tool_calls_remaining']} remaining of {soft_total} "
+                f"({status['soft_tool_calls_used']} used)"
+            )
+            soft_exhausted_line = (
+                "- Soft tool-call budget exhausted: "
+                f"{'yes' if status['soft_tool_call_budget_exhausted'] else 'no'}"
+            )
+
+        guidance = (
+            "[System: Tool-use runtime status for this turn:\n"
+            "- Tool calls still usable on this response: "
+            f"{'yes' if status['tool_calls_available_this_turn'] else 'no'}\n"
+            "- Follow-up API iterations remaining after tool results: "
+            f"{status['follow_up_iterations_remaining']} "
+            f"({status['hard_iteration_budget_used']}/{status['hard_iteration_budget_total']} used)\n"
+            f"{soft_budget_line}\n"
+            f"{soft_exhausted_line}\n"
+            "If tool calls are not still usable on this response, do not emit tool calls now. "
+            "Use tools deliberately, batch where possible, and avoid redundant calls.]"
+        )
+
+        augmented = list(api_messages)
+        augmented.append({"role": "user", "content": guidance})
+        return augmented
 
     def _get_budget_warning(self, api_call_count: int) -> Optional[str]:
         """Return a budget pressure string, or None if not yet needed.
@@ -5847,8 +6407,14 @@ class AIAgent:
                 api_messages.append(api_msg)
 
             effective_system = self._cached_system_prompt or ""
+            extra_ephemeral = []
             if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+                extra_ephemeral.append(self.ephemeral_system_prompt)
+            env_hint = self._build_environment_hint()
+            if env_hint:
+                extra_ephemeral.append(env_hint)
+            if extra_ephemeral:
+                effective_system = (effective_system + "\n\n" + "\n\n".join(extra_ephemeral)).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
             if self.prefill_messages:
@@ -6036,6 +6602,7 @@ class AIAgent:
         # They are initialized in __init__ and must persist across run_conversation
         # calls so that nudge logic accumulates correctly in CLI mode.
         self.iteration_budget = IterationBudget(self.max_iterations)
+        self._tool_calls_executed_total = 0
         
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
@@ -6208,6 +6775,8 @@ class AIAgent:
                         messages, system_message, approx_tokens=_preflight_tokens,
                         task_id=effective_task_id,
                     )
+                    if isinstance(self._persist_user_message_idx, int):
+                        current_turn_user_idx = self._persist_user_message_idx
                     if len(messages) >= _orig_len:
                         break  # Cannot compress further
                     # Re-estimate after compression
@@ -6342,11 +6911,20 @@ class AIAgent:
             # Honcho later-turn recall is intentionally kept OUT of the system prompt
             # so the stable cache prefix remains unchanged.
             effective_system = active_system_prompt or ""
+            extra_ephemeral = []
             if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+                extra_ephemeral.append(self.ephemeral_system_prompt)
             # Plugin context from pre_llm_call hooks — ephemeral, not cached.
             if _plugin_turn_context:
-                effective_system = (effective_system + "\n\n" + _plugin_turn_context).strip()
+                extra_ephemeral.append(_plugin_turn_context)
+            env_hint = self._build_environment_hint()
+            if env_hint:
+                extra_ephemeral.append(env_hint)
+            skill_routing_hint = self._build_skill_routing_hint(user_message)
+            if skill_routing_hint:
+                extra_ephemeral.append(skill_routing_hint)
+            if extra_ephemeral:
+                effective_system = (effective_system + "\n\n" + "\n\n".join(extra_ephemeral)).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -6370,6 +6948,8 @@ class AIAgent:
             # manual message manipulation are always caught.
             api_messages = self._sanitize_api_messages(api_messages)
 
+            api_messages = self._append_tool_budget_guidance(api_messages, api_call_count)
+
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)
             approx_tokens = total_chars // 4  # Rough estimate: 4 chars per token
@@ -6388,7 +6968,9 @@ class AIAgent:
                 if self.thinking_callback:
                     # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
                     # (works in both streaming and non-streaming modes)
-                    self.thinking_callback(f"{face} {verb}...")
+                    thinking_text = f"{face} {verb}..."
+                    self._audit_emit_thinking(thinking_text)
+                    self.thinking_callback(thinking_text)
                 elif not self._has_stream_consumers():
                     # Raw KawaiiSpinner only when no streaming consumers
                     # (would conflict with streamed token output)
@@ -6857,6 +7439,11 @@ class AIAgent:
                     self._persist_session(messages, conversation_history)
                     interrupted = True
                     final_response = f"Operation interrupted: waiting for model response ({api_elapsed:.1f}s elapsed)."
+                    self._audit_emit_error(
+                        "Conversation interrupted",
+                        final_response,
+                        payload={"api_elapsed_seconds": round(api_elapsed, 2)},
+                    )
                     break
 
                 except Exception as api_error:
@@ -7024,6 +7611,8 @@ class AIAgent:
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
                         )
+                        if isinstance(self._persist_user_message_idx, int):
+                            current_turn_user_idx = self._persist_user_message_idx
 
                         if len(messages) < original_len:
                             self._emit_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
@@ -7124,6 +7713,8 @@ class AIAgent:
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
                         )
+                        if isinstance(self._persist_user_message_idx, int):
+                            current_turn_user_idx = self._persist_user_message_idx
 
                         if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
                             if len(messages) < original_len:
@@ -7217,7 +7808,7 @@ class AIAgent:
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
-                            "error": str(api_error),
+                            "error": _strip_cli_ansi(str(api_error)),
                         }
 
                     if retry_count >= max_retries:
@@ -7335,7 +7926,7 @@ class AIAgent:
             # (e.g. repeated context-length errors that exhausted retry_count),
             # the `response` variable is still None. Break out cleanly.
             if response is None:
-                print(f"{self.log_prefix}❌ All API retries exhausted with no successful response.")
+                print(_strip_cli_ansi(f"{self.log_prefix}❌ All API retries exhausted with no successful response."))
                 self._persist_session(messages, conversation_history)
                 break
 
@@ -7391,6 +7982,7 @@ class AIAgent:
                     ).strip()
                     first_line = _think_text.split('\n')[0][:80] if _think_text else ""
                     if first_line:
+                        self._audit_emit_thinking(first_line)
                         try:
                             self.tool_progress_callback("_thinking", first_line)
                         except Exception:
@@ -7706,6 +8298,8 @@ class AIAgent:
                             approx_tokens=self.context_compressor.last_prompt_tokens,
                             task_id=effective_task_id,
                         )
+                        if isinstance(self._persist_user_message_idx, int):
+                            current_turn_user_idx = self._persist_user_message_idx
                     
                     # Save session log incrementally (so progress is visible even if interrupted)
                     self._session_messages = messages
@@ -7812,6 +8406,11 @@ class AIAgent:
 
                             self._cleanup_task_resources(effective_task_id)
                             self._persist_session(messages, conversation_history)
+                            self._audit_emit_error(
+                                "Model returned only thinking blocks",
+                                "Model generated only think blocks with no actual response after 3 retries",
+                                payload={"api_calls": api_call_count},
+                            )
 
                             return {
                                 "final_response": final_response or None,
@@ -7865,6 +8464,7 @@ class AIAgent:
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
                     
                     messages.append(final_msg)
+                    self._audit_emit_message(final_response, status="ok")
                     
                     if not self.quiet_mode:
                         self._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
@@ -7920,6 +8520,11 @@ class AIAgent:
                     # Append as assistant so the history stays valid for
                     # session resume (avoids consecutive user messages).
                     messages.append({"role": "assistant", "content": final_response})
+                    self._audit_emit_error(
+                        "API loop error",
+                        error_msg,
+                        payload={"api_call_count": api_call_count},
+                    )
                     break
         
         if final_response is None and (
@@ -7929,6 +8534,11 @@ class AIAgent:
             if self.iteration_budget.remaining <= 0 and not self.quiet_mode:
                 print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
             final_response = self._handle_max_iterations(messages, api_call_count)
+            self._audit_emit_error(
+                "Iteration limit reached",
+                final_response,
+                payload={"api_call_count": api_call_count},
+            )
         
         # Determine if conversation completed successfully
         completed = final_response is not None and api_call_count < self.max_iterations
@@ -7941,6 +8551,19 @@ class AIAgent:
 
         # Persist session to both JSON log and SQLite
         self._persist_session(messages, conversation_history)
+        self._audit_emit(
+            kind="system",
+            phase="done",
+            status="error" if interrupted or not completed else "ok",
+            is_error=bool(interrupted or not completed),
+            title="Conversation finished",
+            preview=(final_response or "")[:220] if final_response else None,
+            payload={
+                "completed": completed,
+                "interrupted": interrupted,
+                "api_calls": api_call_count,
+            },
+        )
 
         # Sync conversation to Honcho for user modeling
         if final_response and not interrupted and sync_honcho:

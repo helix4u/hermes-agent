@@ -4,7 +4,11 @@
 import errno
 import json
 import logging
+import ntpath
+import os
+import re
 import threading
+from typing import Optional
 from tools.file_operations import ShellFileOperations
 from agent.redact import redact_sensitive_text
 
@@ -25,6 +29,17 @@ def _is_expected_write_exception(exc: Exception) -> bool:
 
 _file_ops_lock = threading.Lock()
 _file_ops_cache: dict = {}
+
+_FILENAME_LIKE_EXTENSIONS = {
+    ".aac", ".avi", ".bash", ".bat", ".bmp", ".c", ".cc", ".cfg", ".cmd",
+    ".conf", ".cpp", ".cs", ".css", ".csv", ".db", ".doc", ".docx", ".env",
+    ".gif", ".go", ".gz", ".h", ".hpp", ".html", ".ini", ".java", ".jpeg",
+    ".jpg", ".js", ".json", ".jsx", ".log", ".lua", ".md", ".mjs", ".mkv",
+    ".mov", ".mp3", ".mp4", ".ogg", ".pdf", ".php", ".png", ".ps1", ".py",
+    ".rb", ".rs", ".sh", ".sqlite", ".sqlite3", ".svg", ".tar", ".tex",
+    ".toml", ".ts", ".tsx", ".txt", ".wav", ".webm", ".xml", ".yaml", ".yml",
+    ".zip",
+}
 
 # Track files read per task to detect re-read loops after context compression.
 # Per task_id we store:
@@ -163,6 +178,74 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.pop(task_id, None)
         else:
             _file_ops_cache.clear()
+
+
+def _split_search_pattern_path(pattern: str) -> tuple[Optional[str], str]:
+    """Split a search pattern into directory + basename across host path styles."""
+    cleaned = str(pattern or "").strip().strip('"').strip("'")
+    if not cleaned:
+        return None, cleaned
+
+    if re.match(r"^[A-Za-z]:[\\/]", cleaned) or "\\" in cleaned:
+        dirpart, basename = ntpath.split(cleaned)
+    else:
+        dirpart, basename = os.path.split(cleaned)
+
+    if dirpart and basename:
+        return dirpart, basename
+    return None, cleaned
+
+
+def _looks_like_file_search(pattern: str) -> bool:
+    """Heuristic: filename/glob-like queries should default to file search."""
+    cleaned = str(pattern or "").strip().strip('"').strip("'")
+    if not cleaned:
+        return False
+
+    dirpart, basename = _split_search_pattern_path(cleaned)
+    if dirpart and basename:
+        return True
+
+    has_glob = any(ch in cleaned for ch in ("*", "?"))
+    if has_glob:
+        regexish = any(ch in cleaned for ch in ("+", "|", "(", ")", "{", "}", "^", "$"))
+        if not regexish:
+            try:
+                re.compile(cleaned)
+            except re.error:
+                return True
+
+    _, ext = os.path.splitext(basename or cleaned)
+    return ext.lower() in _FILENAME_LIKE_EXTENSIONS
+
+
+def _normalize_search_request(
+    pattern: str,
+    target: Optional[str],
+    path: str,
+    *,
+    target_explicit: bool = False,
+) -> tuple[str, str, str]:
+    """Infer file-search intent for filename/path-like queries when target is omitted."""
+    normalized_pattern = pattern
+    normalized_target = target or "content"
+    normalized_path = path or "."
+
+    if target_explicit or normalized_target != "content":
+        return normalized_pattern, normalized_target, normalized_path
+
+    dirpart, basename = _split_search_pattern_path(pattern)
+    if dirpart and basename:
+        normalized_pattern = basename
+        if normalized_path in ("", ".", None):
+            normalized_path = dirpart
+        normalized_target = "files"
+        return normalized_pattern, normalized_target, normalized_path
+
+    if _looks_like_file_search(pattern):
+        normalized_target = "files"
+
+    return normalized_pattern, normalized_target, normalized_path
 
 
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
@@ -330,12 +413,19 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-def search_tool(pattern: str, target: str = "content", path: str = ".",
+def search_tool(pattern: str, target: Optional[str] = None, path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
-                task_id: str = "default") -> str:
-    """Search for content or files."""
+                task_id: str = "default", target_explicit: bool = False) -> str:
+    """Search for content or files, auto-inferring filename lookups when target is omitted."""
     try:
+        pattern, target, path = _normalize_search_request(
+            pattern,
+            target,
+            path,
+            target_explicit=target_explicit,
+        )
+
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated
         # results without tripping the repeated-search guard.
@@ -507,12 +597,13 @@ def _handle_patch(args, **kw):
 def _handle_search_files(args, **kw):
     tid = kw.get("task_id") or "default"
     target_map = {"grep": "content", "find": "files"}
-    raw_target = args.get("target", "content")
+    raw_target = args.get("target")
     target = target_map.get(raw_target, raw_target)
     return search_tool(
         pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
-        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
+        output_mode=args.get("output_mode", "content"), context=args.get("context", 0),
+        task_id=tid, target_explicit=("target" in args))
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖")

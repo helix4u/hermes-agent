@@ -3,10 +3,32 @@
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Union
 
 import yaml
+
+
+_WINDOWS_REPLACE_RETRY_ERRORS = {5, 32}
+
+
+def _atomic_replace_with_retry(src: str, dst: Union[str, Path]) -> None:
+    """Retry os.replace on transient Windows sharing violations."""
+    retries = 8 if os.name == "nt" else 1
+    delay = 0.01
+
+    for attempt in range(retries):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            is_retryable = os.name == "nt" and winerror in _WINDOWS_REPLACE_RETRY_ERRORS
+            if not is_retryable or attempt == retries - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.2)
 
 
 def atomic_json_write(
@@ -48,7 +70,7 @@ def atomic_json_write(
             )
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        _atomic_replace_with_retry(tmp_path, path)
     except BaseException:
         # Intentionally catch BaseException so temp-file cleanup still runs for
         # KeyboardInterrupt/SystemExit before re-raising the original signal.
@@ -96,7 +118,7 @@ def atomic_yaml_write(
                 f.write(extra_content)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        _atomic_replace_with_retry(tmp_path, path)
     except BaseException:
         # Match atomic_json_write: cleanup must also happen for process-level
         # interruptions before we re-raise them.

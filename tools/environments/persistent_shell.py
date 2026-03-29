@@ -34,7 +34,8 @@ class PersistentShellMixin:
     @abstractmethod
     def _execute_oneshot(self, command: str, cwd: str, *,
                          timeout: int | None = None,
-                         stdin_data: str | None = None) -> dict: ...
+                         stdin_data: str | None = None,
+                         shell_mode_override: str | None = None) -> dict: ...
 
     @abstractmethod
     def _cleanup_temp_files(self): ...
@@ -132,13 +133,18 @@ class PersistentShellMixin:
 
     def execute(self, command: str, cwd: str = "", *,
                 timeout: int | None = None,
-                stdin_data: str | None = None) -> dict:
-        if self.persistent:
+                stdin_data: str | None = None,
+                shell_mode_override: str | None = None) -> dict:
+        if self.persistent and shell_mode_override is None:
             return self._execute_persistent(
                 command, cwd, timeout=timeout, stdin_data=stdin_data,
             )
         return self._execute_oneshot(
-            command, cwd, timeout=timeout, stdin_data=stdin_data,
+            command,
+            cwd,
+            timeout=timeout,
+            stdin_data=stdin_data,
+            shell_mode_override=shell_mode_override,
         )
 
     def cleanup(self):

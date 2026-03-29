@@ -28,6 +28,7 @@ import threading
 import time
 import uuid
 import webbrowser
+import ssl
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -72,6 +73,11 @@ DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
+CODEX_DEVICE_AUTH_FRESH_RETRY_LIMIT = 1
+CODEX_SESSION_ORIGIN_HERMES = "hermes_device_auth"
+CODEX_SESSION_ORIGIN_SHARED_IMPORT = "shared_codex_import"
+CODEX_SESSION_ORIGIN_SHARED_MIGRATION = "shared_codex_migration"
+CODEX_SESSION_ORIGIN_LEGACY = "legacy"
 
 
 # =============================================================================
@@ -414,11 +420,14 @@ class AuthError(RuntimeError):
 
 def format_auth_error(error: Exception) -> str:
     """Map auth failures to concise user-facing guidance."""
+    from hermes_cli.colors import strip_ansi
+
+    message = strip_ansi(str(error))
     if not isinstance(error, AuthError):
-        return str(error)
+        return message
 
     if error.relogin_required:
-        return f"{error} Run `hermes model` to re-authenticate."
+        return f"{message} Run `hermes model` to re-authenticate."
 
     if error.code == "subscription_required":
         return (
@@ -433,7 +442,9 @@ def format_auth_error(error: Exception) -> str:
         )
 
     if error.code == "temporarily_unavailable":
-        return f"{error} Please retry in a few seconds."
+        return f"{message} Please retry in a few seconds."
+
+    return message
 
     return str(error)
 
@@ -840,7 +851,7 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     state = _load_provider_state(auth_store, "openai-codex")
     if not state:
         raise AuthError(
-            "No Codex credentials stored. Run `hermes login` to authenticate.",
+            "No Codex credentials stored. Run `hermes model` to authenticate.",
             provider="openai-codex",
             code="codex_auth_missing",
             relogin_required=True,
@@ -848,7 +859,7 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     tokens = state.get("tokens")
     if not isinstance(tokens, dict):
         raise AuthError(
-            "Codex auth state is missing tokens. Run `hermes login` to re-authenticate.",
+            "Codex auth state is missing tokens. Run `hermes model` to re-authenticate.",
             provider="openai-codex",
             code="codex_auth_invalid_shape",
             relogin_required=True,
@@ -857,14 +868,14 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     refresh_token = tokens.get("refresh_token")
     if not isinstance(access_token, str) or not access_token.strip():
         raise AuthError(
-            "Codex auth is missing access_token. Run `hermes login` to re-authenticate.",
+            "Codex auth is missing access_token. Run `hermes model` to re-authenticate.",
             provider="openai-codex",
             code="codex_auth_missing_access_token",
             relogin_required=True,
         )
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise AuthError(
-            "Codex auth is missing refresh_token. Run `hermes login` to re-authenticate.",
+            "Codex auth is missing refresh_token. Run `hermes model` to re-authenticate.",
             provider="openai-codex",
             code="codex_auth_missing_refresh_token",
             relogin_required=True,
@@ -872,10 +883,16 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     return {
         "tokens": tokens,
         "last_refresh": state.get("last_refresh"),
+        "session_origin": state.get("session_origin") or CODEX_SESSION_ORIGIN_LEGACY,
     }
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None) -> None:
+def _save_codex_tokens(
+    tokens: Dict[str, str],
+    last_refresh: str = None,
+    *,
+    session_origin: Optional[str] = None,
+) -> None:
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -885,6 +902,11 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None) -> None
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = "chatgpt"
+        state["session_origin"] = (
+            session_origin
+            or state.get("session_origin")
+            or CODEX_SESSION_ORIGIN_HERMES
+        )
         _save_provider_state(auth_store, "openai-codex", state)
         _save_auth_store(auth_store)
 
@@ -900,7 +922,7 @@ def _refresh_codex_auth_tokens(
     refresh_token = tokens.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise AuthError(
-            "Codex auth is missing refresh_token. Run `hermes login` to re-authenticate.",
+            "Codex auth is missing refresh_token. Run `hermes model` to re-authenticate.",
             provider="openai-codex",
             code="codex_auth_missing_refresh_token",
             relogin_required=True,
@@ -921,7 +943,9 @@ def _refresh_codex_auth_tokens(
     if response.status_code != 200:
         code = "codex_refresh_failed"
         message = f"Codex token refresh failed with status {response.status_code}."
-        relogin_required = False
+        # Some providers return a 401 without a parseable error body.
+        # Treat 401 as a strong signal the refresh token is revoked/expired.
+        relogin_required = response.status_code == 401
         try:
             err = response.json()
             if isinstance(err, dict):
@@ -994,32 +1018,82 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         return None
 
 
+def _should_retry_codex_device_code_login(error: AuthError) -> bool:
+    """Return True when a fresh device-code flow is worth retrying once."""
+    if error.provider != "openai-codex":
+        return False
+    if error.code == "invalid_grant":
+        return True
+    if error.code != "token_exchange_error":
+        return False
+
+    lowered = str(error).lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "already used",
+            "already been used",
+            "already redeemed",
+            "invalid authorization code",
+            "authorization code",
+        )
+    )
+
+
+def _codex_can_prompt_for_reauth() -> bool:
+    """Return True when Hermes can safely run interactive Codex device auth."""
+    def _stream_is_tty(stream: Any) -> bool:
+        try:
+            return bool(stream) and bool(stream.isatty())
+        except Exception:
+            return False
+
+    stdin_tty = _stream_is_tty(getattr(sys, "stdin", None)) or _stream_is_tty(getattr(sys, "__stdin__", None))
+    stdout_tty = _stream_is_tty(getattr(sys, "stdout", None)) or _stream_is_tty(getattr(sys, "__stdout__", None))
+    return stdin_tty and stdout_tty
+
+
+def _recover_codex_relogin(
+    *,
+    prior_tokens: Dict[str, str],
+    refresh_error: AuthError,
+    allow_device_auth: Optional[bool] = None,
+) -> Dict[str, str]:
+    """Recover from a revoked Codex refresh token.
+
+    Recovery order:
+    1. If interactive, run Hermes-owned device auth and persist it.
+    2. Otherwise re-raise the original auth error.
+    """
+    can_device_auth = (
+        _codex_can_prompt_for_reauth() if allow_device_auth is None else bool(allow_device_auth)
+    )
+    if can_device_auth:
+        print("Codex session expired. Starting Hermes device re-auth...")
+        creds = _codex_device_code_login()
+        recovered_tokens = dict(creds.get("tokens") or {})
+        access_token = str(recovered_tokens.get("access_token", "") or "").strip()
+        refresh_token = str(recovered_tokens.get("refresh_token", "") or "").strip()
+        if access_token and refresh_token:
+            _save_codex_tokens(
+                recovered_tokens,
+                creds.get("last_refresh"),
+                session_origin=CODEX_SESSION_ORIGIN_HERMES,
+            )
+            return recovered_tokens
+
+    raise refresh_error
+
+
 def resolve_codex_runtime_credentials(
     *,
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    allow_device_auth: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime credentials from Hermes's own Codex token store."""
-    try:
-        data = _read_codex_tokens()
-    except AuthError as orig_err:
-        # Only attempt migration when there are NO tokens stored at all
-        # (code == "codex_auth_missing"), not when tokens exist but are invalid.
-        if orig_err.code != "codex_auth_missing":
-            raise
-
-        # Migration: user had Codex as active provider with old storage (~/.codex/).
-        cli_tokens = _import_codex_cli_tokens()
-        if cli_tokens:
-            logger.info("Migrating Codex credentials from ~/.codex/ to Hermes auth store")
-            print("⚠️  Migrating Codex credentials to Hermes's own auth store.")
-            print("   This avoids conflicts with Codex CLI and VS Code.")
-            print("   Run `hermes login` to create a fully independent session.\n")
-            _save_codex_tokens(cli_tokens)
-            data = _read_codex_tokens()
-        else:
-            raise
+    data = _read_codex_tokens()
     tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_timeout_seconds = float(os.getenv("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", "20"))
@@ -1039,7 +1113,17 @@ def resolve_codex_runtime_credentials(
                 should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
 
             if should_refresh:
-                tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+                try:
+                    tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+                except AuthError as refresh_error:
+                    if refresh_error.relogin_required:
+                        tokens = _recover_codex_relogin(
+                            prior_tokens=tokens,
+                            refresh_error=refresh_error,
+                            allow_device_auth=allow_device_auth,
+                        )
+                    else:
+                        raise
                 access_token = str(tokens.get("access_token", "") or "").strip()
 
     base_url = (
@@ -1054,6 +1138,7 @@ def resolve_codex_runtime_credentials(
         "source": "hermes-auth-store",
         "last_refresh": data.get("last_refresh"),
         "auth_mode": "chatgpt",
+        "session_origin": data.get("session_origin") or CODEX_SESSION_ORIGIN_LEGACY,
     }
 
 
@@ -1086,6 +1171,13 @@ def _resolve_verify(
     if effective_ca:
         return str(effective_ca)
     return True
+
+
+def _httpx_verify_arg(verify: bool | str) -> bool | ssl.SSLContext:
+    """Convert persisted TLS settings into the form preferred by httpx."""
+    if isinstance(verify, str):
+        return ssl.create_default_context(cafile=verify)
+    return verify
 
 
 # =============================================================================
@@ -1249,7 +1341,11 @@ def fetch_nous_models(
 ) -> List[str]:
     """Fetch available model IDs from the Nous inference API."""
     timeout = httpx.Timeout(timeout_seconds)
-    with httpx.Client(timeout=timeout, headers={"Accept": "application/json"}, verify=verify) as client:
+    with httpx.Client(
+        timeout=timeout,
+        headers={"Accept": "application/json"},
+        verify=_httpx_verify_arg(verify),
+    ) as client:
         response = client.get(
             f"{inference_base_url.rstrip('/')}/models",
             headers={"Authorization": f"Bearer {api_key}"},
@@ -1376,7 +1472,11 @@ def resolve_nous_runtime_credentials(
             refresh_token_fp=_token_fingerprint(state.get("refresh_token")),
         )
 
-        with httpx.Client(timeout=timeout, headers={"Accept": "application/json"}, verify=verify) as client:
+        with httpx.Client(
+            timeout=timeout,
+            headers={"Accept": "application/json"},
+            verify=_httpx_verify_arg(verify),
+        ) as client:
             access_token = state.get("access_token")
             refresh_token = state.get("refresh_token")
 
@@ -1589,6 +1689,7 @@ def get_codex_auth_status() -> Dict[str, Any]:
             "last_refresh": creds.get("last_refresh"),
             "auth_mode": creds.get("auth_mode"),
             "source": creds.get("source"),
+            "session_origin": creds.get("session_origin") or CODEX_SESSION_ORIGIN_LEGACY,
         }
     except AuthError as exc:
         return {
@@ -1772,7 +1873,7 @@ def detect_external_credentials() -> List[Dict[str, Any]]:
         found.append({
             "provider": "openai-codex",
             "path": str(codex_path),
-            "label": f"Codex CLI credentials found ({codex_path}) — run `hermes login` to create a separate session",
+            "label": f"Codex CLI credentials found ({codex_path}) — run `hermes model` to create a separate session",
         })
 
     return found
@@ -1999,12 +2100,15 @@ def _login_openai_codex(args, pconfig: ProviderConfig) -> None:
         except (EOFError, KeyboardInterrupt):
             do_import = "n"
         if do_import in ("y", "yes"):
-            _save_codex_tokens(cli_tokens)
+            _save_codex_tokens(
+                cli_tokens,
+                session_origin=CODEX_SESSION_ORIGIN_SHARED_IMPORT,
+            )
             base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
             config_path = _update_config_for_provider("openai-codex", base_url)
             print()
             print("Credentials imported. Note: if Codex CLI refreshes its token,")
-            print("Hermes will keep working independently with its own session.")
+            print("Hermes will use the imported session until you run `hermes model` for a separate Hermes-owned login.")
             print(f"  Config updated: {config_path} (model.provider=openai-codex)")
             return
 
@@ -2017,7 +2121,11 @@ def _login_openai_codex(args, pconfig: ProviderConfig) -> None:
     creds = _codex_device_code_login()
 
     # Save tokens to Hermes auth store
-    _save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
+    _save_codex_tokens(
+        creds["tokens"],
+        creds.get("last_refresh"),
+        session_origin=CODEX_SESSION_ORIGIN_HERMES,
+    )
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
     print()
     print("Login successful!")
@@ -2026,6 +2134,21 @@ def _login_openai_codex(args, pconfig: ProviderConfig) -> None:
 
 
 def _codex_device_code_login() -> Dict[str, Any]:
+    """Run the OpenAI device code login flow and retry once with a fresh code if needed."""
+    attempts = CODEX_DEVICE_AUTH_FRESH_RETRY_LIMIT + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return _codex_device_code_login_once()
+        except AuthError as exc:
+            if attempt >= attempts or not _should_retry_codex_device_code_login(exc):
+                raise
+            print()
+            print("Codex authorization code was rejected. Restarting device auth with a fresh code...")
+
+    raise RuntimeError("Codex device auth retry loop exited unexpectedly.")
+
+
+def _codex_device_code_login_once() -> Dict[str, Any]:
     """Run the OpenAI device code login flow and return credentials dict."""
     import time as _time
 
@@ -2064,11 +2187,13 @@ def _codex_device_code_login() -> Dict[str, Any]:
         )
 
     # Step 2: Show user the code
+    from hermes_cli.colors import Colors, color
+
     print("To continue, follow these steps:\n")
-    print("  1. Open this URL in your browser:")
-    print(f"     \033[94m{issuer}/codex/device\033[0m\n")
-    print("  2. Enter this code:")
-    print(f"     \033[94m{user_code}\033[0m\n")
+    print(f"  1. Open this URL in your browser:")
+    print(f"     {color(f'{issuer}/codex/device', Colors.BLUE)}\n")
+    print(f"  2. Enter this code:")
+    print(f"     {color(user_code, Colors.BLUE)}\n")
     print("Waiting for sign-in... (press Ctrl+C to cancel)")
 
     # Step 3: Poll for authorization code
@@ -2137,9 +2262,27 @@ def _codex_device_code_login() -> Dict[str, Any]:
         )
 
     if token_resp.status_code != 200:
+        code = "token_exchange_error"
+        message = f"Token exchange returned status {token_resp.status_code}."
+        relogin_required = False
+        try:
+            payload = token_resp.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            err_code = payload.get("error") or payload.get("code")
+            err_desc = payload.get("error_description") or payload.get("message")
+            if isinstance(err_code, str) and err_code.strip():
+                code = err_code.strip()
+            if isinstance(err_desc, str) and err_desc.strip():
+                message = f"Codex token exchange failed: {err_desc.strip()}"
+        if code in {"invalid_grant", "invalid_token"}:
+            relogin_required = True
         raise AuthError(
-            f"Token exchange returned status {token_resp.status_code}.",
-            provider="openai-codex", code="token_exchange_error",
+            message,
+            provider="openai-codex",
+            code=code,
+            relogin_required=relogin_required,
         )
 
     tokens = token_resp.json()
@@ -2209,7 +2352,11 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
         print(f"TLS verification: custom CA bundle ({ca_bundle})")
 
     try:
-        with httpx.Client(timeout=timeout, headers={"Accept": "application/json"}, verify=verify) as client:
+        with httpx.Client(
+            timeout=timeout,
+            headers={"Accept": "application/json"},
+            verify=_httpx_verify_arg(verify),
+        ) as client:
             device_data = _request_device_code(
                 client=client, portal_base_url=portal_base_url,
                 client_id=client_id, scope=scope,

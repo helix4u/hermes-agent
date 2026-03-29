@@ -221,9 +221,14 @@ class TestPruning:
 
 class TestSpawnEnvSanitization:
     def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
-        captured = {}
+        captured = {"dispatch": []}
+
+        def fake_dispatch(command, work_dir):
+            captured["dispatch"].append((command, work_dir))
+            return (["cmd.exe", "/d", "/s", "/c", command], {"cwd": work_dir, "shell": False}, "cmd")
 
         def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
             captured["env"] = kwargs["env"]
             proc = MagicMock()
             proc.pid = 4321
@@ -241,7 +246,7 @@ class TestSpawnEnvSanitization:
             "TELEGRAM_BOT_TOKEN": "bot-secret",
             "FIRECRAWL_API_KEY": "fc-secret",
         }, clear=True), \
-            patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("tools.process_registry.build_local_subprocess_invocation", side_effect=fake_dispatch), \
             patch("subprocess.Popen", side_effect=fake_popen), \
             patch("threading.Thread", return_value=fake_thread), \
             patch.object(registry, "_write_checkpoint"):
@@ -256,11 +261,26 @@ class TestSpawnEnvSanitization:
             )
 
         env = captured["env"]
+        assert captured["dispatch"] == [("echo hello", "/tmp")]
+        assert captured["cmd"] == ["cmd.exe", "/d", "/s", "/c", "echo hello"]
         assert env["MY_CUSTOM_VAR"] == "keep-me"
         assert env["TELEGRAM_BOT_TOKEN"] == "forced-bot-token"
         assert "FIRECRAWL_API_KEY" not in env
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
+
+    def test_kill_process_uses_shared_terminator_for_local_processes(self, registry):
+        s = _make_session()
+        s.process = MagicMock()
+        s.process.pid = 4321
+        registry._running[s.id] = s
+
+        with patch("tools.process_registry.terminate_process_tree") as mock_terminate, \
+            patch.object(registry, "_write_checkpoint"):
+            result = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        mock_terminate.assert_called_once_with(s.process, force=False)
 
 
 # =========================================================================

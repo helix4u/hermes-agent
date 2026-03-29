@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hermes Page Context Bridge</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="icons/nous-32.png">
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="app">
+      <header class="hero">
+        <p class="eyebrow">Hermes Agent</p>
+        <h1>Inject page context</h1>
+        <p class="subhead">Send the current tab into a local Hermes gateway session.</p>
+      </header>
+
+      <section class="card">
+        <div class="section-head">
+          <h2>Current tab</h2>
+          <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
+        </div>
+        <p id="page-title" class="page-title">Loading page context...</p>
+        <p id="page-url" class="page-url"></p>
+        <div class="meta-grid">
+          <div class="meta-chip">
+            <span class="meta-label">Kind</span>
+            <span id="content-kind" class="meta-value">-</span>
+          </div>
+          <div class="meta-chip">
+            <span class="meta-label">Selection</span>
+            <span id="selection-length" class="meta-value">0 chars</span>
+          </div>
+          <div class="meta-chip">
+            <span class="meta-label">Transcript</span>
+            <span id="transcript-status" class="meta-value">Checking...</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <h2>Instruction</h2>
+        </div>
+        <textarea
+          id="note-input"
+          class="note-input"
+          rows="4"
+          placeholder="Optional: tell Hermes what you want to do with this page."
+        ></textarea>
+        <label class="checkbox-row">
+          <input id="include-transcript" type="checkbox">
+          <span>Include the YouTube transcript the first time this video is shared</span>
+        </label>
+        <button id="send-button" class="primary-button" type="button">Send to Hermes</button>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <h2>Bridge settings</h2>
+          <button id="health-button" class="ghost-button" type="button">Check bridge</button>
+        </div>
+        <label class="field">
+          <span class="field-label">Bridge URL</span>
+          <input id="bridge-url" type="url" spellcheck="false">
+        </label>
+        <label class="field">
+          <span class="field-label">Bridge token</span>
+          <input id="bridge-token" type="password" spellcheck="false" placeholder="Paste ~/.hermes/browser_bridge_token">
+        </label>
+        <button id="save-settings-button" class="secondary-button" type="button">Save settings</button>
+      </section>
+
+      <section class="card status-card">
+        <div class="section-head">
+          <h2>Status</h2>
+        </div>
+        <p id="status-text" class="status-text">Waiting for input.</p>
+      </section>
+    </main>
+    <script src="theme.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

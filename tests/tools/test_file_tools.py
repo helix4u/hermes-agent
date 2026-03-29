@@ -217,6 +217,93 @@ class TestSearchHandler:
         result = json.loads(search_tool(pattern="x"))
         assert "error" in result
 
+    @patch("tools.file_tools._get_file_ops")
+    def test_search_infers_file_lookup_for_filename_pattern(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"files": [], "total_count": 0}
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import search_tool
+        search_tool(pattern="2026-03-27_22-09-10.mp4")
+        mock_ops.search.assert_called_once_with(
+            pattern="2026-03-27_22-09-10.mp4",
+            path=".",
+            target="files",
+            file_glob=None,
+            limit=50,
+            offset=0,
+            output_mode="content",
+            context=0,
+        )
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_search_infers_search_root_from_full_path_pattern(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"files": [], "total_count": 0}
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import search_tool
+        search_tool(pattern=r"D:\Symlinks\Downloads\a\2026-03-27_22-09-10.mp4")
+        mock_ops.search.assert_called_once_with(
+            pattern="2026-03-27_22-09-10.mp4",
+            path=r"D:\Symlinks\Downloads\a",
+            target="files",
+            file_glob=None,
+            limit=50,
+            offset=0,
+            output_mode="content",
+            context=0,
+        )
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_explicit_content_target_is_preserved_for_filename_like_pattern(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"matches": [], "total_count": 0}
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import _handle_search_files
+        _handle_search_files(
+            {"pattern": "2026-03-27_22-09-10.mp4", "target": "content"},
+            task_id="task-1",
+        )
+        mock_ops.search.assert_called_once_with(
+            pattern="2026-03-27_22-09-10.mp4",
+            path=".",
+            target="content",
+            file_glob=None,
+            limit=50,
+            offset=0,
+            output_mode="content",
+            context=0,
+        )
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_search_infers_files_target_for_glob_like_pattern(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"files": [], "total_count": 0}
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import search_tool
+        search_tool(pattern="*ggwave*")
+        mock_ops.search.assert_called_once_with(
+            pattern="*ggwave*",
+            path=".",
+            target="files",
+            file_glob=None,
+            limit=50,
+            offset=0,
+            output_mode="content",
+            context=0,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tool result hint tests (#722)
@@ -309,6 +396,5 @@ class TestSearchHints:
         raw = search_tool(pattern="foo", offset=50, limit=50)
         assert "[Hint:" in raw
         assert "offset=100" in raw
-
 
 

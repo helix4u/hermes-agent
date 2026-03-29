@@ -219,9 +219,40 @@ terminal:
 # Browser Tool Configuration
 # =============================================================================
 browser:
+  # Browser backend: "playwright" (local) or "browserbase"
+  # backend: "playwright"
+
+  # Optional live CDP endpoint override for browser tools.
+  # When set, browser tools connect to this endpoint instead of headless local mode.
+  # Example: "ws://localhost:9222"
+  # cdp_url: ""
+
+  # Preferred browser target for `/browser connect` auto-launch.
+  # Options: auto, chrome, edge, brave, chromium, comet
+  cdp_browser: "auto"
+
+  # Default localhost CDP port used by `/browser connect` when no endpoint is provided.
+  cdp_port: 9222
+
+  # Optional user-data-dir for CDP browser launch.
+  # Useful to isolate automation from your daily profile.
+  # cdp_user_data_dir: "%TEMP%\\chrome-cdp-hermes"
+
   # Inactivity timeout in seconds - browser sessions are automatically closed
   # after this period of no activity between agent loops (default: 120 = 2 minutes)
   inactivity_timeout: 120
+
+  # Navigation timeout in seconds for page loads/actions
+  # navigate_timeout: 30
+
+  # Run browser in headless mode (set false to watch it)
+  # headless: true
+
+  # Optional persistent profile directory for local browser state
+  # profile_dir: "~/.hermes/browser-profile"
+
+  # Optional custom browser user-agent string
+  # user_agent: ""
 
 # =============================================================================
 # Context Compression (Auto-shrinks long conversations)
@@ -491,6 +522,18 @@ platform_toolsets:
   signal: [hermes-signal]
   homeassistant: [hermes-homeassistant]
 
+# =============================================================================
+# Browser Sidecar
+# =============================================================================
+# Browser extension sidecar sessions use a local bridge and are intentionally
+# conservative by default. Delegation is off unless you opt in.
+#
+# browser_sidecar:
+#   toolsets: [hermes-sidecar]   # Optional explicit override
+#   allow_delegation: false      # Default false; set true to allow delegate_task
+#   max_turns: 80                # Optional sidecar-specific iteration budget
+#   max_tool_calls: 320          # Optional sidecar-specific soft tool-call budget
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Available toolsets (use these names in platform_toolsets or the toolsets list)
 #
@@ -512,7 +555,7 @@ platform_toolsets:
 #   skills_hub   - skill_hub (search/install/manage from online registries — user-driven only)
 #   moa          - mixture_of_agents  (requires OPENROUTER_API_KEY)
 #   todo         - todo (in-memory task planning, no deps)
-#   tts          - text_to_speech  (Edge TTS free, or ELEVENLABS/OPENAI key)
+#   tts          - text_to_speech  (Edge TTS free, local F5, or ELEVENLABS/OPENAI key)
 #   cronjob      - cronjob (create/list/update/pause/resume/run/remove scheduled tasks)
 #   rl           - rl_list_environments, rl_start_training, etc. (requires TINKER_API_KEY)
 #
@@ -541,7 +584,7 @@ platform_toolsets:
 #   todo         - Task planning and tracking for multi-step work
 #   memory       - Persistent memory across sessions (personal notes + user profile)
 #   session_search - Search and recall past conversations (FTS5 + Gemini Flash summarization)
-#   tts          - Text-to-speech (Edge TTS free, ElevenLabs, OpenAI)
+#   tts          - Text-to-speech (Edge TTS free, local F5, ElevenLabs, OpenAI)
 #   cronjob      - Schedule and manage automated tasks (CLI-only)
 #   rl           - RL training tools (Tinker-Atropos)
 #
@@ -608,6 +651,22 @@ platform_toolsets:
 # =============================================================================
 # Voice Transcription (Speech-to-Text)
 # =============================================================================
+# Text-to-speech provider settings live in ~/.hermes/config.yaml:
+#
+# tts:
+#   provider: "f5"               # "edge" | "elevenlabs" | "openai" | "f5"
+#   f5:
+#     base_url: "http://localhost:8081"
+#     voice_profile: "Tim"
+#     token_ttl_minutes: 30
+#     request_timeout_seconds: 300
+#
+# Put the shared FastAPI SECRET_KEY in ~/.hermes/.env as
+# a 32+ byte secret (required for HS256 JWT signing):
+#   F5TTS_SECRET_KEY=replace-with-32-plus-byte-secret
+#   # PowerShell example generator:
+#   # [Convert]::ToBase64String((1..32 | ForEach-Object {Get-Random -Maximum 256}))
+#
 # Automatically transcribe voice messages on messaging platforms.
 # Requires OPENAI_API_KEY in .env (uses OpenAI Whisper API directly).
 stt:
@@ -694,6 +753,14 @@ display:
   #   queue:     Queue your message for the next turn
   # Ctrl+C always interrupts regardless of this setting.
   busy_input_mode: interrupt
+  # Tool progress delivery style for chat platforms (Discord/Telegram/etc.)
+  #   single: Keep one live "working" message and edit it as tools run (default)
+  #   feed:   Send each progress update as a new message
+  tool_progress_style: single
+
+  # Number of recent tool events to keep in the live progress window.
+  # Valid range: 1-8
+  tool_progress_rolling_entries: 4
 
   # Background process notifications (gateway/messaging only).
   # Controls how chatty the process watcher is when you use

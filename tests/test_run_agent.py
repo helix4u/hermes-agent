@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import run_agent
+from agent.context_compressor import ContextCompressor
 from honcho_integration.client import HonchoClientConfig
 from run_agent import AIAgent, _inject_honcho_turn_context
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
@@ -81,6 +82,121 @@ def agent_with_memory_tool():
         )
         a.client = MagicMock()
         return a
+
+
+def test_context_compressor_does_not_pin_opening_turns(agent):
+    """Live sessions should let compaction summarize the opening exchange."""
+    assert agent.context_compressor.protect_first_n == 0
+
+
+def test_compress_context_keeps_latest_user_turn_last(agent):
+    """Todo reinjection after compression must not displace the live user ask."""
+    latest_request = "do the wiki pending stuff"
+    todo_snapshot = "[Your active task list was preserved across context compression]"
+    messages = [
+        {"role": "user", "content": "what's up today?"},
+        {"role": "assistant", "content": "not much"},
+        {"role": "user", "content": latest_request},
+    ]
+
+    agent._persist_user_message_idx = 2
+    agent.context_compressor = MagicMock()
+
+    def _compress_side_effect(msgs, current_tokens=None):
+        return [
+            {"role": "assistant", "content": "[CONTEXT COMPACTION] summary"},
+            msgs[-1].copy(),
+        ]
+
+    agent.context_compressor.compress.side_effect = _compress_side_effect
+    agent._todo_store = MagicMock()
+    agent._todo_store.format_for_injection.return_value = todo_snapshot
+    agent._build_system_prompt = MagicMock(return_value="system prompt")
+    agent._cached_system_prompt = "old system prompt"
+    agent._session_db = None
+
+    with patch.object(agent, "flush_memories"):
+        compressed, new_system_prompt = agent._compress_context(messages, "system prompt")
+
+    assert new_system_prompt == "system prompt"
+    assert compressed[-2] == {"role": "user", "content": todo_snapshot}
+    assert compressed[-1] == {"role": "user", "content": latest_request}
+    assert agent._persist_user_message_idx == len(compressed) - 1
+
+
+def test_compress_context_preserves_current_user_before_tool_tail(agent):
+    """Large tool outputs after the live ask must not push that ask into the summary."""
+    latest_request = "do the wiki pending stuff"
+    todo_snapshot = "[Your active task list was preserved across context compression]"
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = "summary text"
+
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        agent.context_compressor = ContextCompressor(
+            model="test/model",
+            quiet_mode=True,
+            protect_first_n=0,
+            protect_last_n=2,
+        )
+
+    messages = [
+        {"role": "user", "content": "what's up today?"},
+        {"role": "assistant", "content": "not much"},
+        {"role": "user", "content": latest_request},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_wiki_1",
+                    "type": "function",
+                    "function": {"name": "search_files", "arguments": "{}"},
+                },
+                {
+                    "id": "call_wiki_2",
+                    "type": "function",
+                    "function": {"name": "search_files", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_wiki_1", "content": "x" * 80000},
+        {"role": "tool", "tool_call_id": "call_wiki_2", "content": "y" * 80000},
+    ]
+
+    agent._persist_user_message_idx = 2
+    agent._todo_store = MagicMock()
+    agent._todo_store.format_for_injection.return_value = todo_snapshot
+    agent._build_system_prompt = MagicMock(return_value="system prompt")
+    agent._cached_system_prompt = "old system prompt"
+    agent._session_db = None
+
+    with (
+        patch("agent.context_compressor.call_llm", return_value=mock_response),
+        patch.object(agent, "flush_memories"),
+    ):
+        compressed, new_system_prompt = agent._compress_context(messages, "system prompt")
+
+    assert new_system_prompt == "system prompt"
+    todo_idx = next(i for i, msg in enumerate(compressed) if msg.get("content") == todo_snapshot)
+    current_user_idx = next(
+        i
+        for i, msg in enumerate(compressed)
+        if msg.get("role") == "user" and msg.get("content") == latest_request
+    )
+    tool_call_idx = next(
+        i
+        for i, msg in enumerate(compressed)
+        if msg.get("role") == "assistant" and msg.get("tool_calls")
+    )
+
+    assert todo_idx < current_user_idx < tool_call_idx
+    assert agent._persist_user_message_idx == current_user_idx
+    assert [
+        msg.get("content")
+        for msg in compressed
+        if msg.get("role") == "user"
+    ][-1] == latest_request
 
 
 def test_aiagent_reuses_existing_errors_log_handler():
@@ -743,6 +859,123 @@ class TestToolUseEnforcementConfig:
             assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
 
 
+class TestBuildEnvironmentHint:
+    def test_returns_empty_on_non_windows_host(self, agent):
+        with patch.object(run_agent.os, "name", "posix"):
+            assert agent._build_environment_hint() == ""
+
+    def test_cmd_mode_hint(self, agent):
+        with (
+            patch.object(run_agent.os, "name", "nt"),
+            patch("tools.environments.shell_utils.get_local_shell_mode", return_value="cmd"),
+            patch.dict("os.environ", {"HERMES_WINDOWS_SHELL": "cmd"}, clear=False),
+        ):
+            hint = agent._build_environment_hint()
+        assert "cmd.exe local terminal" in hint
+        assert "Do NOT use PowerShell syntax" in hint
+        assert "do that action first before memory or worldview file reads" in hint
+
+    def test_powershell_mode_hint(self, agent):
+        with (
+            patch.object(run_agent.os, "name", "nt"),
+            patch("tools.environments.shell_utils.get_local_shell_mode", return_value="powershell"),
+            patch.dict("os.environ", {"HERMES_WINDOWS_SHELL": "powershell"}, clear=False),
+        ):
+            hint = agent._build_environment_hint()
+        assert "PowerShell local terminal" in hint
+        assert "Get-ChildItem" in hint
+        assert "do that action first before memory or worldview file reads" in hint
+
+    def test_wsl_mode_hint(self, agent):
+        with (
+            patch.object(run_agent.os, "name", "nt"),
+            patch("tools.environments.shell_utils.get_local_shell_mode", return_value="wsl"),
+            patch.dict("os.environ", {"HERMES_WINDOWS_SHELL": "wsl"}, clear=False),
+        ):
+            hint = agent._build_environment_hint()
+        assert "local terminal is WSL" in hint
+        assert "/mnt/c/Users" in hint
+        assert "do that action first before memory or worldview file reads" in hint
+
+    def test_hint_uses_resolved_override_not_direct_env(self, agent):
+        with (
+            patch.object(run_agent.os, "name", "nt"),
+            patch("tools.environments.shell_utils.get_local_shell_mode", return_value="cmd"),
+            patch("tools.environments.shell_utils.resolve_windows_shell_override", return_value="cmd"),
+            patch.dict("os.environ", {}, clear=False),
+        ):
+            hint = agent._build_environment_hint()
+        assert "HERMES_WINDOWS_SHELL=cmd" in hint
+
+
+class TestBuildSkillRoutingHint:
+    def test_returns_empty_without_skill_view_tool(self, agent):
+        assert agent._build_skill_routing_hint("please use kokoro voices") == ""
+
+    def test_returns_empty_without_kokoro_markers(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "skill_view"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent.client = MagicMock()
+        assert agent._build_skill_routing_hint("say hello with tts") == ""
+
+    def test_kokoro_request_prefers_existing_skill_and_provider(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "skill_view", "text_to_speech"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent.client = MagicMock()
+
+        hint = agent._build_skill_routing_hint(
+            "Use Kokoro FastAPI on localhost:8880 and list voices before synthesis."
+        )
+
+        assert "skill `kokoro-tts`" in hint
+        assert "skill_view('kokoro-tts')" in hint
+        assert "`text_to_speech` provider `kokoro`" in hint
+
+
+class TestShellUtilsWindowsOverride:
+    def test_env_override_takes_precedence_over_config(self):
+        from tools.environments import shell_utils
+
+        with (
+            patch.dict("os.environ", {"HERMES_WINDOWS_SHELL": "powershell"}, clear=False),
+            patch("tools.environments.shell_utils._config_windows_shell_override", return_value="cmd"),
+        ):
+            assert shell_utils.resolve_windows_shell_override() == "powershell"
+
+    def test_config_override_used_when_env_missing(self):
+        from tools.environments import shell_utils
+
+        with (
+            patch.dict("os.environ", {}, clear=False),
+            patch("tools.environments.shell_utils._config_windows_shell_override", return_value="cmd"),
+        ):
+            assert shell_utils.resolve_windows_shell_override() == "cmd"
+
+
 class TestInvalidateSystemPrompt:
     def test_clears_cache(self, agent):
         agent._cached_system_prompt = "cached value"
@@ -928,6 +1161,34 @@ class TestExecuteToolCalls:
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
+
+    def test_single_tool_skips_raw_spinner_when_progress_callback_present(self, agent):
+        tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        progress_callback = MagicMock()
+        agent.tool_progress_callback = progress_callback
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch("run_agent.KawaiiSpinner") as mock_spinner,
+        ):
+            agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        mock_spinner.assert_not_called()
+        assert progress_callback.call_count == 2
+        start_call, finish_call = progress_callback.call_args_list
+        assert start_call.args[0] == "web_search"
+        assert start_call.args[2] == {"q": "test"}
+        assert finish_call.args[0] == "_tool_result"
+        assert finish_call.args[1] == "web_search"
+        assert finish_call.args[2]["tool"] == "web_search"
+        assert isinstance(finish_call.args[2]["duration_seconds"], (int, float))
+        assert finish_call.args[2]["is_error"] is False
+        assert finish_call.args[2]["status_suffix"] == ""
+        assert finish_call.args[2]["result"] == "search result"
+        assert len(messages) == 1
+        assert messages[0]["role"] == "tool"
 
     def test_interrupt_skips_remaining(self, agent):
         tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -1205,6 +1466,60 @@ class TestConcurrentToolExecution:
         for m in messages:
             assert len(m["content"]) < 150_000
             assert "Truncated" in m["content"]
+
+    def test_concurrent_reports_completion_as_each_tool_finishes(self, agent):
+        """Progress callbacks should stream per-tool completion without waiting for the whole batch."""
+        import time as _time
+
+        tc1 = _mock_tool_call(name="web_search", arguments='{"q":"slow"}', call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments='{"q":"fast"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        progress_callback = MagicMock()
+        agent.tool_progress_callback = progress_callback
+
+        def fake_handle(name, args, task_id, **kwargs):
+            q = args.get("q", "")
+            if q == "slow":
+                _time.sleep(0.1)
+            return f"result_{q}"
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        completion_calls = [
+            call for call in progress_callback.call_args_list
+            if call.args[0] == "_tool_result"
+        ]
+        assert len(completion_calls) == 2
+        assert completion_calls[0].args[2]["result"] == "result_fast"
+        assert completion_calls[1].args[2]["result"] == "result_slow"
+
+    def test_concurrent_emits_waiting_heartbeat_for_long_tool(self, agent, monkeypatch):
+        """Long-running concurrent tools should emit periodic waiting updates."""
+        import time as _time
+
+        tc1 = _mock_tool_call(name="web_search", arguments='{"q":"slow"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1])
+        messages = []
+        progress_callback = MagicMock()
+        agent.tool_progress_callback = progress_callback
+        monkeypatch.setattr(run_agent, "_TOOL_PROGRESS_HEARTBEAT_SECONDS", 0.01)
+
+        def fake_handle(name, args, task_id, **kwargs):
+            _time.sleep(0.05)
+            return "slow_result"
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        waiting_calls = [
+            call for call in progress_callback.call_args_list
+            if call.args[0] == "_tool_waiting"
+        ]
+        assert waiting_calls
+        assert waiting_calls[0].args[1] == "web_search"
+        assert waiting_calls[0].args[2]["tool"] == "web_search"
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
@@ -2262,6 +2577,61 @@ class TestBudgetPressure:
             messages[-1]["content"] = last_content + f"\n\n{warning}"
         assert "plain text result" in messages[-1]["content"]
         assert "BUDGET WARNING" in messages[-1]["content"]
+
+    def test_tool_budget_status_uses_live_iteration_budget(self, agent):
+        """Runtime status should reflect the real per-run budget, not max_iterations math."""
+        agent.max_iterations = 90
+        agent.iteration_budget = run_agent.IterationBudget(3)
+        agent.iteration_budget.consume()
+        agent.iteration_budget.consume()
+        agent._tool_calls_executed_total = 4
+        agent.max_tool_calls_per_run = 6
+
+        status = agent._get_tool_budget_status(api_call_count=2)
+
+        assert status["hard_iteration_budget_total"] == 3
+        assert status["hard_iteration_budget_used"] == 2
+        assert status["follow_up_iterations_remaining"] == 1
+        assert status["tool_calls_available_this_turn"] is True
+        assert status["soft_tool_call_budget_total"] == 6
+        assert status["soft_tool_calls_used"] == 4
+        assert status["soft_tool_calls_remaining"] == 2
+        assert status["soft_tool_call_budget_exhausted"] is False
+
+    def test_tool_budget_guidance_blocks_last_turn_tool_calls(self, agent):
+        """The model should be told when no follow-up turn remains for tool results."""
+        agent.iteration_budget = run_agent.IterationBudget(1)
+        agent.iteration_budget.consume()
+        agent._tool_calls_executed_total = 0
+
+        augmented = agent._append_tool_budget_guidance(
+            [{"role": "user", "content": "do work"}],
+            api_call_count=1,
+        )
+
+        assert len(augmented) == 2
+        guidance = augmented[-1]["content"]
+        assert "Tool calls still usable on this response: no" in guidance
+        assert "Follow-up API iterations remaining after tool results: 0 (1/1 used)" in guidance
+        assert "do not emit tool calls now" in guidance
+        assert "Soft tool-call budget for this run: not configured" in guidance
+
+    def test_tool_budget_guidance_reports_soft_budget_exhaustion(self, agent):
+        """Soft budget exhaustion should be explicit without pretending it is a hard block."""
+        agent.iteration_budget = run_agent.IterationBudget(5)
+        agent.iteration_budget.consume()
+        agent.max_tool_calls_per_run = 2
+        agent._tool_calls_executed_total = 2
+
+        augmented = agent._append_tool_budget_guidance(
+            [{"role": "user", "content": "keep going"}],
+            api_call_count=1,
+        )
+
+        guidance = augmented[-1]["content"]
+        assert "Tool calls still usable on this response: yes" in guidance
+        assert "Soft tool-call budget for this run: 0 remaining of 2 (2 used)" in guidance
+        assert "Soft tool-call budget exhausted: yes" in guidance
 
 
 class TestSafeWriter:

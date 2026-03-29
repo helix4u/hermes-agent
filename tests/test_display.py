@@ -78,6 +78,17 @@ class TestBuildToolPreview:
         assert result is not None
         assert "find something" in result
 
+    def test_search_files_preview_includes_mode_and_path(self):
+        result = build_tool_preview(
+            "search_files",
+            {"pattern": "2026-03-27_22-09-10.mp4", "target": "files", "path": "C:/workspace/Videos"},
+            max_len=80,
+        )
+        assert result is not None
+        assert "files" in result
+        assert "2026-03-27_22-09-10.mp4" in result
+        assert "Videos" in result
+
     def test_false_like_args_zero(self):
         """Non-dict falsy values should return None, not crash."""
         assert build_tool_preview("terminal", 0) is None

@@ -3,6 +3,7 @@
 import json
 import pytest
 from pathlib import Path
+import tools.memory_tool as memory_tool_module
 
 from tools.memory_tool import (
     MemoryStore,
@@ -201,11 +202,36 @@ class TestMemoryStorePersistence:
         monkeypatch.setattr("tools.memory_tool.MEMORY_DIR", tmp_path)
         # Write file with duplicates
         mem_file = tmp_path / "MEMORY.md"
-        mem_file.write_text("duplicate entry\n§\nduplicate entry\n§\nunique entry")
+        mem_file.write_text("duplicate entry\n§\nduplicate entry\n§\nunique entry", encoding="utf-8")
 
         store = MemoryStore()
         store.load_from_disk()
         assert len(store.memory_entries) == 2
+
+    def test_file_lock_uses_windows_fallback_when_fcntl_missing(self, tmp_path, monkeypatch):
+        class FakeMsvcrt:
+            LK_LOCK = 1
+            LK_UNLCK = 2
+
+            def __init__(self):
+                self.calls = []
+
+            def locking(self, fileno, mode, size):
+                self.calls.append((mode, size))
+
+        fake_msvcrt = FakeMsvcrt()
+        monkeypatch.setattr(memory_tool_module, "fcntl", None)
+        monkeypatch.setattr(memory_tool_module, "msvcrt", fake_msvcrt)
+
+        path = tmp_path / "MEMORY.md"
+        with MemoryStore._file_lock(path):
+            pass
+
+        assert path.with_suffix(".md.lock").exists()
+        assert fake_msvcrt.calls == [
+            (FakeMsvcrt.LK_LOCK, 1),
+            (FakeMsvcrt.LK_UNLCK, 1),
+        ]
 
 
 class TestMemoryStoreSnapshot:

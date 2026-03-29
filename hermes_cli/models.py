@@ -78,7 +78,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "openai/gpt-5.4-nano",
     ],
     "openai-codex": [
+        "gpt-5.4",
         "gpt-5.3-codex",
+        "gpt-5.3-codex-spark",
         "gpt-5.2-codex",
         "gpt-5.1-codex-mini",
         "gpt-5.1-codex-max",
@@ -486,6 +488,10 @@ def detect_provider_for_model(
             break
 
     if direct_match:
+        resolved_direct_name = name
+        if "." in name and "/" not in name:
+            resolved_direct_name = _find_openrouter_slug(name) or f"{direct_match}/{name}"
+
         # Check if we have credentials for this provider
         has_creds = False
         try:
@@ -501,15 +507,15 @@ def detect_provider_for_model(
             pass
 
         if has_creds:
-            return (direct_match, name)
+            return (direct_match, resolved_direct_name)
 
         # No direct creds — try to find this model on OpenRouter instead
         or_slug = _find_openrouter_slug(name)
         if or_slug:
             return ("openrouter", or_slug)
         # Still return the direct provider — credential resolution will
-        # give a clear error rather than silently using the wrong provider
-        return (direct_match, name)
+        # give a clear error rather than silently using the wrong provider.
+        return (direct_match, resolved_direct_name)
 
     # --- Step 2: check OpenRouter catalog ---
     # First try exact match (handles provider/model format)

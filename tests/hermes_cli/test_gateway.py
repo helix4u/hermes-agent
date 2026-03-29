@@ -143,7 +143,7 @@ def test_conflicting_systemd_units_warning(monkeypatch, tmp_path, capsys):
 
 def test_install_linux_gateway_from_setup_system_choice_without_root_prints_followup(monkeypatch, capsys):
     monkeypatch.setattr(gateway, "prompt_linux_gateway_install_scope", lambda: "system")
-    monkeypatch.setattr(gateway.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(gateway, "_effective_uid", lambda: 1000)
     monkeypatch.setattr(gateway, "_default_system_service_user", lambda: "alice")
     monkeypatch.setattr(gateway, "systemd_install", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not install")))
 
@@ -157,7 +157,7 @@ def test_install_linux_gateway_from_setup_system_choice_without_root_prints_foll
 
 def test_install_linux_gateway_from_setup_system_choice_as_root_installs(monkeypatch):
     monkeypatch.setattr(gateway, "prompt_linux_gateway_install_scope", lambda: "system")
-    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(gateway, "_effective_uid", lambda: 0)
     monkeypatch.setattr(gateway, "_default_system_service_user", lambda: "alice")
 
     calls = []
@@ -230,10 +230,11 @@ class TestWaitForGatewayExit:
         monkeypatch.setattr("os.kill", mock_kill)
 
         gateway._wait_for_gateway_exit(timeout=10.0, force_after=5.0)
-        assert (42, signal.SIGKILL) in kills
+        expected_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+        assert (42, expected_signal) in kills
 
     def test_handles_process_already_gone_on_kill(self, monkeypatch):
-        """ProcessLookupError during SIGKILL is not fatal."""
+        """ProcessLookupError during forced kill is not fatal."""
         import time as _time
 
         call_num = 0

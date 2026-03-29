@@ -5,6 +5,7 @@ without risk of circular imports.
 """
 
 import os
+import tempfile
 from pathlib import Path
 
 
@@ -14,7 +15,13 @@ def get_hermes_home() -> Path:
     Reads HERMES_HOME env var, falls back to ~/.hermes.
     This is the single source of truth — all other copies should import this.
     """
-    return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    hermes_home = os.getenv("HERMES_HOME", "").strip()
+    if hermes_home:
+        return Path(hermes_home).expanduser()
+    try:
+        return Path.home() / ".hermes"
+    except RuntimeError:
+        return Path(tempfile.gettempdir()) / ".hermes"
 
 
 def get_hermes_dir(new_subpath: str, old_name: str) -> Path:

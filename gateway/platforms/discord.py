@@ -10,21 +10,31 @@ Uses discord.py library for:
 """
 
 import asyncio
+import io
 import json
 import logging
+import math
+import mimetypes
 import os
+import shutil
 import struct
 import subprocess
 import tempfile
 import threading
 import time
+import wave
 from collections import defaultdict
+from contextlib import suppress
 from pathlib import Path
-from typing import Callable, Dict, Optional, Any
+from typing import Callable, Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
+DISCORD_AUDIO_SAFE_BYTES = 7_500_000
+DISCORD_LISTEN_FULL_CUSTOM_ID = "hermes:listen:full"
+DISCORD_LISTEN_KNIGHT_CUSTOM_ID = "hermes:listen:knight"
+DISCORD_LISTEN_ANSWER_CUSTOM_ID = "hermes:listen:answer"
 
 try:
     import discord
@@ -57,6 +67,10 @@ from gateway.platforms.base import (
 )
 
 
+_KNIGHT_BLOCK_RE = re.compile(r"<ʞᴎiʜƚ>([\s\S]*?)</ʞᴎiʜƚ>", re.IGNORECASE)
+_ACTION_RESPONSE_RE = re.compile(r"(?im)^\s*Action\s*/\s*Response\s*:\s*")
+
+
 def _clean_discord_id(entry: str) -> str:
     """Strip common prefixes from a Discord user ID or username entry.
 
@@ -74,9 +88,99 @@ def _clean_discord_id(entry: str) -> str:
     return entry.strip()
 
 
+def build_discord_listen_components() -> list[dict[str, Any]]:
+    """Return REST-compatible persistent listen buttons for detached Discord sends."""
+    return [
+        {
+            "type": 1,
+            "components": [
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Listen",
+                    "emoji": {"name": "🔊"},
+                    "custom_id": DISCORD_LISTEN_FULL_CUSTOM_ID,
+                },
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "ʞᴎiʜƚ",
+                    "emoji": {"name": "🧠"},
+                    "custom_id": DISCORD_LISTEN_KNIGHT_CUSTOM_ID,
+                },
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Answer",
+                    "emoji": {"name": "🗣️"},
+                    "custom_id": DISCORD_LISTEN_ANSWER_CUSTOM_ID,
+                },
+            ],
+        }
+    ]
+
+
+def _extract_listen_sections(text: str) -> dict[str, str]:
+    full = str(text or "").strip()
+    if not full:
+        return {"full": "", "knight": "", "answer": ""}
+
+    knight_parts = [part.strip() for part in _KNIGHT_BLOCK_RE.findall(full) if str(part).strip()]
+    knight = "\n\n".join(knight_parts).strip()
+
+    action_match = _ACTION_RESPONSE_RE.search(full)
+    if action_match:
+        answer = full[action_match.end():].strip()
+    else:
+        answer = _KNIGHT_BLOCK_RE.sub("", full).strip()
+
+    return {"full": full, "knight": knight, "answer": answer}
+
+
 def check_discord_requirements() -> bool:
     """Check if Discord dependencies are available."""
     return DISCORD_AVAILABLE
+
+
+def _find_opus_library_path() -> Optional[str]:
+    """Locate an Opus shared library path for discord.py voice support."""
+    import ctypes.util
+
+    opus_path = ctypes.util.find_library("opus")
+    if opus_path:
+        return opus_path
+
+    # ctypes.util.find_library fails on macOS with Homebrew-installed libs,
+    # so fall back to known Homebrew paths if needed.
+    _homebrew_paths = (
+        "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
+        "/usr/local/lib/libopus.dylib",     # Intel Mac
+    )
+    if sys.platform == "darwin":
+        for _hp in _homebrew_paths:
+            if os.path.isfile(_hp):
+                return _hp
+
+    # On Windows, discord.py often bundles libopus alongside the package.
+    # Prefer those DLLs before giving up, since find_library() commonly
+    # returns None even when the bundled codec is present.
+    if sys.platform == "win32" and discord is not None:
+        discord_pkg_dir = Path(getattr(discord, "__file__", "")).resolve().parent
+        candidates = [
+            discord_pkg_dir / "bin" / "libopus-0.x64.dll",
+            discord_pkg_dir / "bin" / "libopus-0.x86.dll",
+        ]
+        try:
+            av_libs_dir = discord_pkg_dir.parent / "av.libs"
+            if av_libs_dir.is_dir():
+                candidates.extend(sorted(av_libs_dir.glob("libopus-*.dll")))
+        except Exception:
+            pass
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+
+    return None
 
 
 class VoiceReceiver:
@@ -419,8 +523,10 @@ class DiscordAdapter(BasePlatformAdapter):
     - Reaction-based feedback
     """
     
-    # Discord message limits
-    MAX_MESSAGE_LENGTH = 2000
+    # Keep slightly below Discord's embed description hard limit for safety.
+    MAX_EMBED_DESCRIPTION = 4000
+    CHAIN_SEND_DELAY_SECONDS = 0.5
+    CHAIN_SEND_MAX_RETRIES = 5
     
     # Auto-disconnect from voice channel after this many seconds of inactivity
     VOICE_TIMEOUT = 300
@@ -428,8 +534,13 @@ class DiscordAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
+        self._client_task: Optional[asyncio.Task] = None
+        self._post_ready_task: Optional[asyncio.Task] = None
+        self._post_ready_initialized = False
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
+        self._listen_view_registered = False
+        self._seen_message_ids: Dict[int, float] = {}
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
@@ -449,7 +560,76 @@ class DiscordAdapter(BasePlatformAdapter):
         self._bot_task: Optional[asyncio.Task] = None
         # Cap to prevent unbounded growth (Discord threads get archived).
         self._MAX_TRACKED_THREADS = 500
-    
+
+    def _flatten_slash_command_names(
+        self, commands: list[Any], prefix: str = ""
+    ) -> list[str]:
+        """Return flattened slash command names, including grouped subcommands."""
+        names: list[str] = []
+        for command in commands or []:
+            name = str(getattr(command, "name", "") or "").strip()
+            if not name:
+                continue
+            full = f"{prefix} {name}".strip() if prefix else name
+            children = getattr(command, "commands", None)
+            if children:
+                names.extend(self._flatten_slash_command_names(list(children), prefix=full))
+            else:
+                names.append(full)
+        return names
+
+    async def _run_post_ready_startup(self, *, members: bool) -> None:
+        """Run slow, non-critical startup tasks after gateway readiness."""
+        if not self._client:
+            return
+        logger.info("[%s] Post-ready startup begin", self.name)
+
+        if members:
+            try:
+                await self._resolve_allowed_usernames()
+            except Exception:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "[%s] Failed to resolve allowed usernames",
+                    self.name,
+                    exc_info=True,
+                )
+        elif any(not str(entry).isdigit() for entry in (self._allowed_user_ids or set())):
+            logger.warning(
+                "[%s] DISCORD_ALLOWED_USERS includes username entries but members intent is disabled; "
+                "username-based allowlisting will not be resolved",
+                self.name,
+            )
+
+        try:
+            synced = await self._client.tree.sync()
+            logger.info("[%s] Synced %d slash command(s)", self.name, len(synced))
+            try:
+                command_roots = list(self._client.tree.get_commands())
+                flattened = sorted(set(self._flatten_slash_command_names(command_roots)))
+                if flattened:
+                    print(f"[{self.name}] Synced {len(synced)} slash command(s)", flush=True)
+                    print(
+                        f"[{self.name}] Commands: " + ", ".join(f"/{name}" for name in flattened),
+                        flush=True,
+                    )
+            except Exception as list_exc:  # pragma: no cover - defensive logging
+                logger.debug("[%s] Failed to render slash command list: %s", self.name, list_exc)
+        except Exception as e:  # pragma: no cover - defensive logging
+            logger.warning("[%s] Slash command sync failed: %s", self.name, e, exc_info=True)
+
+        if not self._listen_view_registered:
+            try:
+                self._client.add_view(PersistentListenButtonView(self))
+                self._listen_view_registered = True
+            except Exception as e:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "[%s] Failed to register persistent listen button: %s",
+                    self.name,
+                    e,
+                    exc_info=True,
+                )
+        logger.info("[%s] Post-ready startup complete", self.name)
+
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
         if not DISCORD_AVAILABLE:
@@ -458,21 +638,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Load opus codec for voice channel support
         if not discord.opus.is_loaded():
-            import ctypes.util
-            opus_path = ctypes.util.find_library("opus")
-            # ctypes.util.find_library fails on macOS with Homebrew-installed libs,
-            # so fall back to known Homebrew paths if needed.
-            if not opus_path:
-                import sys
-                _homebrew_paths = (
-                    "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
-                    "/usr/local/lib/libopus.dylib",     # Intel Mac
-                )
-                if sys.platform == "darwin":
-                    for _hp in _homebrew_paths:
-                        if os.path.isfile(_hp):
-                            opus_path = _hp
-                            break
+            opus_path = _find_opus_library_path()
             if opus_path:
                 try:
                     discord.opus.load_opus(opus_path)
@@ -484,50 +650,74 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self.config.token:
             logger.error("[%s] No bot token configured", self.name)
             return False
-        
-        try:
-            # Set up intents -- members intent needed for username-to-ID resolution
+
+        # Parse allowed user entries (may contain usernames or IDs)
+        allowed_env = os.getenv("DISCORD_ALLOWED_USERS", "")
+        if allowed_env:
+            self._allowed_user_ids = {
+                _clean_discord_id(uid) for uid in allowed_env.split(",")
+                if uid.strip()
+            }
+
+        # Username resolution requires guild member listing (privileged members intent).
+        needs_members_intent = any(
+            not str(entry).isdigit() for entry in (self._allowed_user_ids or set())
+        )
+
+        async def _attempt_connect(*, message_content: bool, members: bool) -> tuple[bool, Optional[Exception]]:
+            """Try one connect profile and return (success, startup_exception)."""
+            self._ready_event.clear()
+            self._post_ready_initialized = False
+            self._client_task = None
+
             intents = Intents.default()
-            intents.message_content = True
+            intents.message_content = message_content
             intents.dm_messages = True
             intents.guild_messages = True
-            intents.members = True
+            intents.members = members
             intents.voice_states = True
-            
-            # Create bot
+            # Needed for reaction-based moderation controls.
+            if hasattr(intents, "reactions"):
+                intents.reactions = True
+            if hasattr(intents, "dm_reactions"):
+                intents.dm_reactions = True
+
             self._client = commands.Bot(
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
             )
-            
-            # Parse allowed user entries (may contain usernames or IDs)
-            allowed_env = os.getenv("DISCORD_ALLOWED_USERS", "")
-            if allowed_env:
-                self._allowed_user_ids = {
-                    _clean_discord_id(uid) for uid in allowed_env.split(",")
-                    if uid.strip()
-                }
-            
+
             adapter_self = self  # capture for closure
-            
-            # Register event handlers
+
             @self._client.event
             async def on_ready():
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
-                
-                # Resolve any usernames in the allowed list to numeric IDs
-                await adapter_self._resolve_allowed_usernames()
-                
-                # Sync slash commands with Discord
-                try:
-                    synced = await adapter_self._client.tree.sync()
-                    logger.info("[%s] Synced %d slash command(s)", adapter_self.name, len(synced))
-                except Exception as e:  # pragma: no cover - defensive logging
-                    logger.warning("[%s] Slash command sync failed: %s", adapter_self.name, e, exc_info=True)
                 adapter_self._ready_event.set()
-            
+                if not adapter_self._post_ready_initialized:
+                    adapter_self._post_ready_initialized = True
+                    adapter_self._post_ready_task = asyncio.create_task(
+                        adapter_self._run_post_ready_startup(members=members)
+                    )
+
             @self._client.event
             async def on_message(message: DiscordMessage):
+                # Drop duplicate deliveries of the same Discord message ID.
+                # This protects against occasional repeated gateway dispatch.
+                now = time.time()
+                msg_id = int(getattr(message, "id", 0) or 0)
+                if msg_id:
+                    last = self._seen_message_ids.get(msg_id)
+                    if last and (now - last) < 120:
+                        logger.info("[discord] duplicate message ignored: msg_id=%s", str(msg_id))
+                        return
+                    self._seen_message_ids[msg_id] = now
+                    # Lightweight TTL cleanup
+                    if len(self._seen_message_ids) > 2000:
+                        cutoff = now - 300
+                        self._seen_message_ids = {
+                            k: v for k, v in self._seen_message_ids.items() if v >= cutoff
+                        }
+
                 # Always ignore our own messages
                 if message.author == self._client.user:
                     return
@@ -536,7 +726,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Allow both default and reply types — replies have a distinct MessageType.
                 if message.type not in (discord.MessageType.default, discord.MessageType.reply):
                     return
-                
                 # Bot message filtering (DISCORD_ALLOW_BOTS):
                 #   "none"     — ignore all other bots (default)
                 #   "mentions" — accept bot messages only when they @mention us
@@ -549,7 +738,6 @@ class DiscordAdapter(BasePlatformAdapter):
                         if not self._client.user or self._client.user not in message.mentions:
                             return
                     # "all" falls through to handle_message
-                
                 # If the message @mentions other users but NOT the bot, the
                 # sender is talking to someone else — stay silent.  Only
                 # applies in server channels; in DMs the user is always
@@ -566,7 +754,47 @@ class DiscordAdapter(BasePlatformAdapter):
                     if not _bot_mentioned:
                         return  # Talking to someone else, don't interrupt
 
-                await self._handle_message(message)
+                try:
+                    await self._handle_message(message)
+                except Exception:
+                    logger.exception("[discord] message handler crashed")
+
+            @self._client.event
+            async def on_raw_reaction_add(payload):
+                """
+                Delete this bot's messages when a user reacts with :x: / ❌.
+                Uses raw events so this works even when the message isn't cached.
+                """
+                try:
+                    if self._client.user and payload.user_id == self._client.user.id:
+                        return
+
+                    emoji_name = getattr(payload.emoji, "name", "") or ""
+                    if emoji_name not in {"❌", "x", "✖", "✖️"}:
+                        return
+
+                    channel = self._client.get_channel(payload.channel_id)
+                    if channel is None:
+                        channel = await self._client.fetch_channel(payload.channel_id)
+                    if channel is None:
+                        return
+
+                    message = await channel.fetch_message(payload.message_id)
+                    if message is None:
+                        return
+                    # Delete only this bot's own messages.
+                    if not self._client.user or getattr(message.author, "id", None) != self._client.user.id:
+                        return
+
+                    await message.delete()
+                    logger.info(
+                        "[discord] deleted bot message %s via %s reaction by user %s",
+                        str(message.id),
+                        emoji_name,
+                        str(payload.user_id),
+                    )
+                except Exception:
+                    logger.exception("[discord] reaction delete handler failed")
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
@@ -603,18 +831,95 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Register slash commands
             self._register_slash_commands()
-            
-            # Start the bot in background
-            self._bot_task = asyncio.create_task(self._client.start(self.config.token))
-            
-            # Wait for ready
-            await asyncio.wait_for(self._ready_event.wait(), timeout=30)
-            
-            self._running = True
-            return True
-            
-        except asyncio.TimeoutError:
-            logger.error("[%s] Timeout waiting for connection to Discord", self.name, exc_info=True)
+            try:
+                registered = len(self._client.tree.get_commands())
+            except Exception:
+                registered = -1
+            if registered >= 0:
+                logger.info("[%s] Registered %d slash command roots locally", self.name, registered)
+            else:
+                logger.info("[%s] Registered slash commands locally", self.name)
+
+            start_task = asyncio.create_task(self._client.start(self.config.token))
+            ready_task = asyncio.create_task(self._ready_event.wait())
+
+            try:
+                done, pending = await asyncio.wait(
+                    {start_task, ready_task},
+                    timeout=30,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                _ = pending
+
+                if ready_task in done and self._ready_event.is_set():
+                    self._running = True
+                    # Keep the Discord client task alive for the session lifetime.
+                    self._client_task = start_task
+                    return True, None
+
+                if start_task in done:
+                    if not ready_task.done():
+                        ready_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await ready_task
+                    exc = start_task.exception()
+                    if exc:
+                        return False, exc
+                    return False, RuntimeError("Discord client exited before ready")
+
+                # Timeout waiting for readiness: shut down this attempt cleanly.
+                ready_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await ready_task
+                if not start_task.done():
+                    start_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await start_task
+                return False, asyncio.TimeoutError("Timeout waiting for Discord ready event")
+            finally:
+                if not self._running and self._client:
+                    try:
+                        await self._client.close()
+                    except Exception:
+                        pass
+                    self._client = None
+                if not self._running:
+                    self._client_task = None
+
+        try:
+            # First attempt: normal behavior (message content + optional members intent)
+            ok, err = await _attempt_connect(
+                message_content=True,
+                members=needs_members_intent,
+            )
+            if ok:
+                return True
+
+            err_text = str(err) if err else ""
+            privileged_intents_rejected = bool(
+                err
+                and (
+                    "PrivilegedIntentsRequired" in err.__class__.__name__
+                    or "PrivilegedIntentsRequired" in err_text
+                )
+            )
+            # If Discord rejects privileged intents, retry without them so DMs and slash
+            # commands can still function.
+            if privileged_intents_rejected:
+                logger.warning(
+                    "[%s] Privileged intents not enabled; retrying with reduced intents",
+                    self.name,
+                )
+                ok, err = await _attempt_connect(message_content=False, members=False)
+                if ok:
+                    return True
+
+            if isinstance(err, asyncio.TimeoutError):
+                logger.error("[%s] Timeout waiting for connection to Discord", self.name)
+            elif err:
+                logger.error("[%s] Failed to connect to Discord: %s", self.name, err)
+            else:
+                logger.error("[%s] Failed to connect to Discord", self.name)
             return False
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True)
@@ -622,6 +927,19 @@ class DiscordAdapter(BasePlatformAdapter):
     
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
+        if self._post_ready_task and not self._post_ready_task.done():
+            self._post_ready_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._post_ready_task
+        self._post_ready_task = None
+        self._post_ready_initialized = False
+
+        # Cancel any persistent typing loops so Discord doesn't keep showing
+        # a stuck typing state during shutdown or reconnect.
+        for chat_id in list(self._typing_tasks.keys()):
+            with suppress(Exception):
+                await self.stop_typing(chat_id)
+
         # Clean up all active voice connections before closing the client
         for guild_id in list(self._voice_clients.keys()):
             try:
@@ -634,8 +952,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._client.close()
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.warning("[%s] Error during disconnect: %s", self.name, e, exc_info=True)
+        if self._client_task and not self._client_task.done():
+            self._client_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._client_task
 
         self._running = False
+        self._client_task = None
         self._client = None
         self._ready_event.clear()
         logger.info("[%s] Disconnected", self.name)
@@ -645,9 +968,11 @@ class DiscordAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        include_listen_button: bool = True,
     ) -> SendResult:
-        """Send a message to a Discord channel."""
+        """Send a message to a Discord channel using chained embeds."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -660,9 +985,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
             
-            # Format and split message if needed
+            # Format and split message into embed-sized chunks
             formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            chunks = self.truncate_message(formatted, self.MAX_EMBED_DESCRIPTION)
             
             message_ids = []
             reference = None
@@ -675,31 +1000,81 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.debug("Could not fetch reply-to message: %s", e)
             
             for i, chunk in enumerate(chunks):
-                chunk_reference = reference if i == 0 else None
-                try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
-                except Exception as e:
-                    err_text = str(e)
-                    if (
-                        chunk_reference is not None
-                        and "error code: 50035" in err_text
-                        and "Cannot reply to a system message" in err_text
-                    ):
-                        logger.warning(
-                            "[%s] Reply target %s is a Discord system message; retrying send without reply reference",
-                            self.name,
-                            reply_to,
-                        )
+                embed = discord.Embed(description=chunk)
+                is_tool_progress = bool((metadata or {}).get("tool_progress"))
+                view = ListenButtonView(self) if (include_listen_button and not is_tool_progress) else None
+                last_err: Optional[Exception] = None
+                for attempt in range(1, self.CHAIN_SEND_MAX_RETRIES + 1):
+                    try:
+                        chunk_reference = reference if i == 0 else None
                         msg = await channel.send(
-                            content=chunk,
-                            reference=None,
+                            embed=embed,
+                            view=view,
+                            reference=chunk_reference,
                         )
-                    else:
-                        raise
+                        last_err = None
+                        break
+                    except Exception as e:
+                        err_text = str(e)
+                        if (
+                            chunk_reference is not None
+                            and "error code: 50035" in err_text
+                            and "Cannot reply to a system message" in err_text
+                        ):
+                            logger.warning(
+                                "[%s] Reply target %s is a Discord system message; retrying send without reply reference",
+                                self.name,
+                                reply_to,
+                            )
+                            try:
+                                msg = await channel.send(
+                                    embed=embed,
+                                    view=view,
+                                    reference=None,
+                                )
+                                last_err = None
+                                break
+                            except Exception as retry_without_ref_error:
+                                e = retry_without_ref_error
+                        last_err = e
+                        status = getattr(e, "status", None)
+                        code = getattr(e, "code", None)
+                        retry_after = getattr(e, "retry_after", None)
+                        response_obj = getattr(e, "response", None)
+                        if retry_after is None and response_obj is not None:
+                            try:
+                                header_val = response_obj.headers.get("Retry-After")
+                                retry_after = float(header_val) if header_val else None
+                            except Exception:
+                                retry_after = None
+
+                        logger.warning(
+                            "[discord] chunk send failed (%d/%d, chunk %d/%d, len=%d, status=%s, code=%s, retry_after=%s): %s",
+                            attempt,
+                            self.CHAIN_SEND_MAX_RETRIES,
+                            i + 1,
+                            len(chunks),
+                            len(chunk),
+                            status,
+                            code,
+                            retry_after,
+                            e,
+                        )
+                        if attempt < self.CHAIN_SEND_MAX_RETRIES:
+                            if retry_after is not None:
+                                delay = max(float(retry_after), self.CHAIN_SEND_DELAY_SECONDS)
+                            else:
+                                delay = self.CHAIN_SEND_DELAY_SECONDS * attempt
+                            await asyncio.sleep(delay)
+
+                if last_err is not None:
+                    raise last_err
+
                 message_ids.append(str(msg.id))
+
+                # Add slight pacing between chained sends to reduce burst failures.
+                if i < (len(chunks) - 1):
+                    await asyncio.sleep(self.CHAIN_SEND_DELAY_SECONDS)
             
             return SendResult(
                 success=True,
@@ -726,9 +1101,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
             msg = await channel.fetch_message(int(message_id))
             formatted = self.format_message(content)
-            if len(formatted) > self.MAX_MESSAGE_LENGTH:
-                formatted = formatted[:self.MAX_MESSAGE_LENGTH - 3] + "..."
-            await msg.edit(content=formatted)
+            if len(formatted) > self.MAX_EMBED_DESCRIPTION:
+                formatted = formatted[:self.MAX_EMBED_DESCRIPTION - 3] + "..."
+            embed = discord.Embed(description=formatted)
+            await msg.edit(embed=embed)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
@@ -775,6 +1151,184 @@ class DiscordAdapter(BasePlatformAdapter):
                 return SendResult(success=success)
         return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
 
+    @staticmethod
+    def _discord_audio_duration_seconds(audio_path: str) -> Optional[float]:
+        suffix = os.path.splitext(audio_path)[1].lower()
+        try:
+            if suffix == ".wav":
+                with wave.open(audio_path, "rb") as wav_file:
+                    frame_rate = wav_file.getframerate()
+                    frame_count = wav_file.getnframes()
+                    return (frame_count / float(frame_rate)) if frame_rate else None
+            if suffix in {".ogg", ".opus"}:
+                from mutagen.oggopus import OggOpus
+
+                info = OggOpus(audio_path)
+                return float(getattr(info.info, "length", 0.0) or 0.0) or None
+            if suffix == ".mp3":
+                from mutagen.mp3 import MP3
+
+                info = MP3(audio_path)
+                return float(getattr(info.info, "length", 0.0) or 0.0) or None
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _cleanup_temp_audio_files(paths: List[str], preserve: Optional[set[str]] = None) -> None:
+        keep = preserve or set()
+        for path in paths:
+            if not path or path in keep:
+                continue
+            with suppress(OSError):
+                os.unlink(path)
+
+    @staticmethod
+    def _transcode_audio_for_discord(audio_path: str) -> str:
+        if not shutil.which("ffmpeg"):
+            return audio_path
+
+        suffix = os.path.splitext(audio_path)[1].lower()
+        if suffix in {".ogg", ".opus"} and os.path.getsize(audio_path) <= DISCORD_AUDIO_SAFE_BYTES:
+            return audio_path
+
+        output_path = tempfile.NamedTemporaryFile(
+            suffix=".ogg",
+            prefix="discord-audio-",
+            delete=False,
+        ).name
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-i",
+                    audio_path,
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-c:a",
+                    "libopus",
+                    "-b:a",
+                    "64k",
+                    "-vbr",
+                    "on",
+                    "-application",
+                    "voip",
+                    output_path,
+                    "-y",
+                ],
+                capture_output=True,
+                timeout=180,
+            )
+            if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                return output_path
+        except Exception:
+            pass
+
+        with suppress(OSError):
+            os.unlink(output_path)
+        return audio_path
+
+    @classmethod
+    def _split_wav_for_discord(cls, audio_path: str, max_bytes: int) -> List[str]:
+        target_bytes = int(max_bytes * 0.9)
+        if target_bytes <= 0:
+            return [audio_path]
+
+        parts: List[str] = []
+        with wave.open(audio_path, "rb") as wav_file:
+            params = wav_file.getparams()
+            bytes_per_frame = params.nchannels * params.sampwidth
+            if bytes_per_frame <= 0:
+                return [audio_path]
+            frames_per_chunk = max(params.framerate, target_bytes // bytes_per_frame)
+            index = 1
+            while True:
+                frames = wav_file.readframes(frames_per_chunk)
+                if not frames:
+                    break
+                part_path = tempfile.NamedTemporaryFile(
+                    suffix=f".part{index:03d}.wav",
+                    prefix="discord-audio-",
+                    delete=False,
+                ).name
+                with wave.open(part_path, "wb") as out_file:
+                    out_file.setparams(params)
+                    out_file.writeframes(frames)
+                parts.append(part_path)
+                index += 1
+        return parts or [audio_path]
+
+    @classmethod
+    def _split_audio_for_discord(cls, audio_path: str, max_bytes: int = DISCORD_AUDIO_SAFE_BYTES) -> List[str]:
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) <= max_bytes:
+            return [audio_path]
+
+        duration = cls._discord_audio_duration_seconds(audio_path)
+        if shutil.which("ffmpeg") and duration and duration > 1:
+            estimated_parts = max(2, math.ceil(os.path.getsize(audio_path) / float(max_bytes)))
+            segment_seconds = max(15, int(math.ceil(duration / estimated_parts)))
+            for _attempt in range(4):
+                part_dir = tempfile.mkdtemp(prefix="discord-audio-parts-")
+                pattern = os.path.join(part_dir, "part-%03d.ogg")
+                try:
+                    result = subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-i",
+                            audio_path,
+                            "-vn",
+                            "-ac",
+                            "1",
+                            "-c:a",
+                            "libopus",
+                            "-b:a",
+                            "64k",
+                            "-vbr",
+                            "on",
+                            "-application",
+                            "voip",
+                            "-f",
+                            "segment",
+                            "-segment_time",
+                            str(segment_seconds),
+                            "-reset_timestamps",
+                            "1",
+                            pattern,
+                            "-y",
+                        ],
+                        capture_output=True,
+                        timeout=300,
+                    )
+                    parts = sorted(
+                        os.path.join(part_dir, name)
+                        for name in os.listdir(part_dir)
+                        if name.endswith(".ogg")
+                    )
+                    if result.returncode == 0 and parts and all(os.path.getsize(part) <= max_bytes for part in parts):
+                        return parts
+                except Exception:
+                    pass
+                segment_seconds = max(5, segment_seconds // 2)
+
+        if os.path.splitext(audio_path)[1].lower() == ".wav":
+            return cls._split_wav_for_discord(audio_path, max_bytes)
+
+        return [audio_path]
+
+    async def _send_discord_audio_file(
+        self,
+        channel,
+        audio_path: str,
+        *,
+        caption: Optional[str] = None,
+    ) -> str:
+        filename = os.path.basename(audio_path)
+        with open(audio_path, "rb") as f:
+            file = discord.File(io.BytesIO(f.read()), filename=filename)
+        msg = await channel.send(content=str(caption or "").strip() or None, file=file)
+        return str(msg.id)
+
     async def send_voice(
         self,
         chat_id: str,
@@ -785,9 +1339,8 @@ class DiscordAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send audio as a Discord file attachment."""
+        temp_paths: List[str] = []
         try:
-            import io
-
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
@@ -797,58 +1350,37 @@ class DiscordAdapter(BasePlatformAdapter):
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
 
-            filename = os.path.basename(audio_path)
+            prepared_path = self._transcode_audio_for_discord(audio_path)
+            if prepared_path != audio_path:
+                temp_paths.append(prepared_path)
 
-            with open(audio_path, "rb") as f:
-                file_data = f.read()
+            segment_paths = self._split_audio_for_discord(prepared_path, DISCORD_AUDIO_SAFE_BYTES)
+            for path in segment_paths:
+                if path not in {audio_path, prepared_path}:
+                    temp_paths.append(path)
 
-            # Try sending as a native voice message via raw API (flags=8192).
-            try:
-                import base64
+            message_id = ""
+            total_segments = len(segment_paths)
+            for index, segment_path in enumerate(segment_paths, start=1):
+                segment_caption = None
+                if total_segments > 1:
+                    prefix = f"Audio segment {index}/{total_segments}"
+                    segment_caption = prefix if not caption or index > 1 else f"{caption}\n{prefix}"
+                elif caption:
+                    segment_caption = caption
 
-                duration_secs = 5.0
-                try:
-                    from mutagen.oggopus import OggOpus
-                    info = OggOpus(audio_path)
-                    duration_secs = info.info.length
-                except Exception:
-                    duration_secs = max(1.0, len(file_data) / 2000.0)
-
-                waveform_bytes = bytes([128] * 256)
-                waveform_b64 = base64.b64encode(waveform_bytes).decode()
-
-                import json as _json
-                payload = _json.dumps({
-                    "flags": 8192,
-                    "attachments": [{
-                        "id": "0",
-                        "filename": "voice-message.ogg",
-                        "duration_secs": round(duration_secs, 2),
-                        "waveform": waveform_b64,
-                    }],
-                })
-                form = [
-                    {"name": "payload_json", "value": payload},
-                    {
-                        "name": "files[0]",
-                        "value": file_data,
-                        "filename": "voice-message.ogg",
-                        "content_type": "audio/ogg",
-                    },
-                ]
-                msg_data = await self._client.http.request(
-                    discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id),
-                    form=form,
+                message_id = await self._send_discord_audio_file(
+                    channel,
+                    segment_path,
+                    caption=segment_caption,
                 )
-                return SendResult(success=True, message_id=str(msg_data["id"]))
-            except Exception as voice_err:
-                logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
-                file = discord.File(io.BytesIO(file_data), filename=filename)
-                msg = await channel.send(file=file)
-                return SendResult(success=True, message_id=str(msg.id))
+
+            return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send audio, falling back to base adapter: %s", self.name, e, exc_info=True)
-            return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
+            logger.error("[%s] Failed to send Discord audio: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+        finally:
+            self._cleanup_temp_audio_files(temp_paths, preserve={audio_path})
 
     # ------------------------------------------------------------------
     # Voice channel methods (join / leave / play)
@@ -937,8 +1469,17 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.error("Voice playback error: %s", error)
                 loop.call_soon_threadsafe(done.set)
 
-            source = discord.FFmpegPCMAudio(audio_path)
-            source = discord.PCMVolumeTransformer(source, volume=1.0)
+            discord_lib = discord
+            if discord_lib is None:
+                try:
+                    import importlib
+                    discord_lib = importlib.import_module("discord")
+                except Exception:
+                    logger.warning("discord module unavailable for voice playback")
+                    return False
+
+            source = discord_lib.FFmpegPCMAudio(audio_path)
+            source = discord_lib.PCMVolumeTransformer(source, volume=1.0)
             vc.play(source, after=_after)
             try:
                 await asyncio.wait_for(done.wait(), timeout=self.PLAYBACK_TIMEOUT)
@@ -1272,14 +1813,17 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Discord's TYPING_START gateway event is unreliable in DMs for bots.
         Instead, start a background loop that hits the typing endpoint every
-        8 seconds (typing indicator lasts ~10s).  The loop is cancelled when
-        stop_typing() is called (after the response is sent).
+        ~10s (indicator lasts ~10s; slightly longer spacing reduces REST 429s).
+        The loop is cancelled when stop_typing() is called (after the response
+        is sent). On HTTP 429, backs off using retry_after instead of stopping.
         """
         if not self._client:
             return
         # Don't start a duplicate loop
         if chat_id in self._typing_tasks:
             return
+
+        _typing_interval = 10.0
 
         async def _typing_loop() -> None:
             try:
@@ -1293,9 +1837,32 @@ class DiscordAdapter(BasePlatformAdapter):
                     except asyncio.CancelledError:
                         return
                     except Exception as e:
-                        logger.debug("Discord typing indicator failed for %s: %s", chat_id, e)
+                        status = getattr(e, "status", None)
+                        if status == 429:
+                            retry_after = getattr(e, "retry_after", None)
+                            if retry_after is None:
+                                response_obj = getattr(e, "response", None)
+                                if response_obj is not None:
+                                    try:
+                                        header_val = response_obj.headers.get("Retry-After")
+                                        retry_after = (
+                                            float(header_val) if header_val else None
+                                        )
+                                    except (TypeError, ValueError):
+                                        retry_after = None
+                            delay = max(float(retry_after or 3), 1.0)
+                            logger.debug(
+                                "Discord typing rate-limited for %s; waiting %.1fs",
+                                chat_id,
+                                delay,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        logger.debug(
+                            "Discord typing indicator failed for %s: %s", chat_id, e
+                        )
                         return
-                    await asyncio.sleep(8)
+                    await asyncio.sleep(_typing_interval)
             except asyncio.CancelledError:
                 pass
 
@@ -1428,16 +1995,63 @@ class DiscordAdapter(BasePlatformAdapter):
         interaction: discord.Interaction,
         command_text: str,
         followup_msg: str | None = None,
+        delete_original: bool = False,
     ) -> None:
         """Common handler for simple slash commands that dispatch a command string."""
         await interaction.response.defer(ephemeral=True)
         event = self._build_slash_event(interaction, command_text)
         await self.handle_message(event)
-        if followup_msg:
+        if delete_original:
             try:
-                await interaction.followup.send(followup_msg, ephemeral=True)
+                await interaction.delete_original_response()
+                return
             except Exception as e:
-                logger.debug("Discord followup failed: %s", e)
+                logger.debug("Discord delete_original_response failed: %s", e)
+        if not followup_msg:
+            return
+        try:
+            await interaction.followup.send(followup_msg, ephemeral=True)
+        except Exception as e:
+            logger.debug("Discord followup failed: %s", e)
+
+    async def _cron_job_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> List[Any]:
+        """Return Discord autocomplete choices for cron job selectors."""
+        del interaction  # unused for now; keep signature compatible with discord.py
+
+        choice_cls = getattr(getattr(discord, "app_commands", None), "Choice", None)
+        if choice_cls is None:
+            return []
+
+        try:
+            from cron.jobs import list_jobs
+            jobs = list_jobs(include_disabled=True)
+        except Exception:
+            return []
+
+        needle = str(current or "").strip().lower()
+        choices: List[Any] = []
+        for job in jobs:
+            job_id = str(job.get("id") or "").strip()
+            if not job_id:
+                continue
+            name = str(job.get("name") or "(unnamed)").strip()
+            state = str(job.get("state") or ("scheduled" if job.get("enabled", True) else "paused")).strip()
+            schedule = str(job.get("schedule_display") or job.get("schedule") or "").strip()
+            haystack = " ".join(part for part in (job_id, name, state, schedule) if part).lower()
+            if needle and needle not in haystack:
+                continue
+
+            label = f"{name} [{state}] ({job_id})"
+            if len(label) > 100:
+                label = label[:97] + "..."
+            choices.append(choice_cls(name=label, value=job_id))
+            if len(choices) >= 25:
+                break
+        return choices
 
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
@@ -1466,10 +2080,81 @@ class DiscordAdapter(BasePlatformAdapter):
             event = self._build_slash_event(interaction, f"/reasoning {effort}".strip())
             await self.handle_message(event)
 
+        @tree.command(name="terminal", description="Show or change the local terminal shell (Windows)")
+        @discord.app_commands.describe(mode="cmd, powershell, wsl, or auto. Leave empty to show current.")
+        async def slash_terminal(interaction: discord.Interaction, mode: str = ""):
+            await self._run_simple_slash(
+                interaction,
+                f"/terminal {mode}".strip(),
+                followup_msg=None,
+                delete_original=True,
+            )
+
         @tree.command(name="personality", description="Set a personality")
         @discord.app_commands.describe(name="Personality name. Leave empty to list available.")
         async def slash_personality(interaction: discord.Interaction, name: str = ""):
             await self._run_simple_slash(interaction, f"/personality {name}".strip())
+
+        cron_group_cls = getattr(discord.app_commands, "Group", None)
+        if cron_group_cls is not None:
+            cron = cron_group_cls(name="cron", description="Manage Hermes cron jobs")
+
+            @cron.command(name="list", description="List all scheduled cron jobs")
+            async def slash_cron_list(interaction: discord.Interaction):
+                await self._run_simple_slash(
+                    interaction,
+                    "/cron list",
+                    followup_msg=None,
+                    delete_original=True,
+                )
+
+            @cron.command(name="add", description="Add a new cron job")
+            @discord.app_commands.describe(
+                schedule="Accepted: 30m | 2h | 1d | every 30m | 0 9 * * * | 2026-03-03T14:00:00",
+                prompt="What the job should do",
+            )
+            async def slash_cron_add(
+                interaction: discord.Interaction,
+                schedule: str,
+                prompt: str,
+            ):
+                # Cron schedule parsing in the runner expects quoted schedules when
+                # spaces are present (e.g., cron expressions).
+                schedule_arg = f'"{schedule}"' if " " in schedule else schedule
+                await self._run_simple_slash(
+                    interaction,
+                    f"/cron add {schedule_arg} {prompt}",
+                    followup_msg=None,
+                    delete_original=True,
+                )
+
+            @cron.command(name="remove", description="Remove a cron job")
+            @discord.app_commands.describe(job_id="Job ID from /cron list")
+            async def slash_cron_remove(interaction: discord.Interaction, job_id: str):
+                await self._run_simple_slash(
+                    interaction,
+                    f"/cron remove {job_id}",
+                    followup_msg=None,
+                    delete_original=True,
+                )
+            autocomplete = getattr(discord.app_commands, "autocomplete", None)
+            if autocomplete is not None:
+                slash_cron_remove = autocomplete(job_id=self._cron_job_autocomplete)(slash_cron_remove)
+
+            @cron.command(name="run", description="Run one cron job immediately")
+            @discord.app_commands.describe(job_id="Job ID from /cron list")
+            async def slash_cron_run(interaction: discord.Interaction, job_id: str):
+                await self._run_simple_slash(
+                    interaction,
+                    f"/cron run {job_id}",
+                    followup_msg=None,
+                    delete_original=True,
+                )
+            if autocomplete is not None:
+                slash_cron_run = autocomplete(job_id=self._cron_job_autocomplete)(slash_cron_run)
+
+            if hasattr(tree, "add_command"):
+                tree.add_command(cron)
 
         @tree.command(name="retry", description="Retry your last message")
         async def slash_retry(interaction: discord.Interaction):
@@ -2142,6 +2827,161 @@ class DiscordAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 if DISCORD_AVAILABLE:
+    _LISTEN_BUTTON_STYLE = getattr(discord.ButtonStyle, "secondary", None)
+    if _LISTEN_BUTTON_STYLE is None:
+        _LISTEN_BUTTON_STYLE = getattr(discord.ButtonStyle, "primary", 1)
+
+    class ListenButtonView(discord.ui.View):
+        """Button view that reads the current embed text aloud via TTS."""
+
+        def __init__(self, adapter: "DiscordAdapter"):
+            try:
+                super().__init__(timeout=3600)  # 1 hour
+            except TypeError:
+                # Test stubs often replace discord.ui.View with bare object.
+                super().__init__()
+            self.adapter = adapter
+
+        @discord.ui.button(label="Listen", style=_LISTEN_BUTTON_STYLE, emoji="🔊")
+        async def listen(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await _handle_discord_listen(self.adapter, interaction, section="full")
+
+        @discord.ui.button(label="ʞᴎiʜƚ", style=_LISTEN_BUTTON_STYLE, emoji="🧠")
+        async def listen_knight(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await _handle_discord_listen(self.adapter, interaction, section="knight")
+
+        @discord.ui.button(label="Answer", style=_LISTEN_BUTTON_STYLE, emoji="🗣️")
+        async def listen_answer(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await _handle_discord_listen(self.adapter, interaction, section="answer")
+
+    class PersistentListenButtonView(discord.ui.View):
+        """Persistent listen button for messages sent through REST payloads."""
+
+        FULL_CUSTOM_ID = DISCORD_LISTEN_FULL_CUSTOM_ID
+        KNIGHT_CUSTOM_ID = DISCORD_LISTEN_KNIGHT_CUSTOM_ID
+        ANSWER_CUSTOM_ID = DISCORD_LISTEN_ANSWER_CUSTOM_ID
+
+        def __init__(self, adapter: "DiscordAdapter"):
+            try:
+                super().__init__(timeout=None)  # Persistent while process is running
+            except TypeError:
+                super().__init__()
+            self.adapter = adapter
+
+        @discord.ui.button(
+            label="Listen",
+            style=_LISTEN_BUTTON_STYLE,
+            emoji="🔊",
+            custom_id=FULL_CUSTOM_ID,
+        )
+        async def listen(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await _handle_discord_listen(self.adapter, interaction, section="full")
+
+        @discord.ui.button(
+            label="ʞᴎiʜƚ",
+            style=_LISTEN_BUTTON_STYLE,
+            emoji="🧠",
+            custom_id=KNIGHT_CUSTOM_ID,
+        )
+        async def listen_knight(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await _handle_discord_listen(self.adapter, interaction, section="knight")
+
+        @discord.ui.button(
+            label="Answer",
+            style=_LISTEN_BUTTON_STYLE,
+            emoji="🗣️",
+            custom_id=ANSWER_CUSTOM_ID,
+        )
+        async def listen_answer(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await _handle_discord_listen(self.adapter, interaction, section="answer")
+
+
+async def _handle_discord_listen(
+    adapter: "DiscordAdapter", interaction: "discord.Interaction", section: str = "full"
+) -> None:
+    try:
+        if not interaction.message:
+            await interaction.response.send_message(
+                "No message context available for TTS.", ephemeral=True
+            )
+            return
+
+        # Use embed description first (gateway uses embeds for normal replies).
+        text = ""
+        if interaction.message.embeds:
+            text = (interaction.message.embeds[0].description or "").strip()
+        if not text:
+            text = (interaction.message.content or "").strip()
+        if not text:
+            await interaction.response.send_message(
+                "Nothing to read from this message.", ephemeral=True
+            )
+            return
+
+        sections = _extract_listen_sections(text)
+        requested_text = sections.get(section, "").strip()
+        if not requested_text:
+            label = "ʞᴎiʜƚ" if section == "knight" else "answer" if section == "answer" else "message"
+            await interaction.response.send_message(
+                f"This message does not have a separate {label} section to read.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=False)
+
+        from tools.tts_tool import text_to_speech_tool
+        tts_json = await asyncio.to_thread(text_to_speech_tool, requested_text)
+        data = json.loads(tts_json)
+        if not data.get("success"):
+            await interaction.followup.send(
+                f"TTS failed: {data.get('error', 'unknown error')}",
+                ephemeral=True,
+            )
+            return
+
+        audio_path = str(data.get("file_path", "")).strip()
+        if not audio_path:
+            await interaction.followup.send(
+                "TTS returned no output file path.",
+                ephemeral=True,
+            )
+            return
+
+        result = await adapter.send_voice(
+            chat_id=str(interaction.channel_id),
+            audio_path=audio_path,
+            reply_to=str(interaction.message.id),
+        )
+        if not result.success:
+            await interaction.followup.send(
+                f"Failed to send audio: {result.error}",
+                ephemeral=True,
+            )
+            return
+
+        # Success is silent: audio delivery in channel is the confirmation.
+    except Exception:  # pragma: no cover - defensive logging
+        logger.exception("[discord] listen button handler failed")
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("TTS failed unexpectedly.", ephemeral=True)
+            else:
+                await interaction.response.send_message("TTS failed unexpectedly.", ephemeral=True)
+        except Exception:
+            pass
 
     class ExecApprovalView(discord.ui.View):
         """

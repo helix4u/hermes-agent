@@ -167,6 +167,12 @@ TOOL_CATEGORIES = {
                 "tts_provider": "openai",
             },
             {
+                "name": "Kokoro FastAPI",
+                "tag": "Local server - voice mixing, no API key needed",
+                "env_vars": [],
+                "tts_provider": "kokoro",
+            },
+            {
                 "name": "ElevenLabs",
                 "tag": "Premium - most natural voices",
                 "env_vars": [
@@ -503,31 +509,39 @@ def _get_platform_tools(
 def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[str]):
     """Save the selected toolset keys for a platform to config.
 
-    Preserves any non-configurable toolset entries (like MCP server names)
-    that were already in the config for this platform.
+    Preserves any non-configurable, non-composite entries (like MCP server
+    names) that were already in the config for this platform.
+
+    Composite platform toolsets (hermes-cli, hermes-telegram, etc.) are
+    dropped once the user has explicitly configured individual toolsets —
+    keeping them would override the user's selections because they include
+    all tools via _HERMES_CORE_TOOLS.
     """
+    from toolsets import TOOLSETS
+
     config.setdefault("platform_toolsets", {})
 
-    # Get the set of all configurable toolset keys (built-in + plugin)
+    # Keys the user can toggle in the checklist UI
     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
     plugin_keys = _get_plugin_toolset_keys()
     configurable_keys |= plugin_keys
 
-    # Also exclude platform default toolsets (hermes-cli, hermes-telegram, etc.)
-    # These are "super" toolsets that resolve to ALL tools, so preserving them
-    # would silently override the user's unchecked selections on the next read.
-    platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}
+    # Keys that are known composite/individual toolsets in toolsets.py
+    # (hermes-cli, hermes-telegram, homeassistant, web, terminal, etc.)
+    known_toolset_keys = set(TOOLSETS.keys())
 
     # Get existing toolsets for this platform
     existing_toolsets = config.get("platform_toolsets", {}).get(platform, [])
     if not isinstance(existing_toolsets, list):
         existing_toolsets = []
 
-    # Preserve any entries that are NOT configurable toolsets and NOT platform
-    # defaults (i.e. only MCP server names should be preserved)
+    # Preserve entries that are neither configurable toolsets nor known
+    # composite toolsets — this keeps MCP server names and other custom
+    # entries while dropping composites like "hermes-cli" that would
+    # silently re-enable everything the user just disabled.
     preserved_entries = {
         entry for entry in existing_toolsets
-        if entry not in configurable_keys and entry not in platform_default_keys
+        if entry not in configurable_keys and entry not in known_toolset_keys
     }
 
     # Merge preserved entries with new enabled toolsets

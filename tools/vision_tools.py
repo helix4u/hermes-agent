@@ -32,6 +32,7 @@ import base64
 import json
 import logging
 import os
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
@@ -43,6 +44,27 @@ from tools.debug_helpers import DebugSession
 logger = logging.getLogger(__name__)
 
 _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
+
+
+def _get_user_home() -> Path:
+    """Return a stable home directory across Windows/Linux test environments."""
+    for key in ("HOME", "USERPROFILE"):
+        value = os.getenv(key, "").strip()
+        if value:
+            return Path(value)
+    try:
+        return Path.home()
+    except Exception:
+        return Path(tempfile.gettempdir())
+
+
+def _expand_local_path(path_str: str) -> Path:
+    """Expand ``~`` without depending on host-specific ``expanduser`` behavior."""
+    if path_str == "~":
+        return _get_user_home()
+    if path_str.startswith("~/") or path_str.startswith("~\\"):
+        return _get_user_home() / path_str[2:]
+    return Path(path_str)
 
 
 def _validate_image_url(url: str) -> bool:
@@ -267,7 +289,7 @@ async def vision_analyze_tool(
         logger.info("User prompt: %s", user_prompt[:100])
         
         # Determine if this is a local file path or a remote URL
-        local_path = Path(os.path.expanduser(image_url))
+        local_path = _expand_local_path(image_url)
         if local_path.is_file():
             # Local file path (e.g. from platform image cache) -- skip download
             logger.info("Using local image file: %s", image_url)

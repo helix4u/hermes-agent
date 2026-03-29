@@ -621,6 +621,8 @@ def _print_setup_summary(config: dict, hermes_home):
         tool_status.append(("Text-to-Speech (ElevenLabs)", True, None))
     elif tts_provider == "openai" and get_env_value("VOICE_TOOLS_OPENAI_KEY"):
         tool_status.append(("Text-to-Speech (OpenAI)", True, None))
+    elif tts_provider == "kokoro":
+        tool_status.append(("Text-to-Speech (Kokoro local)", True, None))
     elif tts_provider == "neutts":
         try:
             import importlib.util
@@ -1867,13 +1869,15 @@ def _install_neutts_deps() -> bool:
 
 def _setup_tts_provider(config: dict):
     """Interactive TTS provider selection with install flow for NeuTTS."""
-    tts_config = config.get("tts", {})
+    tts_config = config.setdefault("tts", {})
     current_provider = tts_config.get("provider", "edge")
+    kokoro_config = tts_config.setdefault("kokoro", {})
 
     provider_labels = {
         "edge": "Edge TTS",
         "elevenlabs": "ElevenLabs",
         "openai": "OpenAI TTS",
+        "kokoro": "Kokoro FastAPI",
         "neutts": "NeuTTS",
     }
     current_label = provider_labels.get(current_provider, current_provider)
@@ -1887,15 +1891,16 @@ def _setup_tts_provider(config: dict):
         "Edge TTS (free, cloud-based, no setup needed)",
         "ElevenLabs (premium quality, needs API key)",
         "OpenAI TTS (good quality, needs API key)",
+        "Kokoro FastAPI (local server, voice mixing, no API key)",
         "NeuTTS (local on-device, free, ~300MB model download)",
         f"Keep current ({current_label})",
     ]
     idx = prompt_choice("Select TTS provider:", choices, len(choices) - 1)
 
-    if idx == 4:  # Keep current
+    if idx == 5:  # Keep current
         return
 
-    providers = ["edge", "elevenlabs", "openai", "neutts"]
+    providers = ["edge", "elevenlabs", "openai", "kokoro", "neutts"]
     selected = providers[idx]
 
     if selected == "neutts":
@@ -1945,6 +1950,35 @@ def _setup_tts_provider(config: dict):
             else:
                 print_warning("No API key provided. Falling back to Edge TTS.")
                 selected = "edge"
+
+    elif selected == "kokoro":
+        print()
+        print_info("Kokoro FastAPI uses the local OpenAI-compatible speech endpoint.")
+        print_info("Voice mixing is supported with strings like af_sky+af_v0+af_nicole")
+        print()
+
+        kokoro_config["base_url"] = prompt(
+            "Kokoro base URL",
+            kokoro_config.get("base_url", "http://localhost:8880"),
+        )
+        kokoro_config["model"] = prompt(
+            "Kokoro model",
+            kokoro_config.get("model", "kokoro"),
+        )
+        kokoro_config["voice"] = prompt(
+            "Kokoro default voice or mix",
+            kokoro_config.get("voice", "af_sky+af_v0+af_nicole"),
+        )
+
+        speed_value = prompt(
+            "Kokoro default speed",
+            str(kokoro_config.get("speed", 1.75)),
+        )
+        try:
+            kokoro_config["speed"] = float(speed_value)
+        except (TypeError, ValueError):
+            print_warning("Invalid speed provided. Using 1.75.")
+            kokoro_config["speed"] = 1.75
 
     # Save the selection
     if "tts" not in config:

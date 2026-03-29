@@ -15,9 +15,12 @@
 
 Use any model you want — [Nous Portal](https://portal.nousresearch.com), [OpenRouter](https://openrouter.ai) (200+ models), [z.ai/GLM](https://z.ai), [Kimi/Moonshot](https://platform.moonshot.ai), [MiniMax](https://www.minimax.io), OpenAI, or your own endpoint. Switch with `hermes model` — no code changes, no lock-in.
 
+> Hermes supports native Windows without requiring WSL, the browser sidecar and full-page control room are first-class operator surfaces, and Windows local shell auto-selection prefers `cmd.exe`, then PowerShell, then WSL.
+
 <table>
-<tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
+<tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, streaming tool output, and Windows-aware shell selection.</td></tr>
 <tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>
+<tr><td><b>Browser sidecar + control room</b></td><td>Chrome sidepanel chat plus a full-page operator console for audit events, prompt inspection, tool timing, branch runs, images, voice input, and reply TTS.</td></tr>
 <tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. FTS5 session search with LLM summarization for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
 <tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
 <tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
@@ -27,22 +30,86 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 ---
 
-## Quick Install
+## Quick Install (Linux, macOS, WSL)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
 ```
 
-Works on Linux, macOS, and WSL2. The installer handles everything — Python, Node.js, dependencies, and the `hermes` command. No prerequisites except git.
+The `install.sh` bootstrap handles Linux, macOS, and WSL2. It installs Python, Node.js, dependencies, and the `hermes` command. No prerequisites except git.
 
-> **Windows:** Native Windows is not supported. Please install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run the command above.
-
-After installation:
+After installation on Unix-like environments:
 
 ```bash
 source ~/.bashrc    # reload shell (or: source ~/.zshrc)
 hermes              # start chatting!
 ```
+
+## Quick Install (Windows)
+
+Fresh install into `%LOCALAPPDATA%\hermes` with the native Windows installer:
+
+PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex
+```
+
+`cmd.exe`:
+
+```bat
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.cmd -o install.cmd && install.cmd && del install.cmd
+```
+
+## Native Windows
+
+Native Windows is supported for day-to-day use and development. WSL is optional, not required.
+
+If you already have this repo cloned and just want to bootstrap the current checkout for native Windows development, use the repo-local bootstrap scripts:
+
+PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows.ps1
+```
+
+`cmd.exe`:
+
+```bat
+scripts\bootstrap-windows.bat
+```
+
+That path creates `venv`, installs the editable package with `.[all,dev]`, and installs Node-based browser tooling when Node.js is present.
+
+Manual fallback:
+
+PowerShell:
+
+```powershell
+git clone https://github.com/NousResearch/hermes-agent.git
+cd hermes-agent
+py -3.11 -m venv venv
+.\venv\Scripts\Activate.ps1
+python -m pip install -U pip uv
+uv pip install -e ".[all,dev]"
+hermes
+```
+
+`cmd.exe`:
+
+```bat
+git clone https://github.com/NousResearch/hermes-agent.git
+cd hermes-agent
+py -3.11 -m venv venv
+venv\Scripts\activate.bat
+python -m pip install -U pip uv
+uv pip install -e ".[all,dev]"
+hermes
+```
+
+On Windows, Hermes now prefers `cmd.exe`, then PowerShell, then WSL when the local terminal backend is left on auto.
+
+If you run Hermes in both native Windows and WSL at the same time, do not reuse the same localhost defaults in both places. Set different values for `HERMES_BROWSER_BRIDGE_PORT`, `API_SERVER_PORT`, and `BROWSER_CDP_PORT` so the browser bridge, API server, and live CDP browser do not collide.
 
 ---
 
@@ -59,6 +126,8 @@ hermes claw migrate # Migrate from OpenClaw (if coming from OpenClaw)
 hermes update       # Update to the latest version
 hermes doctor       # Diagnose any issues
 ```
+
+OpenAI Codex auth is stored in `~/.hermes/auth.json`. If a cron job or gateway turn reports that Codex needs re-authentication, rerun `hermes model` locally to refresh Hermes's own Codex session.
 
 📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
 
@@ -148,6 +217,16 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv venv --python 3.11
 source venv/bin/activate
 uv pip install -e ".[all,dev]"
+python -m pytest tests/ -q
+```
+
+Native Windows contributors can use the same editable-install flow without WSL:
+
+```powershell
+git clone https://github.com/NousResearch/hermes-agent.git
+cd hermes-agent
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows.ps1
+.\venv\Scripts\Activate.ps1
 python -m pytest tests/ -q
 ```
 

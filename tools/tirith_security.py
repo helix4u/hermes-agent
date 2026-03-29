@@ -22,9 +22,11 @@ never blocks.
 
 import hashlib
 import json
+import ntpath
 import logging
 import os
 import platform
+import posixpath
 import shutil
 import stat
 import subprocess
@@ -33,6 +35,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from pathlib import Path
 
 from hermes_constants import get_hermes_home
 
@@ -105,14 +108,66 @@ _install_thread: threading.Thread | None = None
 _MARKER_TTL = 86400  # 24 hours
 
 
+def _detect_user_home() -> str:
+    """Return the current user's home directory without depending on env vars alone."""
+    try:
+        return str(Path.home())
+    except RuntimeError:
+        pass
+
+    for key in ("USERPROFILE", "HOME"):
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            csidl_profile = 40
+            buf = ctypes.create_unicode_buffer(260)
+            result = ctypes.windll.shell32.SHGetFolderPathW(None, csidl_profile, None, 0, buf)
+            if result == 0 and buf.value:
+                return buf.value
+        except Exception:
+            pass
+    else:
+        try:
+            import pwd
+
+            user_home = pwd.getpwuid(os.getuid()).pw_dir
+            if user_home:
+                return user_home
+        except Exception:
+            pass
+
+    return tempfile.gettempdir()
+
+
 def _get_hermes_home() -> str:
-    """Return the Hermes home directory, respecting HERMES_HOME env var."""
-    return str(get_hermes_home())
+    """Return the Hermes home directory, respecting HERMES_HOME env var.
+
+    Matches the convention used throughout the codebase (hermes_cli.config,
+    cli.py, gateway/run.py, etc.) so tirith state stays inside the active
+    profile and tests get automatic isolation via conftest's HERMES_HOME
+    monkeypatch.
+    """
+    hermes_home = os.getenv("HERMES_HOME", "").strip()
+    if hermes_home:
+        return hermes_home
+    return _join_preserving_path_style(_detect_user_home(), ".hermes")
+
+
+def _join_preserving_path_style(base: str, *parts: str) -> str:
+    """Join path segments without changing the separator style of an explicit base path."""
+    if "\\" in base or (len(base) >= 2 and base[1] == ":"):
+        return ntpath.join(base, *parts)
+    return posixpath.join(base, *parts)
 
 
 def _failure_marker_path() -> str:
     """Return the path to the install-failure marker file."""
-    return os.path.join(_get_hermes_home(), ".tirith-install-failed")
+    return _join_preserving_path_style(_get_hermes_home(), ".tirith-install-failed")
 
 
 def _read_failure_reason() -> str | None:
@@ -176,7 +231,7 @@ def _clear_install_failed():
 
 def _hermes_bin_dir() -> str:
     """Return $HERMES_HOME/bin, creating it if needed."""
-    d = os.path.join(_get_hermes_home(), "bin")
+    d = _join_preserving_path_style(_get_hermes_home(), "bin")
     os.makedirs(d, exist_ok=True)
     return d
 

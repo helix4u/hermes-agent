@@ -96,6 +96,31 @@ class TestBrowserConsole:
         assert result["total_errors"] == 0
 
 
+class TestBrowserGetImages:
+    def test_parses_eval_result(self):
+        from tools.browser_tool import browser_get_images
+
+        response = {
+            "success": True,
+            "data": {
+                "result": '[{"src":"https://example.com/a.png","alt":"logo","width":100,"height":50}]'
+            },
+        }
+
+        with patch("tools.browser_tool._run_browser_command", return_value=response) as mock_cmd:
+            result = json.loads(browser_get_images(task_id="test"))
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["images"][0]["src"] == "https://example.com/a.png"
+        assert result["images"][0]["alt"] == "logo"
+        called_args = mock_cmd.call_args[0]
+        assert called_args[0] == "test"
+        assert called_args[1] == "eval"
+        assert "\n" not in called_args[2][0]
+        assert 'startsWith("data:")' in called_args[2][0]
+
+
 # ── browser_console schema ───────────────────────────────────────────
 
 

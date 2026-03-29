@@ -10,6 +10,7 @@ without overriding run().
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -51,7 +52,11 @@ def _make_cli(**kwargs):
     ):
         import cli as _cli_mod
 
-        _cli_mod = importlib.reload(_cli_mod)
+        for key, value in clean_env.items():
+            if value:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
         with patch.object(_cli_mod, "get_tool_definitions", return_value=[]), patch.dict(
             _cli_mod.__dict__, {"CLI_CONFIG": _clean_config}
         ):

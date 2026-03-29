@@ -41,7 +41,11 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _sanitize_subprocess_env
+from tools.environments.local import _sanitize_subprocess_env
+from tools.environments.shell_utils import (
+    build_local_subprocess_invocation,
+    terminate_process_tree,
+)
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -130,6 +134,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        shell_mode_override: str | None = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -157,12 +162,21 @@ class ProcessRegistry:
                     from winpty import PtyProcess as _PtyProcessCls
                 else:
                     from ptyprocess import PtyProcess as _PtyProcessCls
-                user_shell = _find_shell()
+                pty_args, _, shell_mode = build_local_subprocess_invocation(
+                    command,
+                    session.cwd,
+                    shell_override=shell_mode_override,
+                )
+                if not isinstance(pty_args, list):
+                    logger.warning(
+                        "PTY spawn requires argv-style shell dispatch, falling back to pipe mode"
+                    )
+                    raise RuntimeError("PTY spawn requires argv-style dispatch")
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", command],
-                    cwd=session.cwd,
+                    pty_args,
+                    cwd=None if shell_mode == "wsl" else session.cwd,
                     env=pty_env,
                     dimensions=(30, 120),
                 )
@@ -193,25 +207,26 @@ class ProcessRegistry:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
-        # Use the user's login shell for consistency with LocalEnvironment --
-        # ensures rc files are sourced and user tools are available.
-        user_shell = _find_shell()
+        popen_args, popen_platform_kwargs, _ = build_local_subprocess_invocation(
+            command,
+            session.cwd,
+            shell_override=shell_mode_override,
+        )
         # Force unbuffered output for Python scripts so progress is visible
         # during background execution (libraries like tqdm/datasets buffer when
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
         proc = subprocess.Popen(
-            [user_shell, "-lic", command],
+            popen_args,
             text=True,
-            cwd=session.cwd,
             env=bg_env,
             encoding="utf-8",
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE,
-            preexec_fn=None if _IS_WINDOWS else os.setsid,
+            **popen_platform_kwargs,
         )
 
         session.process = proc
@@ -566,14 +581,7 @@ class ProcessRegistry:
                     if session.pid:
                         os.kill(session.pid, signal.SIGTERM)
             elif session.process:
-                # Local process -- kill the process group
-                try:
-                    if _IS_WINDOWS:
-                        session.process.terminate()
-                    else:
-                        os.killpg(os.getpgid(session.process.pid), signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    session.process.kill()
+                terminate_process_tree(session.process, force=False)
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
@@ -754,7 +762,7 @@ class ProcessRegistry:
             try:
                 os.kill(pid, 0)
                 alive = True
-            except (ProcessLookupError, PermissionError):
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
 
             if alive:

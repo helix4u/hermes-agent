@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import socket
 import threading
 import webbrowser
@@ -194,7 +195,8 @@ async def _wait_for_callback() -> tuple[str, str | None]:
 def _can_open_browser() -> bool:
     if os.environ.get("SSH_CLIENT") or os.environ.get("SSH_TTY"):
         return False
-    if not os.environ.get("DISPLAY") and os.name != "nt" and "darwin" not in os.uname().sysname.lower():
+    system_name = platform.system().lower()
+    if not os.environ.get("DISPLAY") and system_name != "windows" and system_name != "darwin":
         return False
     return True
 

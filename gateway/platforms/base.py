@@ -1249,6 +1249,10 @@ class BasePlatformAdapter(ABC):
                     await typing_task
                 except asyncio.CancelledError:
                     pass
+                try:
+                    await self.stop_typing(event.source.chat_id)
+                except Exception:
+                    pass
                 # Process pending message in new background task
                 await self._process_message_background(pending_event, session_key)
                 return  # Already cleaned up

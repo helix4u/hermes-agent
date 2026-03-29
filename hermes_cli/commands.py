@@ -20,10 +20,6 @@ from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import Completer, Completion
 
 
-# ---------------------------------------------------------------------------
-# CommandDef dataclass
-# ---------------------------------------------------------------------------
-
 @dataclass(frozen=True)
 class CommandDef:
     """Definition of a single slash command."""
@@ -39,27 +35,16 @@ class CommandDef:
     gateway_config_gate: str | None = None  # config dotpath; when truthy, overrides cli_only for gateway
 
 
-# ---------------------------------------------------------------------------
-# Central registry -- single source of truth
-# ---------------------------------------------------------------------------
-
 COMMAND_REGISTRY: list[CommandDef] = [
-    # Session
-    CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
-               aliases=("reset",)),
-    CommandDef("clear", "Clear screen and start a new session", "Session",
-               cli_only=True),
-    CommandDef("history", "Show conversation history", "Session",
-               cli_only=True),
-    CommandDef("save", "Save the current conversation", "Session",
-               cli_only=True),
+    CommandDef("new", "Start a new session (fresh session ID + history)", "Session", aliases=("reset",)),
+    CommandDef("clear", "Clear screen and start a new session", "Session", cli_only=True),
+    CommandDef("history", "Show conversation history", "Session", cli_only=True),
+    CommandDef("save", "Save the current conversation", "Session", cli_only=True),
     CommandDef("retry", "Retry the last message (resend to agent)", "Session"),
     CommandDef("undo", "Remove the last user/assistant exchange", "Session"),
-    CommandDef("title", "Set a title for the current session", "Session",
-               args_hint="[name]"),
+    CommandDef("title", "Set a title for the current session", "Session", args_hint="[name]"),
     CommandDef("compress", "Manually compress conversation context", "Session"),
-    CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
-               args_hint="[number]"),
+    CommandDef("rollback", "List or restore filesystem checkpoints", "Session", args_hint="[number]"),
     CommandDef("stop", "Kill all running background processes", "Session"),
     CommandDef("approve", "Approve a pending dangerous command", "Session",
                gateway_only=True, args_hint="[session|always]"),
@@ -79,6 +64,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
+    CommandDef("model", "Show or change the current model", "Configuration",
+               args_hint="[name]"),
     CommandDef("provider", "Show available providers and current provider",
                "Configuration"),
     CommandDef("prompt", "View/set custom system prompt", "Configuration",
@@ -120,27 +107,15 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Info
     CommandDef("help", "Show available commands", "Info"),
     CommandDef("usage", "Show token usage for the current session", "Info"),
-    CommandDef("insights", "Show usage insights and analytics", "Info",
-               args_hint="[days]"),
-    CommandDef("platforms", "Show gateway/messaging platform status", "Info",
-               cli_only=True, aliases=("gateway",)),
-    CommandDef("paste", "Check clipboard for an image and attach it", "Info",
-               cli_only=True),
-    CommandDef("update", "Update Hermes Agent to the latest version", "Info",
-               gateway_only=True),
-
-    # Exit
-    CommandDef("quit", "Exit the CLI", "Exit",
-               cli_only=True, aliases=("exit", "q")),
+    CommandDef("insights", "Show usage insights and analytics", "Info", args_hint="[days]"),
+    CommandDef("platforms", "Show gateway/messaging platform status", "Info", cli_only=True, aliases=("gateway",)),
+    CommandDef("paste", "Check clipboard for an image and attach it", "Info", cli_only=True),
+    CommandDef("update", "Update Hermes Agent to the latest version", "Info", gateway_only=True),
+    CommandDef("quit", "Exit the CLI", "Exit", cli_only=True, aliases=("exit", "q")),
 ]
 
 
-# ---------------------------------------------------------------------------
-# Derived lookups -- rebuilt once at import time, refreshed by rebuild_lookups()
-# ---------------------------------------------------------------------------
-
 def _build_command_lookup() -> dict[str, CommandDef]:
-    """Map every name and alias to its CommandDef."""
     lookup: dict[str, CommandDef] = {}
     for cmd in COMMAND_REGISTRY:
         lookup[cmd.name] = cmd
@@ -153,46 +128,46 @@ _COMMAND_LOOKUP: dict[str, CommandDef] = _build_command_lookup()
 
 
 def resolve_command(name: str) -> CommandDef | None:
-    """Resolve a command name or alias to its CommandDef.
-
-    Accepts names with or without the leading slash.
-    """
     return _COMMAND_LOOKUP.get(name.lower().lstrip("/"))
 
 
 def register_plugin_command(cmd: CommandDef) -> None:
-    """Append a plugin-defined command to the registry and refresh lookups."""
     COMMAND_REGISTRY.append(cmd)
     rebuild_lookups()
 
 
-def rebuild_lookups() -> None:
-    """Rebuild all derived lookup dicts from the current COMMAND_REGISTRY.
+def _build_description(cmd: CommandDef) -> str:
+    if cmd.args_hint:
+        return f"{cmd.description} (usage: /{cmd.name} {cmd.args_hint})"
+    return cmd.description
 
-    Called after plugin commands are registered so they appear in help,
-    autocomplete, gateway dispatch, Telegram menu, and Slack mapping.
-    """
+
+COMMANDS: dict[str, str] = {}
+COMMANDS_BY_CATEGORY: dict[str, dict[str, str]] = {}
+SUBCOMMANDS: dict[str, list[str]] = {}
+_PIPE_SUBS_RE = re.compile(r"[a-z]+(?:\|[a-z]+)+")
+GATEWAY_KNOWN_COMMANDS: frozenset[str] = frozenset()
+
+
+def rebuild_lookups() -> None:
     global GATEWAY_KNOWN_COMMANDS
 
     _COMMAND_LOOKUP.clear()
     _COMMAND_LOOKUP.update(_build_command_lookup())
 
     COMMANDS.clear()
+    COMMANDS_BY_CATEGORY.clear()
+    SUBCOMMANDS.clear()
+
     for cmd in COMMAND_REGISTRY:
         if not cmd.gateway_only:
             COMMANDS[f"/{cmd.name}"] = _build_description(cmd)
-            for alias in cmd.aliases:
-                COMMANDS[f"/{alias}"] = f"{cmd.description} (alias for /{cmd.name})"
-
-    COMMANDS_BY_CATEGORY.clear()
-    for cmd in COMMAND_REGISTRY:
-        if not cmd.gateway_only:
             cat = COMMANDS_BY_CATEGORY.setdefault(cmd.category, {})
             cat[f"/{cmd.name}"] = COMMANDS[f"/{cmd.name}"]
             for alias in cmd.aliases:
+                COMMANDS[f"/{alias}"] = f"{cmd.description} (alias for /{cmd.name})"
                 cat[f"/{alias}"] = COMMANDS[f"/{alias}"]
 
-    SUBCOMMANDS.clear()
     for cmd in COMMAND_REGISTRY:
         if cmd.subcommands:
             SUBCOMMANDS[f"/{cmd.name}"] = list(cmd.subcommands)
@@ -212,64 +187,7 @@ def rebuild_lookups() -> None:
     )
 
 
-def _build_description(cmd: CommandDef) -> str:
-    """Build a CLI-facing description string including usage hint."""
-    if cmd.args_hint:
-        return f"{cmd.description} (usage: /{cmd.name} {cmd.args_hint})"
-    return cmd.description
-
-
-# Backwards-compatible flat dict: "/command" -> description
-COMMANDS: dict[str, str] = {}
-for _cmd in COMMAND_REGISTRY:
-    if not _cmd.gateway_only:
-        COMMANDS[f"/{_cmd.name}"] = _build_description(_cmd)
-        for _alias in _cmd.aliases:
-            COMMANDS[f"/{_alias}"] = f"{_cmd.description} (alias for /{_cmd.name})"
-
-# Backwards-compatible categorized dict
-COMMANDS_BY_CATEGORY: dict[str, dict[str, str]] = {}
-for _cmd in COMMAND_REGISTRY:
-    if not _cmd.gateway_only:
-        _cat = COMMANDS_BY_CATEGORY.setdefault(_cmd.category, {})
-        _cat[f"/{_cmd.name}"] = COMMANDS[f"/{_cmd.name}"]
-        for _alias in _cmd.aliases:
-            _cat[f"/{_alias}"] = COMMANDS[f"/{_alias}"]
-
-
-# Subcommands lookup: "/cmd" -> ["sub1", "sub2", ...]
-SUBCOMMANDS: dict[str, list[str]] = {}
-for _cmd in COMMAND_REGISTRY:
-    if _cmd.subcommands:
-        SUBCOMMANDS[f"/{_cmd.name}"] = list(_cmd.subcommands)
-
-# Also extract subcommands hinted in args_hint via pipe-separated patterns
-# e.g. args_hint="[on|off|tts|status]" for commands that don't have explicit subcommands.
-# NOTE: If a command already has explicit subcommands, this fallback is skipped.
-# Use the `subcommands` field on CommandDef for intentional tab-completable args.
-_PIPE_SUBS_RE = re.compile(r"[a-z]+(?:\|[a-z]+)+")
-for _cmd in COMMAND_REGISTRY:
-    key = f"/{_cmd.name}"
-    if key in SUBCOMMANDS or not _cmd.args_hint:
-        continue
-    m = _PIPE_SUBS_RE.search(_cmd.args_hint)
-    if m:
-        SUBCOMMANDS[key] = m.group(0).split("|")
-
-
-# ---------------------------------------------------------------------------
-# Gateway helpers
-# ---------------------------------------------------------------------------
-
-# Set of all command names + aliases recognized by the gateway.
-# Includes config-gated commands so the gateway can dispatch them
-# (the handler checks the config gate at runtime).
-GATEWAY_KNOWN_COMMANDS: frozenset[str] = frozenset(
-    name
-    for cmd in COMMAND_REGISTRY
-    if not cmd.cli_only or cmd.gateway_config_gate
-    for name in (cmd.name, *cmd.aliases)
-)
+rebuild_lookups()
 
 
 def _resolve_config_gates() -> set[str]:
@@ -334,11 +252,10 @@ def gateway_help_lines() -> list[str]:
             continue
         args = f" {cmd.args_hint}" if cmd.args_hint else ""
         alias_parts: list[str] = []
-        for a in cmd.aliases:
-            # Skip internal aliases like reload_mcp (underscore variant)
-            if a.replace("-", "_") == cmd.name.replace("-", "_") and a != cmd.name:
+        for alias in cmd.aliases:
+            if alias.replace("-", "_") == cmd.name.replace("-", "_") and alias != cmd.name:
                 continue
-            alias_parts.append(f"`/{a}`")
+            alias_parts.append(f"`/{alias}`")
         alias_note = f" (alias: {', '.join(alias_parts)})" if alias_parts else ""
         lines.append(f"`/{cmd.name}{args}` -- {cmd.description}{alias_note}")
     return lines
@@ -356,8 +273,7 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
-        tg_name = cmd.name.replace("-", "_")
-        result.append((tg_name, cmd.description))
+        result.append((cmd.name.replace("-", "_"), cmd.description))
     return result
 
 
@@ -378,9 +294,25 @@ def slack_subcommand_map() -> dict[str, str]:
     return mapping
 
 
-# ---------------------------------------------------------------------------
-# Autocomplete
-# ---------------------------------------------------------------------------
+def _user_home_dir() -> str:
+    """Return the preferred home directory for path completion/display."""
+    for key in ("HOME", "USERPROFILE"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return os.path.expanduser("~")
+
+
+def _expand_user_path(path: str) -> str:
+    if path.startswith("~"):
+        home = _user_home_dir()
+        if path == "~":
+            return home
+        if path.startswith("~/") or path.startswith("~\\"):
+            suffix = path[2:].replace("/", os.sep).replace("\\", os.sep)
+            return os.path.join(home, suffix)
+    return os.path.expanduser(path)
+
 
 class SlashCommandCompleter(Completer):
     """Autocomplete for built-in slash commands, subcommands, and skill commands."""
@@ -388,8 +320,27 @@ class SlashCommandCompleter(Completer):
     def __init__(
         self,
         skill_commands_provider: Callable[[], Mapping[str, dict[str, Any]]] | None = None,
+        model_completer_provider: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self._skill_commands_provider = skill_commands_provider
+        self._model_completer_provider = model_completer_provider
+        self._model_info_cache: dict[str, Any] | None = None
+        self._model_info_cache_time: float = 0
+
+    def _get_model_info(self) -> dict[str, Any]:
+        import time
+
+        now = time.monotonic()
+        if self._model_info_cache is not None and now - self._model_info_cache_time < 60:
+            return self._model_info_cache
+        if self._model_completer_provider is None:
+            return {}
+        try:
+            self._model_info_cache = self._model_completer_provider() or {}
+            self._model_info_cache_time = now
+        except Exception:
+            self._model_info_cache = self._model_info_cache or {}
+        return self._model_info_cache
 
     def _iter_skill_commands(self) -> Mapping[str, dict[str, Any]]:
         if self._skill_commands_provider is None:
@@ -401,45 +352,31 @@ class SlashCommandCompleter(Completer):
 
     @staticmethod
     def _completion_text(cmd_name: str, word: str) -> str:
-        """Return replacement text for a completion.
-
-        When the user has already typed the full command exactly (``/help``),
-        returning ``help`` would be a no-op and prompt_toolkit suppresses the
-        menu. Appending a trailing space keeps the dropdown visible and makes
-        backspacing retrigger it naturally.
-        """
         return f"{cmd_name} " if cmd_name == word else cmd_name
 
     @staticmethod
     def _extract_path_word(text: str) -> str | None:
-        """Extract the current word if it looks like a file path.
-
-        Returns the path-like token under the cursor, or None if the
-        current word doesn't look like a path.  A word is path-like when
-        it starts with ``./``, ``../``, ``~/``, ``/``, or contains a
-        ``/`` separator (e.g. ``src/main.py``).
-        """
         if not text:
             return None
-        # Walk backwards to find the start of the current "word".
-        # Words are delimited by spaces, but paths can contain almost anything.
         i = len(text) - 1
         while i >= 0 and text[i] != " ":
             i -= 1
         word = text[i + 1:]
         if not word:
             return None
-        # Only trigger path completion for path-like tokens
-        if word.startswith(("./", "../", "~/", "/")) or "/" in word:
+        if (
+            word.startswith(("./", "../", "~/", "/", ".\\", "..\\", "~\\", "\\"))
+            or "/" in word
+            or "\\" in word
+            or os.path.isabs(word)
+        ):
             return word
         return None
 
     @staticmethod
     def _path_completions(word: str, limit: int = 30):
-        """Yield Completion objects for file paths matching *word*."""
-        expanded = os.path.expanduser(word)
-        # Split into directory part and prefix to match inside it
-        if expanded.endswith("/"):
+        expanded = _expand_user_path(word)
+        if expanded.endswith(("/", "\\")):
             search_dir = expanded
             prefix = ""
         else:
@@ -458,59 +395,38 @@ class SlashCommandCompleter(Completer):
                 continue
             if count >= limit:
                 break
-
             full_path = os.path.join(search_dir, entry)
             is_dir = os.path.isdir(full_path)
-
-            # Build the completion text (what replaces the typed word)
             if word.startswith("~"):
-                display_path = "~/" + os.path.relpath(full_path, os.path.expanduser("~"))
+                display_path = "~/" + os.path.relpath(full_path, _user_home_dir())
             elif os.path.isabs(word):
                 display_path = full_path
             else:
-                # Keep relative
                 display_path = os.path.relpath(full_path)
-
             if is_dir:
                 display_path += "/"
-
-            suffix = "/" if is_dir else ""
-            meta = "dir" if is_dir else _file_size_label(full_path)
-
             yield Completion(
                 display_path,
                 start_position=-len(word),
-                display=entry + suffix,
-                display_meta=meta,
+                display=entry + ("/" if is_dir else ""),
+                display_meta="dir" if is_dir else _file_size_label(full_path),
             )
             count += 1
 
     @staticmethod
     def _extract_context_word(text: str) -> str | None:
-        """Extract a bare ``@`` token for context reference completions."""
         if not text:
             return None
-        # Walk backwards to find the start of the current word
         i = len(text) - 1
         while i >= 0 and text[i] != " ":
             i -= 1
         word = text[i + 1:]
-        if not word.startswith("@"):
-            return None
-        return word
+        return word if word.startswith("@") else None
 
     @staticmethod
     def _context_completions(word: str, limit: int = 30):
-        """Yield Claude Code-style @ context completions.
-
-        Bare ``@`` or ``@partial`` shows static references and matching
-        files/folders.  ``@file:path`` and ``@folder:path`` are handled
-        by the existing path completion path.
-        """
         lowered = word.lower()
-
-        # Static context references
-        _STATIC_REFS = (
+        static_refs = (
             ("@diff", "Git working tree diff"),
             ("@staged", "Git staged diff"),
             ("@file:", "Attach a file"),
@@ -518,31 +434,23 @@ class SlashCommandCompleter(Completer):
             ("@git:", "Git log with diffs (e.g. @git:5)"),
             ("@url:", "Fetch web content"),
         )
-        for candidate, meta in _STATIC_REFS:
+        for candidate, meta in static_refs:
             if candidate.lower().startswith(lowered) and candidate.lower() != lowered:
-                yield Completion(
-                    candidate,
-                    start_position=-len(word),
-                    display=candidate,
-                    display_meta=meta,
-                )
+                yield Completion(candidate, start_position=-len(word), display=candidate, display_meta=meta)
 
-        # If the user typed @file: or @folder:, delegate to path completions
         for prefix in ("@file:", "@folder:"):
             if word.startswith(prefix):
                 path_part = word[len(prefix):] or "."
-                expanded = os.path.expanduser(path_part)
-                if expanded.endswith("/"):
+                expanded = _expand_user_path(path_part)
+                if expanded.endswith(("/", "\\")):
                     search_dir, match_prefix = expanded, ""
                 else:
                     search_dir = os.path.dirname(expanded) or "."
                     match_prefix = os.path.basename(expanded)
-
                 try:
                     entries = os.listdir(search_dir)
                 except OSError:
                     return
-
                 count = 0
                 prefix_lower = match_prefix.lower()
                 for entry in sorted(entries):
@@ -553,104 +461,107 @@ class SlashCommandCompleter(Completer):
                     full_path = os.path.join(search_dir, entry)
                     is_dir = os.path.isdir(full_path)
                     display_path = os.path.relpath(full_path)
-                    suffix = "/" if is_dir else ""
                     kind = "folder" if is_dir else "file"
-                    meta = "dir" if is_dir else _file_size_label(full_path)
-                    completion = f"@{kind}:{display_path}{suffix}"
+                    suffix = "/" if is_dir else ""
                     yield Completion(
-                        completion,
+                        f"@{kind}:{display_path}{suffix}",
                         start_position=-len(word),
                         display=entry + suffix,
-                        display_meta=meta,
+                        display_meta="dir" if is_dir else _file_size_label(full_path),
                     )
                     count += 1
                 return
 
-        # Bare @ or @partial — show matching files/folders from cwd
-        query = word[1:]  # strip the @
+        query = word[1:]
         if not query:
             search_dir, match_prefix = ".", ""
         else:
-            expanded = os.path.expanduser(query)
-            if expanded.endswith("/"):
+            expanded = _expand_user_path(query)
+            if expanded.endswith(("/", "\\")):
                 search_dir, match_prefix = expanded, ""
             else:
                 search_dir = os.path.dirname(expanded) or "."
                 match_prefix = os.path.basename(expanded)
-
         try:
             entries = os.listdir(search_dir)
         except OSError:
             return
-
         count = 0
         prefix_lower = match_prefix.lower()
         for entry in sorted(entries):
             if match_prefix and not entry.lower().startswith(prefix_lower):
                 continue
-            if entry.startswith("."):
-                continue  # skip hidden files in bare @ mode
-            if count >= limit:
-                break
+            if entry.startswith(".") or count >= limit:
+                continue
             full_path = os.path.join(search_dir, entry)
             is_dir = os.path.isdir(full_path)
             display_path = os.path.relpath(full_path)
-            suffix = "/" if is_dir else ""
             kind = "folder" if is_dir else "file"
-            meta = "dir" if is_dir else _file_size_label(full_path)
-            completion = f"@{kind}:{display_path}{suffix}"
+            suffix = "/" if is_dir else ""
             yield Completion(
-                completion,
+                f"@{kind}:{display_path}{suffix}",
                 start_position=-len(word),
                 display=entry + suffix,
-                display_meta=meta,
+                display_meta="dir" if is_dir else _file_size_label(full_path),
             )
             count += 1
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
         if not text.startswith("/"):
-            # Try @ context completion (Claude Code-style)
             ctx_word = self._extract_context_word(text)
             if ctx_word is not None:
                 yield from self._context_completions(ctx_word)
                 return
-            # Try file path completion for non-slash input
             path_word = self._extract_path_word(text)
             if path_word is not None:
                 yield from self._path_completions(path_word)
             return
 
-        # Check if we're completing a subcommand (base command already typed)
         parts = text.split(maxsplit=1)
         base_cmd = parts[0].lower()
         if len(parts) > 1 or (len(parts) == 1 and text.endswith(" ")):
             sub_text = parts[1] if len(parts) > 1 else ""
             sub_lower = sub_text.lower()
 
-            # Static subcommand completions
+            if base_cmd == "/model" and " " not in sub_text:
+                info = self._get_model_info()
+                if info:
+                    current_prov = info.get("current_provider", "")
+                    providers = info.get("providers", {})
+                    models_for = info.get("models_for")
+                    if ":" in sub_text:
+                        prov_part, model_part = sub_text.split(":", 1)
+                        model_lower = model_part.lower()
+                        if models_for:
+                            try:
+                                prov_models = models_for(prov_part)
+                            except Exception:
+                                prov_models = []
+                            for mid in prov_models:
+                                if mid.lower().startswith(model_lower) and mid.lower() != model_lower:
+                                    yield Completion(full := f"{prov_part}:{mid}", start_position=-len(sub_text), display=mid)
+                    else:
+                        for pid, plabel in sorted(providers.items(), key=lambda kv: (kv[0] == current_prov, kv[0])):
+                            display_name = f"{pid}:"
+                            if display_name.lower().startswith(sub_lower):
+                                meta = f"({plabel})" if plabel != pid else ""
+                                if pid == current_prov:
+                                    meta = f"(current — {plabel})" if plabel != pid else "(current)"
+                                yield Completion(display_name, start_position=-len(sub_text), display=display_name, display_meta=meta)
+                return
+
             if " " not in sub_text and base_cmd in SUBCOMMANDS:
                 for sub in SUBCOMMANDS[base_cmd]:
                     if sub.startswith(sub_lower) and sub != sub_lower:
-                        yield Completion(
-                            sub,
-                            start_position=-len(sub_text),
-                            display=sub,
-                        )
+                        yield Completion(sub, start_position=-len(sub_text), display=sub)
             return
 
         word = text[1:]
-
         for cmd, desc in COMMANDS.items():
             cmd_name = cmd[1:]
             if cmd_name.startswith(word):
-                yield Completion(
-                    self._completion_text(cmd_name, word),
-                    start_position=-len(word),
-                    display=cmd,
-                    display_meta=desc,
-                )
-
+                yield Completion(self._completion_text(cmd_name, word), start_position=-len(word), display=cmd, display_meta=desc)
         for cmd, info in self._iter_skill_commands().items():
             cmd_name = cmd[1:]
             if cmd_name.startswith(word):
@@ -664,16 +575,8 @@ class SlashCommandCompleter(Completer):
                 )
 
 
-# ---------------------------------------------------------------------------
-# Inline auto-suggest (ghost text) for slash commands
-# ---------------------------------------------------------------------------
-
 class SlashCommandAutoSuggest(AutoSuggest):
-    """Inline ghost-text suggestions for slash commands and their subcommands.
-
-    Shows the rest of a command or subcommand in dim text as you type.
-    Falls back to history-based suggestions for non-slash input.
-    """
+    """Inline ghost-text suggestions for slash commands and their subcommands."""
 
     def __init__(
         self,
@@ -681,49 +584,56 @@ class SlashCommandAutoSuggest(AutoSuggest):
         completer: SlashCommandCompleter | None = None,
     ) -> None:
         self._history = history_suggest
-        self._completer = completer  # Reuse its model cache
+        self._completer = completer
 
     def get_suggestion(self, buffer, document):
         text = document.text_before_cursor
-
-        # Only suggest for slash commands
         if not text.startswith("/"):
-            # Fall back to history for regular text
-            if self._history:
-                return self._history.get_suggestion(buffer, document)
-            return None
+            return self._history.get_suggestion(buffer, document) if self._history else None
 
         parts = text.split(maxsplit=1)
         base_cmd = parts[0].lower()
-
         if len(parts) == 1 and not text.endswith(" "):
-            # Still typing the command name: /upd → suggest "ate"
             word = text[1:].lower()
             for cmd in COMMANDS:
-                cmd_name = cmd[1:]  # strip leading /
+                cmd_name = cmd[1:]
                 if cmd_name.startswith(word) and cmd_name != word:
                     return Suggestion(cmd_name[len(word):])
             return None
 
-        # Command is complete — suggest subcommands or model names
         sub_text = parts[1] if len(parts) > 1 else ""
         sub_lower = sub_text.lower()
+        if base_cmd == "/model" and " " not in sub_text and self._completer:
+            info = self._completer._get_model_info()
+            if info:
+                providers = info.get("providers", {})
+                models_for = info.get("models_for")
+                current_prov = info.get("current_provider", "")
+                if ":" in sub_text:
+                    prov_part, model_part = sub_text.split(":", 1)
+                    model_lower = model_part.lower()
+                    if models_for:
+                        try:
+                            for mid in models_for(prov_part):
+                                if mid.lower().startswith(model_lower) and mid.lower() != model_lower:
+                                    return Suggestion(mid[len(model_part):])
+                        except Exception:
+                            pass
+                else:
+                    for pid in sorted(providers, key=lambda p: (p == current_prov, p)):
+                        candidate = f"{pid}:"
+                        if candidate.lower().startswith(sub_lower) and candidate.lower() != sub_lower:
+                            return Suggestion(candidate[len(sub_text):])
 
-        # Static subcommands
-        if base_cmd in SUBCOMMANDS and SUBCOMMANDS[base_cmd]:
-            if " " not in sub_text:
-                for sub in SUBCOMMANDS[base_cmd]:
-                    if sub.startswith(sub_lower) and sub != sub_lower:
-                        return Suggestion(sub[len(sub_text):])
+        if base_cmd in SUBCOMMANDS and SUBCOMMANDS[base_cmd] and " " not in sub_text:
+            for sub in SUBCOMMANDS[base_cmd]:
+                if sub.startswith(sub_lower) and sub != sub_lower:
+                    return Suggestion(sub[len(sub_text):])
 
-        # Fall back to history
-        if self._history:
-            return self._history.get_suggestion(buffer, document)
-        return None
+        return self._history.get_suggestion(buffer, document) if self._history else None
 
 
 def _file_size_label(path: str) -> str:
-    """Return a compact human-readable file size, or '' on error."""
     try:
         size = os.path.getsize(path)
     except OSError:

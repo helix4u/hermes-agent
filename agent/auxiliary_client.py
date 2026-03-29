@@ -1430,6 +1430,21 @@ def _resolve_task_provider_model(
                 cfg_model = cfg_model or comp.get("summary_model", "").strip() or None
                 _sbu = comp.get("summary_base_url") or ""
                 cfg_base_url = cfg_base_url or _sbu.strip() or None
+    else:
+        try:
+            from hermes_cli.config import load_config
+            config = load_config()
+        except ImportError:
+            config = {}
+
+        model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+        if isinstance(model_cfg, str):
+            cfg_model = None
+        elif isinstance(model_cfg, dict):
+            cfg_provider = str(model_cfg.get("provider", "")).strip() or None
+            cfg_base_url = str(model_cfg.get("base_url", "")).strip() or None
+            if cfg_base_url or cfg_provider == "custom":
+                cfg_model = str(model_cfg.get("default", "")).strip() or None
 
     env_model = _get_auxiliary_env_override(task, "MODEL") if task else None
     resolved_model = model or env_model or cfg_model
@@ -1454,6 +1469,11 @@ def _resolve_task_provider_model(
         if cfg_provider and cfg_provider != "auto":
             return cfg_provider, resolved_model, None, None
         return "auto", resolved_model, None, None
+
+    if cfg_base_url:
+        return "custom", resolved_model, cfg_base_url, cfg_api_key
+    if cfg_provider and cfg_provider != "auto":
+        return cfg_provider, resolved_model, None, None
 
     return "auto", resolved_model, None, None
 

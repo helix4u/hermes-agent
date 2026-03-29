@@ -19,6 +19,7 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
 _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a"}
 _VOICE_EXTS = {".ogg", ".opus"}
+_DISCORD_EMBED_DESCRIPTION_MAX = 4000
 
 
 SEND_MESSAGE_SCHEMA = {
@@ -285,7 +286,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # Platform message length limits (from adapter class attributes)
     _MAX_LENGTHS = {
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH,
-        Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
+        # Detached sends should mirror the gateway's embed-based Discord path,
+        # which is constrained by embed description length rather than the
+        # plain-message 2000-character limit.
+        Platform.DISCORD: DiscordAdapter.MAX_EMBED_DESCRIPTION,
         Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
     }
 
@@ -332,7 +336,12 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     last_result = None
     for chunk in chunks:
         if platform == Platform.DISCORD:
-            result = await _send_discord(pconfig.token, chat_id, chunk)
+            result = await _send_discord(
+                pconfig.token,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+            )
         elif platform == Platform.SLACK:
             result = await _send_slack(pconfig.token, chat_id, chunk)
         elif platform == Platform.WHATSAPP:
@@ -478,25 +487,38 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return {"error": f"Telegram send failed: {e}"}
 
 
-async def _send_discord(token, chat_id, message):
-    """Send a single message via Discord REST API (no websocket client needed).
-
-    Chunking is handled by _send_to_platform() before this is called.
-    """
+async def _send_discord(token, chat_id, message, *, thread_id=None):
+    """Send a single Discord message via REST using the normal embed format."""
     try:
         import aiohttp
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
-        url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
+        from gateway.platforms.discord import build_discord_listen_components
+
+        target_channel_id = thread_id or chat_id
+        url = f"https://discord.com/api/v10/channels/{target_channel_id}/messages"
         headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+        if not message:
+            return {"error": "Discord send failed: message is empty"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.post(url, headers=headers, json={"content": message}) as resp:
+            payload = {
+                "embeds": [{"description": message}],
+                "components": build_discord_listen_components(),
+                "allowed_mentions": {"parse": []},
+            }
+            async with session.post(url, headers=headers, json=payload) as resp:
                 if resp.status not in (200, 201):
                     body = await resp.text()
                     return {"error": f"Discord API error ({resp.status}): {body}"}
                 data = await resp.json()
-        return {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": data.get("id")}
+        return {
+            "success": True,
+            "platform": "discord",
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "message_id": data.get("id"),
+        }
     except Exception as e:
         return {"error": f"Discord send failed: {e}"}
 

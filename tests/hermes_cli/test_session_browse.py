@@ -12,6 +12,11 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
+try:
+    import curses as _test_curses
+except ImportError:
+    _test_curses = None
+
 from hermes_cli.main import _session_browse_picker
 
 
@@ -244,6 +249,7 @@ class TestSessionBrowsePicker:
 
 # ─── Curses-based picker (mocked curses) ────────────────────────────────────
 
+@pytest.mark.skipif(_test_curses is None, reason="curses is not available on this platform")
 class TestCursesBrowse:
     """Tests for the curses-based interactive picker via simulated key sequences."""
 

@@ -14,20 +14,30 @@ Usage:
 """
 
 import asyncio
+import base64
+import contextlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import shlex
-import sys
+import shutil
+import socket
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
+import uuid
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import urlopen
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -77,7 +87,35 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
+
 _hermes_home = get_hermes_home()
+_DEFAULT_SIDECAR_SYNC_TIMEOUT_SECONDS = 300.0
+
+
+def _load_sidecar_sync_timeout_seconds() -> float:
+    raw = (os.getenv("HERMES_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return _DEFAULT_SIDECAR_SYNC_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "Invalid HERMES_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS=%r. Falling back to %.1f.",
+            raw,
+            _DEFAULT_SIDECAR_SYNC_TIMEOUT_SECONDS,
+        )
+        return _DEFAULT_SIDECAR_SYNC_TIMEOUT_SECONDS
+    return value if value > 0 else _DEFAULT_SIDECAR_SYNC_TIMEOUT_SECONDS
+
+
+_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS = _load_sidecar_sync_timeout_seconds()
+
+# Mirror agent tool/thinking lines into the browser bridge poll payload (sidecar UI parity).
+_BROWSER_BRIDGE_PROGRESS_EVENT_CAP = 128
+
+
+def _format_timeout_seconds(value: float) -> str:
+    return f"{int(value)}" if float(value).is_integer() else f"{value:g}"
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -111,7 +149,6 @@ if _config_path.exists():
                 "timeout": "TERMINAL_TIMEOUT",
                 "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
                 "docker_image": "TERMINAL_DOCKER_IMAGE",
-                "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
                 "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
                 "modal_image": "TERMINAL_MODAL_IMAGE",
                 "daytona_image": "TERMINAL_DAYTONA_IMAGE",
@@ -134,8 +171,6 @@ if _config_path.exists():
                         os.environ[_env_var] = json.dumps(_val)
                     else:
                         os.environ[_env_var] = str(_val)
-        # Compression config is read directly from config.yaml by run_agent.py
-        # and auxiliary_client.py — no env var bridging needed.
         # Auxiliary model/direct-endpoint overrides (vision, web_extract).
         # Each task has provider/model/base_url/api_key; bridge non-default values to env vars.
         _auxiliary_cfg = _cfg.get("auxiliary", {})
@@ -176,6 +211,28 @@ if _config_path.exists():
                     os.environ[_env_map["base_url"]] = _base_url
                 if _api_key:
                     os.environ[_env_map["api_key"]] = _api_key
+        _browser_cfg = _cfg.get("browser", {})
+        if _browser_cfg and isinstance(_browser_cfg, dict):
+            _browser_env_map = {
+                "backend": "BROWSER_BACKEND",
+                "inactivity_timeout": "BROWSER_INACTIVITY_TIMEOUT",
+                "navigate_timeout": "BROWSER_NAVIGATE_TIMEOUT",
+                "headless": "BROWSER_HEADLESS",
+                "profile_dir": "BROWSER_PROFILE_DIR",
+                "user_agent": "BROWSER_USER_AGENT",
+                "cdp_url": "BROWSER_CDP_URL",
+                "cdp_browser": "BROWSER_CDP_BROWSER",
+                "cdp_port": "BROWSER_CDP_PORT",
+                "cdp_user_data_dir": "BROWSER_CDP_USER_DATA_DIR",
+            }
+            for _cfg_key, _env_var in _browser_env_map.items():
+                if _cfg_key in _browser_cfg:
+                    _val = _browser_cfg[_cfg_key]
+                    if isinstance(_val, str):
+                        if _val.strip():
+                            os.environ[_env_var] = _val.strip()
+                    elif _val is not None:
+                        os.environ[_env_var] = str(_val)
         _agent_cfg = _cfg.get("agent", {})
         if _agent_cfg and isinstance(_agent_cfg, dict):
             if "max_turns" in _agent_cfg:
@@ -216,6 +273,7 @@ from gateway.config import (
 from gateway.session import (
     SessionStore,
     SessionSource,
+    SessionEntry,
     SessionContext,
     build_session_context,
     build_session_context_prompt,
@@ -223,6 +281,15 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.browser_bridge import (
+    BrowserBridgeConfig,
+    BrowserBridgeServer,
+    build_bridge_chat_id,
+    build_browser_chat_message,
+    build_browser_context_message,
+    fetch_pdf_page_images,
+    fetch_pdf_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +298,23 @@ logger = logging.getLogger(__name__)
 # session from bypassing the "already running" guard during the async gap
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
+
+
+class BrowserBridgeTranscriptUnavailable(Exception):
+    """Raised when a YouTube transcript exists but can't be fetched usefully."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        video_id: str = "",
+        requested_language: str = "",
+        available_languages: Optional[List[str]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.video_id = video_id
+        self.requested_language = requested_language
+        self.available_languages = list(available_languages or [])
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -252,14 +336,103 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
         "api_mode": runtime.get("api_mode"),
-        "command": runtime.get("command"),
-        "args": list(runtime.get("args") or []),
     }
 
 
 def _platform_config_key(platform: "Platform") -> str:
     """Map a Platform enum to its config.yaml key (LOCAL→"cli", rest→enum value)."""
     return "cli" if platform == Platform.LOCAL else platform.value
+
+
+def _is_wsl_runtime() -> bool:
+    if os.name == "nt" or not sys.platform.startswith("linux"):
+        return False
+    if os.getenv("WSL_DISTRO_NAME") or os.getenv("WSL_INTEROP"):
+        return True
+    try:
+        release = os.uname().release
+    except Exception:
+        release = ""
+    return "microsoft" in str(release or "").lower()
+
+
+def _looks_like_local_bind_host(host: str) -> bool:
+    normalized = str(host or "").strip().lower()
+    return normalized in {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}
+
+
+def _parse_int_env(name: str, default: int) -> int:
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _build_windows_wsl_localhost_collision_warning(
+    config: "GatewayConfig",
+    *,
+    os_name: str | None = None,
+    is_wsl: bool | None = None,
+) -> str | None:
+    effective_os_name = os_name if os_name is not None else os.name
+    effective_is_wsl = _is_wsl_runtime() if is_wsl is None else bool(is_wsl)
+    if effective_os_name != "nt" and not effective_is_wsl:
+        return None
+
+    from gateway.browser_bridge import DEFAULT_HOST as _BB_DEFAULT_HOST
+    from gateway.browser_bridge import DEFAULT_PORT as _BB_DEFAULT_PORT
+    from gateway.platforms.api_server import DEFAULT_HOST as _API_DEFAULT_HOST
+    from gateway.platforms.api_server import DEFAULT_PORT as _API_DEFAULT_PORT
+
+    warnings: list[str] = []
+
+    browser_bridge_enabled_raw = str(os.getenv("HERMES_BROWSER_BRIDGE_ENABLED", "true") or "").strip().lower()
+    browser_bridge_enabled = browser_bridge_enabled_raw not in {"0", "false", "no", "off"}
+    browser_bridge_host = str(os.getenv("HERMES_BROWSER_BRIDGE_HOST", _BB_DEFAULT_HOST) or "").strip() or _BB_DEFAULT_HOST
+    browser_bridge_port = _parse_int_env("HERMES_BROWSER_BRIDGE_PORT", _BB_DEFAULT_PORT)
+    if browser_bridge_enabled and _looks_like_local_bind_host(browser_bridge_host) and browser_bridge_port == _BB_DEFAULT_PORT:
+        warnings.append(
+            f"- Browser bridge is using default local bind `{browser_bridge_host}:{browser_bridge_port}`. "
+            "Change `HERMES_BROWSER_BRIDGE_PORT` in one environment."
+        )
+
+    api_platform_cfg = (config.platforms or {}).get(Platform.API_SERVER)
+    api_server_enabled = bool(api_platform_cfg and api_platform_cfg.enabled)
+    if api_server_enabled:
+        api_extra = api_platform_cfg.extra or {}
+        api_host = str(api_extra.get("host", os.getenv("API_SERVER_HOST", _API_DEFAULT_HOST)) or "").strip() or _API_DEFAULT_HOST
+        api_port_raw = api_extra.get("port", os.getenv("API_SERVER_PORT", str(_API_DEFAULT_PORT)))
+        try:
+            api_port = int(api_port_raw)
+        except (TypeError, ValueError):
+            api_port = _API_DEFAULT_PORT
+        if _looks_like_local_bind_host(api_host) and api_port == _API_DEFAULT_PORT:
+            warnings.append(
+                f"- API server is using default local bind `{api_host}:{api_port}`. "
+                "Change `API_SERVER_PORT` in one environment."
+            )
+
+    cdp_port = _parse_int_env("BROWSER_CDP_PORT", 9222)
+    if 9222 <= cdp_port <= 9226:
+        warnings.append(
+            f"- Live CDP default is collision-prone at port `{cdp_port}`. "
+            "Set `BROWSER_CDP_PORT` differently, or connect with `/browser connect <port>`."
+        )
+
+    if not warnings:
+        return None
+
+    runtime_label = "WSL" if effective_is_wsl and effective_os_name != "nt" else "Windows"
+    body = "\n".join(warnings)
+    return (
+        f"{runtime_label} shares localhost with sibling Hermes instances across Windows/WSL. "
+        "If you run Hermes in both environments at once, default local ports can collide:\n"
+        f"{body}\n"
+        "Suggested split: Windows keeps `8765/8642/9222`, WSL uses `8766/8643/9332`."
+    )
 
 
 def _load_gateway_config() -> dict:
@@ -275,6 +448,17 @@ def _load_gateway_config() -> dict:
     return {}
 
 
+def _normalize_gateway_model_for_provider(model: str, provider: str) -> str:
+    """Normalize model names for providers whose APIs reject aggregator slugs."""
+    normalized_model = (model or "").strip()
+    normalized_provider = (provider or "").strip().lower()
+
+    if normalized_provider == "openai-codex" and "/" in normalized_model:
+        return normalized_model.split("/", 1)[1].strip()
+
+    return normalized_model
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from env/config — mirrors the resolution in _run_agent_sync.
 
@@ -284,12 +468,30 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     """
     model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
     cfg = config if config is not None else _load_gateway_config()
-    model_cfg = cfg.get("model", {})
+    requested_provider = ""
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
     if isinstance(model_cfg, str):
         model = model_cfg
     elif isinstance(model_cfg, dict):
         model = model_cfg.get("default") or model_cfg.get("model") or model
-    return model
+        cfg_provider = model_cfg.get("provider", "")
+        if isinstance(cfg_provider, str) and cfg_provider.strip():
+            requested_provider = cfg_provider.strip()
+
+    if not requested_provider:
+        requested_provider = os.getenv("HERMES_INFERENCE_PROVIDER", "").strip()
+
+    try:
+        from hermes_cli.auth import resolve_provider as _resolve_provider
+        from hermes_cli.models import normalize_provider as _normalize_provider
+
+        resolved_provider = _normalize_provider(requested_provider or "auto")
+        if resolved_provider == "auto":
+            resolved_provider = _resolve_provider(resolved_provider)
+    except Exception:
+        resolved_provider = (requested_provider or "").strip().lower()
+
+    return _normalize_gateway_model_for_provider(model, resolved_provider)
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -319,6 +521,321 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     return None
 
 
+def _load_user_config() -> dict:
+    """Load ~/.hermes/config.yaml as a dictionary."""
+    import yaml
+
+    config_path = _hermes_home / "config.yaml"
+    if not config_path.exists():
+        return {}
+    with open(config_path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _save_user_config(config: dict) -> None:
+    """Persist ~/.hermes/config.yaml."""
+    import yaml
+
+    config_path = _hermes_home / "config.yaml"
+    with open(config_path, "w", encoding="utf-8", newline="") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+
+def _get_image_generation_defaults() -> Optional[dict]:
+    """Return persisted image-generation defaults, if any."""
+    try:
+        config = _load_user_config()
+    except Exception:
+        return None
+    image_cfg = config.get("image_generation", {})
+    if not isinstance(image_cfg, dict):
+        return None
+    defaults = image_cfg.get("defaults", {})
+    if not isinstance(defaults, dict):
+        return None
+    model = str(defaults.get("model") or "").strip()
+    if not model:
+        return None
+    raw_aspect_ratio = defaults.get("aspect_ratio")
+    sexagesimal_map = {
+        61: "1:1",
+        243: "4:3",
+        184: "3:4",
+        556: "9:16",
+        969: "16:9",
+    }
+    if isinstance(raw_aspect_ratio, int):
+        defaults["aspect_ratio"] = sexagesimal_map.get(raw_aspect_ratio, str(raw_aspect_ratio))
+    elif raw_aspect_ratio is not None:
+        defaults["aspect_ratio"] = str(raw_aspect_ratio).strip()
+    return defaults
+
+
+def _save_image_generation_defaults(
+    *,
+    model: str,
+    aspect_ratio: str,
+    width: int,
+    height: int,
+) -> None:
+    """Persist image-generation defaults into config.yaml."""
+    config = _load_user_config()
+    image_cfg = config.setdefault("image_generation", {})
+    if not isinstance(image_cfg, dict):
+        image_cfg = {}
+        config["image_generation"] = image_cfg
+    defaults = image_cfg.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        defaults = {}
+        image_cfg["defaults"] = defaults
+
+    defaults.update(
+        {
+            "provider": "invokeai-local-api",
+            "model": model,
+            "aspect_ratio": aspect_ratio,
+            "width": int(width),
+            "height": int(height),
+        }
+    )
+    _save_user_config(config)
+
+
+def _format_image_defaults(defaults: dict) -> str:
+    """Human-readable summary of saved image defaults."""
+    model = defaults.get("model", "")
+    aspect_ratio = defaults.get("aspect_ratio", "1:1")
+    width = defaults.get("width")
+    height = defaults.get("height")
+    lines = [
+        "Image defaults",
+        f"- Model: `{model}`",
+        f"- Aspect ratio: `{aspect_ratio}`",
+    ]
+    if width and height:
+        lines.append(f"- Resolution: `{width}x{height}`")
+    return "\n".join(lines)
+
+
+def _get_wiki_source_root() -> Path:
+    """Return the on-disk source root that contains wiki content."""
+    return _hermes_home / "workspace" / "data"
+
+
+def _get_wiki_web_root_base() -> Path:
+    """Return the parent directory used for generated LAN wiki roots.
+
+    Keep this outside workspace so agent file-editing scopes do not treat
+    transient serving artifacts as wiki source content.
+    """
+    return _hermes_home / ".runtime" / "wiki_serve"
+
+
+def _link_or_copy_path(source: Path, dest: Path) -> None:
+    """Create a symlink when possible, otherwise copy the source into place."""
+    try:
+        os.symlink(source, dest, target_is_directory=source.is_dir())
+        return
+    except OSError:
+        pass
+
+    if source.is_dir():
+        shutil.copytree(source, dest)
+    else:
+        shutil.copy2(source, dest)
+
+
+def _build_wiki_web_root() -> Path:
+    """Create an isolated web root that exposes only the wiki landing page and wiki tree."""
+    source_root = _get_wiki_source_root()
+    landing_page = source_root / "knowledge_wiki.html"
+    wiki_root = source_root / "wiki"
+    if not landing_page.exists():
+        raise FileNotFoundError(f"Wiki landing page not found: {landing_page}")
+    if not wiki_root.exists():
+        raise FileNotFoundError(f"Wiki content directory not found: {wiki_root}")
+
+    web_root_base = _get_wiki_web_root_base()
+    web_root_base.mkdir(parents=True, exist_ok=True)
+    web_root = Path(tempfile.mkdtemp(prefix="lan_wiki_", dir=web_root_base))
+
+    _link_or_copy_path(landing_page, web_root / "knowledge_wiki.html")
+    _link_or_copy_path(landing_page, web_root / "index.html")
+    _link_or_copy_path(wiki_root, web_root / "wiki")
+    return web_root
+
+
+def _cleanup_wiki_web_root(web_root: Optional[Path]) -> None:
+    """Remove a generated LAN wiki root without touching the source wiki content."""
+    if not web_root:
+        return
+    try:
+        shutil.rmtree(web_root, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _get_wiki_host_config() -> dict:
+    """Load persisted wiki-hosting configuration."""
+    try:
+        config = _load_user_config()
+    except Exception:
+        return {}
+    wiki_cfg = config.get("wiki_hosting", {})
+    return wiki_cfg if isinstance(wiki_cfg, dict) else {}
+
+
+def _save_wiki_host_config(*, enabled: bool, port: Optional[int]) -> None:
+    """Persist wiki-hosting configuration to config.yaml."""
+    config = _load_user_config()
+    wiki_cfg = config.setdefault("wiki_hosting", {})
+    if not isinstance(wiki_cfg, dict):
+        wiki_cfg = {}
+        config["wiki_hosting"] = wiki_cfg
+    wiki_cfg["enabled"] = bool(enabled)
+    if port is not None:
+        wiki_cfg["port"] = int(port)
+    _save_user_config(config)
+
+
+def _resolve_lan_ip() -> str:
+    """Best-effort LAN IPv4 for URLs shown to the user."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    candidates: List[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET):
+            candidate = info[4][0]
+            if candidate and not candidate.startswith("127.") and candidate not in candidates:
+                candidates.append(candidate)
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if candidate.startswith("192.168.1."):
+            return candidate
+    for candidate in candidates:
+        if candidate.startswith(("192.168.", "10.", "172.")):
+            return candidate
+    return "127.0.0.1"
+
+
+class _QuietWikiRequestHandler(SimpleHTTPRequestHandler):
+    """Simple static-file handler with quieter logging."""
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path in {"/wiki/knowledge_wiki.html", "/wiki/"}:
+            self.send_response(302)
+            self.send_header("Location", "/knowledge_wiki.html")
+            self.end_headers()
+            return
+        super().do_GET()
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A003
+        logger.debug("wiki-host: " + format, *args)
+
+
+class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """HTTP server that requests exclusive port ownership when available."""
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        super().server_bind()
+
+
+class _EncodingSafeStream:
+    """Best-effort wrapper that degrades unencodable writes with replacement."""
+
+    def __init__(self, stream: Any):
+        self._stream = stream
+        self.encoding = getattr(stream, "encoding", None)
+
+    def write(self, data: str) -> Any:
+        try:
+            return self._stream.write(data)
+        except UnicodeEncodeError:
+            encoding = self.encoding or "utf-8"
+            safe = str(data).encode(encoding, errors="replace").decode(encoding, errors="replace")
+            return self._stream.write(safe)
+
+    def flush(self) -> Any:
+        return self._stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+_gateway_console_progress_lock = threading.Lock()
+
+
+def _write_gateway_console_progress_line(text: str) -> None:
+    """Best-effort direct console mirror for live gateway progress updates."""
+    line = str(text or "").rstrip()
+    if not line:
+        return
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return
+    safe_stream = stream
+    if os.name == "nt":
+        safe_stream = _EncodingSafeStream(stream)
+    try:
+        with _gateway_console_progress_lock:
+            safe_stream.write(line + "\n")
+            safe_stream.flush()
+    except Exception:
+        pass
+
+
+def _harden_windows_console_logging() -> None:
+    """Prevent logging UnicodeEncodeError on legacy Windows console codepages."""
+    if os.name != "nt":
+        return
+
+    for handler in logging.getLogger().handlers:
+        if not isinstance(handler, logging.StreamHandler):
+            continue
+        # File handlers have their own encoding handling; only patch live streams.
+        if isinstance(handler, RotatingFileHandler):
+            continue
+
+        stream = getattr(handler, "stream", None)
+        if stream is None:
+            continue
+
+        reconfigured = False
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+                reconfigured = True
+        except Exception:
+            reconfigured = False
+
+        if not reconfigured:
+            try:
+                handler.stream = _EncodingSafeStream(stream)
+            except Exception:
+                pass
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -339,7 +856,6 @@ class GatewayRunner:
         self._show_reasoning = self._load_show_reasoning()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
-        self._smart_model_routing = self._load_smart_model_routing()
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
@@ -373,10 +889,20 @@ class GatewayRunner:
         # the primary model succeeds again or the user switches via /model.
         self._effective_model: Optional[str] = None
         self._effective_provider: Optional[str] = None
-
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
+        self._wiki_server: Optional[ThreadingHTTPServer] = None
+        self._wiki_server_thread: Optional[threading.Thread] = None
+        self._wiki_host_port: Optional[int] = None
+        self._wiki_web_root: Optional[Path] = None
+        self._update_notification_task: Optional[asyncio.Task] = None
+
+        # Browser extension sidecar bridge state
+        self._browser_bridge: Optional[BrowserBridgeServer] = None
+        self._browser_bridge_tasks: Dict[str, asyncio.Task] = {}
+        self._browser_bridge_progress: Dict[str, Dict[str, Any]] = {}
+        self._browser_bridge_pending_interrupts: set[str] = set()
 
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
@@ -472,23 +998,13 @@ class GatewayRunner:
         for session_key in list(managers.keys()):
             self._shutdown_gateway_honcho(session_key)
     
-    # -- Setup skill availability ----------------------------------------
-
-    def _has_setup_skill(self) -> bool:
-        """Check if the hermes-agent-setup skill is installed."""
-        try:
-            from tools.skill_manager_tool import _find_skill
-            return _find_skill("hermes-agent-setup") is not None
-        except Exception:
-            return False
-
     # -- Voice mode persistence ------------------------------------------
 
     _VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
 
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
-            data = json.loads(self._VOICE_MODE_PATH.read_text())
+            data = json.loads(self._VOICE_MODE_PATH.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
 
@@ -506,7 +1022,8 @@ class GatewayRunner:
         try:
             self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
             self._VOICE_MODE_PATH.write_text(
-                json.dumps(self._voice_mode, indent=2)
+                json.dumps(self._voice_mode, indent=2),
+                encoding="utf-8",
             )
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
@@ -589,12 +1106,15 @@ class GatewayRunner:
             # what's already saved and avoid overwriting newer entries.
             _current_memory = ""
             try:
-                from tools.memory_tool import MEMORY_DIR
+                memory_module = sys.modules.get("tools.memory_tool")
+                if memory_module is None:
+                    from tools import memory_tool as memory_module
+                memory_dir = Path(getattr(memory_module, "MEMORY_DIR"))
                 for fname, label in [
                     ("MEMORY.md", "MEMORY (your personal notes)"),
                     ("USER.md", "USER PROFILE (who the user is)"),
                 ]:
-                    fpath = MEMORY_DIR / fname
+                    fpath = memory_dir / fname
                     if fpath.exists():
                         content = fpath.read_text(encoding="utf-8").strip()
                         if content:
@@ -700,6 +1220,1852 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
         }
         return resolve_turn_route(user_message, getattr(self, "_smart_model_routing", {}), primary)
+
+    @staticmethod
+    def _is_browser_bridge_source(source: Optional[SessionSource]) -> bool:
+        """Return True when the session source came from the browser sidecar bridge."""
+        if not source:
+            return False
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        return source.platform == Platform.LOCAL and chat_id.startswith("browser-bridge:")
+
+    def _build_browser_bridge_source(
+        self,
+        browser_label: str,
+        client_session_id: str = "",
+    ) -> SessionSource:
+        """Build a stable local source for browser sidecar conversations."""
+        label = str(browser_label or "").strip() or "Chrome Extension"
+        chat_id = build_bridge_chat_id(label, str(client_session_id or "").strip())
+        return SessionSource(
+            platform=Platform.LOCAL,
+            chat_id=chat_id,
+            chat_name=label,
+            chat_type="dm",
+            user_id="local-browser",
+            user_name=label,
+        )
+
+    def _resolve_browser_bridge_source(
+        self,
+        payload: Dict[str, Any],
+    ) -> SessionSource:
+        """Resolve sidecar source from payload session key or label/session-id fields."""
+        requested_session_key = str(payload.get("sessionKey") or "").strip()
+        if requested_session_key:
+            try:
+                self.session_store._ensure_loaded()
+                entry = self.session_store._entries.get(requested_session_key)
+                if not entry or not self._is_browser_bridge_source(entry.origin):
+                    raise ValueError("Unknown browser sidecar session.")
+                return entry.origin
+            except Exception as exc:
+                raise ValueError("Unknown browser sidecar session.") from exc
+
+        browser_label = str(payload.get("browserLabel") or "").strip() or "Chrome Extension"
+        client_session_id = str(payload.get("clientSessionId") or "").strip()
+        return self._build_browser_bridge_source(browser_label, client_session_id)
+
+    def _append_browser_bridge_progress_event(
+        self,
+        session_key: str,
+        message: str,
+        *,
+        limit=None,
+    ) -> List[str]:
+        """Append a progress event and return the bounded event list (sidecar activity log)."""
+        cap = (
+            _BROWSER_BRIDGE_PROGRESS_EVENT_CAP
+            if limit is None
+            else max(1, min(int(limit), 500))
+        )
+        normalized = str(message or "").strip()
+        if not normalized:
+            normalized = "Working..."
+        events = list(self._browser_bridge_progress.get(session_key, {}).get("recent_events") or [])
+        stamp = datetime.now().strftime("%H:%M:%S")
+        events.append(f"[{stamp}] {normalized}")
+        if len(events) > cap:
+            events = events[-cap:]
+        return events
+
+    def _wiki_host_status_message(self) -> str:
+        """Human-readable current wiki hosting state."""
+        if not self._wiki_server or not self._wiki_host_port:
+            return (
+                "Wiki hosting is currently disabled.\n\n"
+                "Use `/wiki-host enable <port>` to expose the local wiki on your LAN."
+            )
+
+        lan_ip = _resolve_lan_ip()
+        url = f"http://{lan_ip}:{self._wiki_host_port}/knowledge_wiki.html"
+        web_root = self._wiki_web_root or _get_wiki_web_root_base()
+        return (
+            "Wiki hosting is enabled.\n"
+            f"- Root: `{web_root}`\n"
+            f"- Port: `{self._wiki_host_port}`\n"
+            f"- URL: {url}"
+        )
+
+    def _start_wiki_host(self, port: int) -> str:
+        """Start or restart the local LAN wiki host."""
+        if self._wiki_server and self._wiki_host_port == port:
+            return self._wiki_host_status_message()
+
+        self._stop_wiki_host()
+        web_root = _build_wiki_web_root()
+
+        handler = lambda *args, **kwargs: _QuietWikiRequestHandler(  # noqa: E731
+            *args,
+            directory=str(web_root),
+            **kwargs,
+        )
+        server = _ExclusiveThreadingHTTPServer(("0.0.0.0", int(port)), handler)
+        server.daemon_threads = True
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name=f"wiki-host-{port}",
+            daemon=True,
+        )
+        thread.start()
+
+        self._wiki_server = server
+        self._wiki_server_thread = thread
+        self._wiki_host_port = int(port)
+        self._wiki_web_root = web_root
+        probe_url = f"http://127.0.0.1:{port}/knowledge_wiki.html"
+        deadline = time.time() + 3
+        last_error: Optional[Exception] = None
+        while time.time() < deadline:
+            try:
+                with urlopen(probe_url, timeout=1) as resp:
+                    if getattr(resp, "status", 200) == 200:
+                        last_error = None
+                        break
+            except Exception as e:
+                last_error = e
+                time.sleep(0.1)
+        if last_error is not None:
+            self._stop_wiki_host()
+            raise RuntimeError(f"Wiki host started but self-probe failed for {probe_url}: {last_error}")
+        _save_wiki_host_config(enabled=True, port=port)
+        return self._wiki_host_status_message()
+
+    def _stop_wiki_host(self) -> None:
+        """Stop the local wiki host if it is running."""
+        server = getattr(self, "_wiki_server", None)
+        thread = getattr(self, "_wiki_server_thread", None)
+        web_root = getattr(self, "_wiki_web_root", None)
+        self._wiki_server = None
+        self._wiki_server_thread = None
+        self._wiki_host_port = None
+        self._wiki_web_root = None
+
+        if server:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        if thread and thread.is_alive():
+            thread.join(timeout=2)
+        _cleanup_wiki_web_root(web_root)
+
+    def _set_browser_bridge_progress(
+        self,
+        session_key: str,
+        *,
+        running: bool,
+        detail: str = "",
+        error: str = "",
+        interrupt_requested: bool = False,
+        recent_events: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Update in-memory sidecar progress state for one session."""
+        state = dict(self._browser_bridge_progress.get(session_key, {}))
+        now = time.time()
+        if running and not state.get("started_at"):
+            state["started_at"] = now
+        if not running:
+            state["finished_at"] = now
+        state["running"] = bool(running)
+        state["detail"] = str(detail or state.get("detail") or "").strip()
+        state["error"] = str(error or "").strip()
+        state["interrupt_requested"] = bool(interrupt_requested)
+        if recent_events is not None:
+            state["recent_events"] = list(recent_events)
+        else:
+            state["recent_events"] = list(state.get("recent_events") or [])
+        if not running and not state["detail"]:
+            state["detail"] = "Reply ready."
+        self._browser_bridge_progress[session_key] = state
+        return state
+
+    def _get_browser_bridge_progress_snapshot(self, session_key: str) -> Dict[str, Any]:
+        """Return serialized progress data for browser sidecar polling."""
+        state = dict(self._browser_bridge_progress.get(session_key, {}))
+        task = self._browser_bridge_tasks.get(session_key)
+        if task and task.done():
+            self._browser_bridge_tasks.pop(session_key, None)
+            if state.get("running"):
+                state["running"] = False
+                state["detail"] = state.get("detail") or "Reply ready."
+                state["finished_at"] = time.time()
+                self._browser_bridge_progress[session_key] = state
+
+        started_at = state.get("started_at")
+        finished_at = state.get("finished_at")
+        elapsed = 0
+        if isinstance(started_at, (int, float)):
+            end = finished_at if isinstance(finished_at, (int, float)) and not state.get("running") else time.time()
+            elapsed = max(0, int(end - started_at))
+
+        recent = list(state.get("recent_events") or [])
+        return {
+            "running": bool(state.get("running")),
+            "detail": str(state.get("detail") or "").strip(),
+            "error": str(state.get("error") or "").strip(),
+            "interrupt_requested": bool(state.get("interrupt_requested")),
+            "elapsed_seconds": elapsed,
+            "recent_events": recent,
+            # Alias for extension UI (full activity log; same backing store as recent_events).
+            "activity_log": list(recent),
+        }
+
+    def _normalize_browser_bridge_public_host(self, host: str) -> str:
+        normalized = str(host or "").strip()
+        if normalized in {"0.0.0.0", "::", "[::]"}:
+            return "127.0.0.1"
+        return normalized or "127.0.0.1"
+
+    def _build_browser_bridge_media_url(self, media_path: str) -> str:
+        bridge = self._browser_bridge
+        if not bridge:
+            return ""
+        try:
+            resolved = Path(media_path).expanduser().resolve()
+        except Exception:
+            return ""
+        if not resolved.exists() or not resolved.is_file():
+            return ""
+        mime_type = mimetypes.guess_type(str(resolved))[0] or ""
+        if not mime_type.startswith("image/"):
+            return ""
+        host = self._normalize_browser_bridge_public_host(bridge.config.host)
+        token = quote(bridge.config.token, safe="")
+        encoded_path = quote(str(resolved), safe="")
+        return f"http://{host}:{bridge.config.port}/media?path={encoded_path}&token={token}"
+
+    @staticmethod
+    def _extract_browser_bridge_content(content: Any) -> str:
+        """Flatten message content from either plain strings or rich content blocks."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                        continue
+                    if "content" in item and isinstance(item["content"], str):
+                        parts.append(item["content"])
+            return "\n".join(part for part in parts if part).strip()
+        if isinstance(content, dict):
+            text = content.get("text") or content.get("content")
+            if isinstance(text, str):
+                return text
+        return str(content or "").strip()
+
+    @staticmethod
+    def _extract_browser_bridge_label(message: str, prefix: str) -> str:
+        for line in str(message or "").splitlines():
+            if line.startswith(prefix):
+                return line[len(prefix):].strip()
+        return ""
+
+    @staticmethod
+    def _extract_youtube_video_id(url_or_id: str) -> str:
+        value = str(url_or_id or "").strip()
+        if not value:
+            return ""
+
+        patterns = (
+            r"(?:v=|youtu\.be/|shorts/|embed/|live/)([a-zA-Z0-9_-]{11})",
+            r"^([a-zA-Z0-9_-]{11})$",
+        )
+
+        pending = [value]
+        seen = set()
+
+        while pending:
+            candidate = str(pending.pop(0) or "").strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+
+            for pattern in patterns:
+                match = re.search(pattern, candidate)
+                if match:
+                    return match.group(1)
+
+            parsed = urlparse(candidate)
+            host = parsed.netloc.lower()
+            if not host:
+                continue
+
+            query = parse_qs(parsed.query or "", keep_blank_values=False)
+            pending.extend(query.get("v", []))
+
+            path_parts = [part for part in parsed.path.split("/") if part]
+            if "youtu.be" in host and path_parts:
+                pending.append(path_parts[0])
+            if (
+                ("youtube.com" in host or "youtube-nocookie.com" in host)
+                and len(path_parts) >= 2
+                and path_parts[0] in {"embed", "shorts", "live"}
+            ):
+                pending.append(path_parts[1])
+
+        return ""
+
+    @staticmethod
+    def _run_gateway_python_install_command(args: List[str], timeout: int = 120) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+
+    @classmethod
+    def _ensure_gateway_python_package(
+        cls,
+        *,
+        import_name: str,
+        package_spec: str,
+    ) -> None:
+        try:
+            __import__(import_name)
+            return
+        except Exception:
+            pass
+
+        uv_exe = shutil.which("uv")
+        if uv_exe:
+            install = subprocess.run(
+                [
+                    uv_exe,
+                    "pip",
+                    "install",
+                    "--python",
+                    sys.executable,
+                    package_spec,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
+            if install.returncode != 0:
+                details = (install.stderr or install.stdout or "").strip()
+                raise ValueError(
+                    f"Failed to install {package_spec} in the Hermes gateway environment with uv pip."
+                    + (f" Details: {details}" if details else "")
+                )
+        else:
+            pip_probe = cls._run_gateway_python_install_command(["-m", "pip", "--version"], timeout=30)
+            if pip_probe.returncode != 0:
+                ensurepip = cls._run_gateway_python_install_command(["-m", "ensurepip", "--upgrade"], timeout=180)
+                if ensurepip.returncode != 0:
+                    details = (ensurepip.stderr or ensurepip.stdout or "").strip()
+                    raise ValueError(
+                        f"Failed to bootstrap pip in the Hermes gateway environment."
+                        + (f" Details: {details}" if details else "")
+                    )
+
+            install = cls._run_gateway_python_install_command(
+                [
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    package_spec,
+                ],
+                timeout=180,
+            )
+            if install.returncode != 0:
+                details = (install.stderr or install.stdout or "").strip()
+                raise ValueError(
+                    f"Failed to install {package_spec} in the Hermes gateway environment."
+                    + (f" Details: {details}" if details else "")
+                )
+
+        try:
+            __import__(import_name)
+        except Exception as exc:
+            raise ValueError(
+                f"{package_spec} install completed but import still failed."
+            ) from exc
+
+    @classmethod
+    def _fetch_bridge_youtube_transcript(
+        cls,
+        url_or_id: str,
+        language: str = "",
+    ) -> Dict[str, Any]:
+        """Fetch transcript text for browser bridge sidebar previews."""
+        video_id = cls._extract_youtube_video_id(url_or_id)
+        if not video_id:
+            raise ValueError("A YouTube URL or video ID is required.")
+
+        def _load_transcript_api():
+            from youtube_transcript_api import YouTubeTranscriptApi
+
+            return YouTubeTranscriptApi
+
+        def _clean_language(value: str) -> str:
+            return str(value or "").strip().replace("_", "-")
+
+        def _build_language_preferences(requested_language: str, available_codes: List[str]) -> List[str]:
+            requested = _clean_language(requested_language)
+            lowered_available = {
+                _clean_language(code).lower(): _clean_language(code)
+                for code in available_codes
+                if code
+            }
+            preferred: List[str] = []
+
+            def _append(code: str) -> None:
+                cleaned = _clean_language(code)
+                if not cleaned:
+                    return
+                for existing in preferred:
+                    if existing.lower() == cleaned.lower():
+                        return
+                preferred.append(cleaned)
+
+            if requested:
+                base = requested.split("-", 1)[0].lower()
+                if base == "en":
+                    _append("en")
+                    if "en-us" in lowered_available:
+                        _append(lowered_available["en-us"])
+                    elif requested.lower() == "en-us":
+                        _append("en-US")
+                    for code in available_codes:
+                        cleaned = _clean_language(code)
+                        if cleaned.lower().split("-", 1)[0] == "en":
+                            _append(cleaned)
+                    if requested.lower() != "en":
+                        _append(requested)
+                else:
+                    _append(requested)
+                    for code in available_codes:
+                        cleaned = _clean_language(code)
+                        if cleaned.lower() == requested.lower():
+                            _append(cleaned)
+                    for code in available_codes:
+                        cleaned = _clean_language(code)
+                        if cleaned.lower().split("-", 1)[0] == base:
+                            _append(cleaned)
+            else:
+                if "en" in lowered_available:
+                    _append(lowered_available["en"])
+                if "en-us" in lowered_available:
+                    _append(lowered_available["en-us"])
+                for code in available_codes:
+                    cleaned = _clean_language(code)
+                    if cleaned.lower().split("-", 1)[0] == "en":
+                        _append(cleaned)
+                for code in available_codes:
+                    _append(code)
+
+            return preferred
+
+        def _extract_segments(fetched: Any) -> List[str]:
+            segments: List[str] = []
+            for segment in fetched:
+                if isinstance(segment, dict):
+                    text = str(segment.get("text") or "").strip()
+                else:
+                    text = str(getattr(segment, "text", "") or "").strip()
+                if text:
+                    segments.append(text)
+            return segments
+
+        try:
+            YouTubeTranscriptApi = _load_transcript_api()
+        except Exception:
+            cls._ensure_gateway_python_package(
+                import_name="youtube_transcript_api",
+                package_spec="youtube-transcript-api>=1.2.0",
+            )
+            try:
+                YouTubeTranscriptApi = _load_transcript_api()
+            except Exception as exc:
+                raise ValueError(
+                    "youtube-transcript-api install completed but import still failed."
+                ) from exc
+
+        requested_language = _clean_language(language)
+        api = YouTubeTranscriptApi()
+        try:
+            transcript_list = api.list(video_id) if hasattr(api, "list") else None
+            available_codes: List[str] = []
+            if transcript_list is not None:
+                try:
+                    available_codes = [
+                        str(getattr(transcript, "language_code", "") or "").strip()
+                        for transcript in list(transcript_list)
+                        if str(getattr(transcript, "language_code", "") or "").strip()
+                    ]
+                except Exception:
+                    available_codes = []
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            raise BrowserBridgeTranscriptUnavailable(
+                message,
+                video_id=video_id,
+                requested_language=requested_language,
+                available_languages=[],
+            ) from exc
+
+        languages = _build_language_preferences(requested_language, available_codes)
+        matched_language = ""
+
+        try:
+            if transcript_list is not None:
+                lookup_languages = languages or available_codes
+                chosen_transcript = transcript_list.find_transcript(lookup_languages)
+                matched_language = str(getattr(chosen_transcript, "language_code", "") or "").strip()
+                segments = _extract_segments(chosen_transcript.fetch())
+            elif hasattr(api, "fetch"):
+                kwargs = {"languages": languages} if languages else {}
+                segments = _extract_segments(api.fetch(video_id, **kwargs))
+            else:
+                raw_segments = (
+                    YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
+                    if languages
+                    else YouTubeTranscriptApi.get_transcript(video_id)
+                )
+                segments = [
+                    str(segment.get("text") or "").strip()
+                    for segment in raw_segments
+                    if isinstance(segment, dict) and str(segment.get("text") or "").strip()
+                ]
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            raise BrowserBridgeTranscriptUnavailable(
+                message,
+                video_id=video_id,
+                requested_language=requested_language,
+                available_languages=available_codes,
+            ) from exc
+
+        full_text = " ".join(segments).strip()
+        resolved_language = (
+            matched_language
+            or (languages[0] if languages else (available_codes[0] if available_codes else requested_language))
+        )
+        return {
+            "video_id": video_id,
+            "language": resolved_language,
+            "segment_count": len(segments),
+            "transcript_text": full_text,
+            "char_count": len(full_text),
+        }
+
+    def _serialize_browser_bridge_history(
+        self,
+        history: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Convert transcript messages to sidepanel-friendly message entries."""
+        result: List[Dict[str, Any]] = []
+        for message in history:
+            role = str(message.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = self._extract_browser_bridge_content(message.get("content"))
+            if not content.strip():
+                continue
+
+            media_paths = re.findall(r"MEDIA:(\S+)", content)
+            cleaned_content = re.sub(r"\n?MEDIA:\S+\s*", "\n", content).strip()
+            images = []
+            for raw_path in media_paths:
+                media_url = self._build_browser_bridge_media_url(raw_path.strip().rstrip('",}'))
+                if not media_url:
+                    continue
+                images.append(
+                    {
+                        "source": "local",
+                        "media_url": media_url,
+                        "mime_type": mimetypes.guess_type(raw_path)[0] or "image/png",
+                        "alt_text": Path(raw_path).name,
+                        "local_path": raw_path,
+                    }
+                )
+
+            kind = "chat"
+            page_title = ""
+            page_url = ""
+            display_content = cleaned_content
+            if role == "user" and content.startswith("[Injected browser context from the local Chrome extension]"):
+                kind = "page_context"
+                page_title = self._extract_browser_bridge_label(content, "- Title:")
+                page_url = self._extract_browser_bridge_label(content, "- URL:")
+                if "User request:" in content:
+                    request_chunk = content.split("User request:", 1)[1].strip()
+                    display_content = request_chunk.split("\n\n", 1)[0].strip()
+                if not display_content:
+                    display_content = "Shared browser page context."
+
+            timestamp = message.get("timestamp")
+            if isinstance(timestamp, (int, float)):
+                timestamp_iso = datetime.fromtimestamp(timestamp).isoformat()
+            else:
+                timestamp_iso = str(timestamp or "").strip()
+
+            result.append(
+                {
+                    "role": role,
+                    "kind": kind,
+                    "display_content": display_content,
+                    "content": cleaned_content,
+                    "page_title": page_title,
+                    "page_url": page_url,
+                    "images": images,
+                    "timestamp": timestamp_iso,
+                }
+            )
+        return result
+
+    def _get_browser_bridge_session_snapshot(self, source: SessionSource) -> Dict[str, Any]:
+        """Load current browser sidecar session state for extension polling."""
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+        progress = self._get_browser_bridge_progress_snapshot(session_entry.session_key)
+        return {
+            "session_key": session_entry.session_key,
+            "session_id": session_entry.session_id,
+            "browser_label": source.chat_name or source.user_name or "Chrome Extension",
+            "messages": self._serialize_browser_bridge_history(history),
+            "progress": progress,
+            # Browser sidecar sessions remain locally controllable while running:
+            # send is still blocked by busy-state in the sidepanel, but interrupt
+            # should stay available instead of downgrading the session to read-only.
+            "can_send": True,
+        }
+
+    def _list_browser_bridge_sessions(
+        self,
+        *,
+        limit: int = 25,
+        preferred_session_key: str = "",
+    ) -> Dict[str, Any]:
+        """Return sidecar session list for the extension history picker."""
+        self.session_store._ensure_loaded()
+        entries = [
+            entry
+            for entry in self.session_store._entries.values()
+            if self._is_browser_bridge_source(entry.origin)
+        ]
+        entries.sort(key=lambda item: item.updated_at, reverse=True)
+        sessions = []
+        for entry in entries[: max(1, min(limit, 100))]:
+            history = self.session_store.load_transcript(entry.session_id)
+            rich = self._serialize_browser_bridge_history(history)
+            last_message = rich[-1] if rich else {}
+            progress = self._get_browser_bridge_progress_snapshot(entry.session_key)
+            sessions.append(
+                {
+                    "session_key": entry.session_key,
+                    "session_id": entry.session_id,
+                    "browser_label": (entry.origin.chat_name or entry.origin.user_name or "Chrome Extension")
+                    if entry.origin
+                    else "Chrome Extension",
+                    "updated_at": entry.updated_at.isoformat() if entry.updated_at else "",
+                    "created_at": entry.created_at.isoformat() if entry.created_at else "",
+                    "message_count": len(rich),
+                    "last_message_role": last_message.get("role") or "",
+                    "last_message_preview": (last_message.get("display_content") or "")[:140],
+                    "running": bool(progress.get("running")),
+                }
+            )
+
+        active_session_key = str(preferred_session_key or "").strip()
+        if active_session_key and not any(s["session_key"] == active_session_key for s in sessions):
+            active_session_key = ""
+        if not active_session_key and sessions:
+            active_session_key = sessions[0]["session_key"]
+
+        return {
+            "active_session_key": active_session_key,
+            "sessions": sessions,
+        }
+
+    def _get_active_session_entry_by_session_id(self, session_id: str) -> Optional[SessionEntry]:
+        self.session_store._ensure_loaded()
+        normalized_session_id = str(session_id or "").strip()
+        if not normalized_session_id:
+            return None
+        for entry in self.session_store._entries.values():
+            if entry.session_id == normalized_session_id:
+                return entry
+        return None
+
+    def _get_active_session_entry_by_key_or_session_id(
+        self,
+        session_ref: str,
+    ) -> Optional[SessionEntry]:
+        self.session_store._ensure_loaded()
+        normalized_session_ref = str(session_ref or "").strip()
+        if not normalized_session_ref:
+            return None
+
+        active_entry = self.session_store._entries.get(normalized_session_ref)
+        if active_entry:
+            return active_entry
+
+        return self._get_active_session_entry_by_session_id(normalized_session_ref)
+
+    @staticmethod
+    def _empty_sidebar_session_snapshot() -> Dict[str, Any]:
+        return {
+            "session_key": "",
+            "session_id": "",
+            "messages": [],
+            "progress": {},
+            "running": False,
+            "browser_label": "",
+            "source": "",
+            "is_browser_session": False,
+            "can_send": False,
+        }
+
+    @staticmethod
+    def _format_sidebar_source_label(source_name: str) -> str:
+        value = str(source_name or "").strip().lower()
+        if value == "cli":
+            return "CLI terminal"
+        if value == "local":
+            return "Local session"
+        if not value:
+            return "Hermes session"
+        return value.replace("_", " ").title()
+
+    def _format_sidebar_session_label(
+        self,
+        *,
+        session_entry: Optional[SessionEntry] = None,
+        session_record: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if session_entry and session_entry.origin:
+            source = session_entry.origin
+            if self._is_browser_bridge_source(source):
+                return source.chat_name or source.user_name or session_entry.display_name or "Browser Sidecar"
+            if source.platform == Platform.LOCAL and str(source.chat_id or "") == "cli":
+                return session_entry.display_name or "CLI terminal"
+
+            platform_label = self._format_sidebar_source_label(source.platform.value)
+            target_label = (
+                source.chat_name
+                or source.user_name
+                or session_entry.display_name
+                or source.chat_id
+                or ""
+            )
+            if target_label and target_label != platform_label:
+                return f"{platform_label}: {target_label}"
+            return platform_label
+
+        session_record = session_record or {}
+        return self._format_sidebar_source_label(session_record.get("source") or "")
+
+    def _list_sidebar_sessions(self, *, limit: int = 20) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 100))
+        db = self.session_store._db
+        if not db:
+            return self._list_browser_bridge_sessions(limit=limit).get("sessions", [])
+
+        session_rows = db.search_sessions(limit=limit)
+        sessions: List[Dict[str, Any]] = []
+        for row in session_rows:
+            session_id = str(row.get("id") or "").strip()
+            if not session_id:
+                continue
+
+            active_entry = self._get_active_session_entry_by_session_id(session_id)
+            active_origin = active_entry.origin if active_entry else None
+            is_browser_session = bool(active_origin and self._is_browser_bridge_source(active_origin))
+            progress = (
+                self._get_browser_bridge_progress_snapshot(active_entry.session_key)
+                if active_entry and is_browser_session
+                else {}
+            )
+            updated_at = (
+                active_entry.updated_at.isoformat()
+                if active_entry and active_entry.updated_at
+                else datetime.fromtimestamp(float(row.get("started_at") or 0)).isoformat()
+                if row.get("started_at")
+                else ""
+            )
+
+            sessions.append(
+                {
+                    "session_key": active_entry.session_key if active_entry else session_id,
+                    "session_id": session_id,
+                    "browser_label": self._format_sidebar_session_label(
+                        session_entry=active_entry,
+                        session_record=row,
+                    ),
+                    "source": str(row.get("source") or ""),
+                    "updated_at": updated_at,
+                    "created_at": updated_at,
+                    "message_count": int(row.get("message_count") or 0),
+                    "last_message_role": "",
+                    "last_message_preview": "",
+                    "running": bool(progress.get("running")),
+                    "is_browser_session": is_browser_session,
+                    "can_send": is_browser_session,
+                }
+            )
+
+        return sessions
+
+    def _get_sidebar_session_snapshot(self, session_ref: str) -> Dict[str, Any]:
+        normalized_session_ref = str(session_ref or "").strip()
+        if not normalized_session_ref:
+            return self._empty_sidebar_session_snapshot()
+
+        active_entry = self._get_active_session_entry_by_key_or_session_id(normalized_session_ref)
+        resolved_session_id = active_entry.session_id if active_entry else normalized_session_ref
+        session_record = self.session_store._db.get_session(resolved_session_id) if self.session_store._db else None
+        if not active_entry and not session_record:
+            raise ValueError("Unknown Hermes session.")
+
+        history = self.session_store.load_transcript(resolved_session_id)
+        is_browser_session = bool(active_entry and active_entry.origin and self._is_browser_bridge_source(active_entry.origin))
+        progress = (
+            self._get_browser_bridge_progress_snapshot(active_entry.session_key)
+            if active_entry and is_browser_session
+            else {}
+        )
+        source_name = ""
+        if active_entry and active_entry.platform:
+            source_name = active_entry.platform.value
+        elif session_record:
+            source_name = str(session_record.get("source") or "")
+
+        return {
+            "session_key": active_entry.session_key if active_entry else resolved_session_id,
+            "session_id": resolved_session_id,
+            "messages": self._serialize_browser_bridge_history(history),
+            "progress": progress,
+            "running": bool(progress.get("running")),
+            "browser_label": self._format_sidebar_session_label(
+                session_entry=active_entry,
+                session_record=session_record or {},
+            ),
+            "source": source_name,
+            "is_browser_session": is_browser_session,
+            "can_send": is_browser_session,
+        }
+
+    @staticmethod
+    def _serialize_browser_bridge_timestamp(value: Any) -> str:
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(value).isoformat()
+            except Exception:
+                return ""
+        return str(value or "").strip()
+
+    def _serialize_browser_bridge_transcript(
+        self,
+        history: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        for index, message in enumerate(history, start=1):
+            if isinstance(message, dict):
+                raw_message: Any = message
+                tool_calls = message.get("tool_calls")
+                if not isinstance(tool_calls, list):
+                    tool_calls = []
+                result.append(
+                    {
+                        "index": index,
+                        "role": str(message.get("role") or "").strip(),
+                        "timestamp": self._serialize_browser_bridge_timestamp(message.get("timestamp")),
+                        "content_text": self._extract_browser_bridge_content(message.get("content")),
+                        "tool_name": str(message.get("tool_name") or "").strip(),
+                        "tool_call_count": len(tool_calls),
+                        "raw": raw_message,
+                    }
+                )
+                continue
+
+            result.append(
+                {
+                    "index": index,
+                    "role": "",
+                    "timestamp": "",
+                    "content_text": self._extract_browser_bridge_content(message),
+                    "tool_name": "",
+                    "tool_call_count": 0,
+                    "raw": message,
+                }
+            )
+        return result
+
+    def _load_browser_bridge_session_log(self, session_id: str) -> Dict[str, Any]:
+        normalized_session_id = str(session_id or "").strip()
+        path = _hermes_home / "sessions" / f"session_{normalized_session_id}.json"
+        result = {
+            "path": str(path),
+            "exists": path.exists(),
+            "data": None,
+            "error": "",
+        }
+        if not normalized_session_id or not path.exists():
+            return result
+        try:
+            result["data"] = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            result["error"] = str(exc)
+        return result
+
+    @staticmethod
+    def _extract_session_log_tool_name(tool_call: Any) -> str:
+        if not isinstance(tool_call, dict):
+            return ""
+        function_info = tool_call.get("function")
+        if isinstance(function_info, dict):
+            name = str(function_info.get("name") or "").strip()
+            if name:
+                return name
+        return str(tool_call.get("name") or "").strip()
+
+    @staticmethod
+    def _deep_merge_browser_bridge_config(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+        for key, value in patch.items():
+            if isinstance(base.get(key), dict) and isinstance(value, dict):
+                GatewayRunner._deep_merge_browser_bridge_config(base[key], value)
+            else:
+                base[key] = value
+        return base
+
+    @staticmethod
+    def _safe_json_loads(value: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            return value
+        text = str(value or "").strip()
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except Exception:
+            return {}
+
+    def _build_delegate_branch_summary(self, audit_events: List[Dict[str, Any]]) -> Dict[str, Any]:
+        calls: List[Dict[str, Any]] = []
+        graph_nodes: List[Dict[str, Any]] = [
+            {"id": "root", "label": "Hermes session", "kind": "root", "status": "ok"}
+        ]
+        graph_edges: List[Dict[str, Any]] = []
+
+        delegate_events = [
+            event for event in (audit_events or [])
+            if event.get("kind") == "tool_finish" and event.get("tool_name") == "delegate_task"
+        ]
+        for index, event in enumerate(delegate_events, start=1):
+            parsed = self._safe_json_loads((event.get("payload") or {}).get("result"))
+            tasks = parsed.get("results") if isinstance(parsed, dict) else []
+            if not isinstance(tasks, list):
+                tasks = []
+            call_id = f"delegate-{index}"
+            call_status = "error" if event.get("is_error") else "ok"
+            call_summary = {
+                "id": call_id,
+                "status": call_status,
+                "duration_ms": int(event.get("duration_ms") or 0),
+                "started_at": event.get("ts"),
+                "branch_count": len(tasks),
+                "ok_count": sum(1 for task in tasks if str(task.get("status") or "").strip().lower() == "completed"),
+                "error_count": sum(1 for task in tasks if str(task.get("status") or "").strip().lower() not in {"", "completed"}),
+                "tasks": [],
+            }
+            graph_nodes.append({
+                "id": call_id,
+                "label": f"delegate_task #{index}",
+                "kind": "delegate_call",
+                "status": call_status,
+                "duration_ms": call_summary["duration_ms"],
+            })
+            graph_edges.append({"from": "root", "to": call_id})
+
+            for task_index, task in enumerate(tasks, start=1):
+                task_status = str(task.get("status") or "unknown").strip().lower() or "unknown"
+                summary = str(task.get("summary") or task.get("error") or "").strip()
+                label = summary[:96] if summary else f"Branch {task_index}"
+                node_id = f"{call_id}-task-{task_index}"
+                call_summary["tasks"].append({
+                    "task_index": int(task.get("task_index") or task_index - 1),
+                    "status": task_status,
+                    "duration_seconds": float(task.get("duration_seconds") or 0),
+                    "summary": summary,
+                    "error": str(task.get("error") or "").strip(),
+                })
+                graph_nodes.append({
+                    "id": node_id,
+                    "label": label,
+                    "kind": "delegate_branch",
+                    "status": task_status,
+                    "duration_seconds": float(task.get("duration_seconds") or 0),
+                })
+                graph_edges.append({"from": call_id, "to": node_id})
+            calls.append(call_summary)
+
+        return {
+            "total_delegate_calls": len(calls),
+            "total_branches": sum(call["branch_count"] for call in calls),
+            "calls": calls,
+            "graph": {"nodes": graph_nodes, "edges": graph_edges},
+        }
+
+    def _build_tool_benchmark_summary(
+        self,
+        audit_events: List[Dict[str, Any]],
+        audit_metrics: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        tool_finish = [
+            event for event in (audit_events or [])
+            if event.get("kind") == "tool_finish"
+        ]
+        tool_stats: Dict[str, Dict[str, Any]] = {}
+        for event in tool_finish:
+            tool_name = str(event.get("tool_name") or "tool").strip() or "tool"
+            entry = tool_stats.setdefault(
+                tool_name,
+                {
+                    "tool_name": tool_name,
+                    "count": 0,
+                    "error_count": 0,
+                    "total_duration_ms": 0,
+                    "max_duration_ms": 0,
+                },
+            )
+            entry["count"] += 1
+            if event.get("is_error"):
+                entry["error_count"] += 1
+            duration_ms = int(event.get("duration_ms") or 0)
+            entry["total_duration_ms"] += duration_ms
+            entry["max_duration_ms"] = max(entry["max_duration_ms"], duration_ms)
+
+        tools = []
+        for entry in tool_stats.values():
+            count = int(entry["count"] or 0)
+            error_count = int(entry["error_count"] or 0)
+            total_duration_ms = int(entry["total_duration_ms"] or 0)
+            tools.append({
+                **entry,
+                "avg_duration_ms": int(total_duration_ms / count) if count else 0,
+                "error_rate": round(error_count / count, 3) if count else 0.0,
+            })
+        tools.sort(key=lambda item: (item["avg_duration_ms"], item["count"], item["max_duration_ms"]), reverse=True)
+
+        return {
+            "runtime_ms": audit_metrics.get("runtime_ms"),
+            "error_count": audit_metrics.get("error_count", 0),
+            "tool_count": audit_metrics.get("tool_count", 0),
+            "message_count": audit_metrics.get("message_count", 0),
+            "slowest_tools": audit_metrics.get("slowest_tools", []),
+            "tools": tools,
+        }
+
+    def _build_runtime_config_snapshot(self, selected_provider: str = "") -> Dict[str, Any]:
+        from hermes_cli.auth import PROVIDER_REGISTRY, get_auth_status
+        from hermes_cli.config import get_env_value, load_config
+        from hermes_cli.models import curated_models_for_provider, list_available_providers
+
+        config = load_config()
+        model_cfg = config.get("model")
+        if isinstance(model_cfg, str):
+            model_settings = {
+                "default": model_cfg.strip(),
+                "provider": "auto",
+                "base_url": "",
+                "api_mode": "",
+            }
+        elif isinstance(model_cfg, dict):
+            model_settings = {
+                "default": str(model_cfg.get("default") or "").strip(),
+                "provider": str(model_cfg.get("provider") or "auto").strip() or "auto",
+                "base_url": str(model_cfg.get("base_url") or "").strip(),
+                "api_mode": str(model_cfg.get("api_mode") or "").strip(),
+            }
+        else:
+            model_settings = {"default": "", "provider": "auto", "base_url": "", "api_mode": ""}
+
+        selected_provider_id = str(selected_provider or model_settings.get("provider") or "openrouter").strip() or "openrouter"
+        providers: List[Dict[str, Any]] = []
+        for provider in list_available_providers():
+            provider_id = str(provider.get("id") or "").strip()
+            pconfig = PROVIDER_REGISTRY.get(provider_id)
+            status = get_auth_status(provider_id)
+            base_url_env_var = str(getattr(pconfig, "base_url_env_var", "") or "").strip()
+            providers.append({
+                **provider,
+                "auth_type": str(getattr(pconfig, "auth_type", "") or "").strip(),
+                "api_key_env_vars": list(getattr(pconfig, "api_key_env_vars", ()) or ()),
+                "base_url_env_var": base_url_env_var,
+                "base_url_value": get_env_value(base_url_env_var) if base_url_env_var else "",
+                "status": status,
+            })
+
+        provider_models = curated_models_for_provider(selected_provider_id if selected_provider_id != "auto" else "openrouter")
+        terminal_settings = dict(config.get("terminal") or {})
+        env_windows_shell = str(os.getenv("HERMES_WINDOWS_SHELL") or "").strip()
+        if env_windows_shell:
+            terminal_settings["windows_shell"] = env_windows_shell
+        config_path = _hermes_home / "config.yaml"
+        env_path = _hermes_home / ".env"
+        config_text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+
+        return {
+            "config": {
+                "model": model_settings,
+                "control_room": dict(config.get("control_room") or {}),
+                "terminal": terminal_settings,
+                "web": dict(config.get("web") or {}),
+                "tts": dict(config.get("tts") or {}),
+                "stt": dict(config.get("stt") or {}),
+                "delegation": dict(config.get("delegation") or {}),
+            },
+            "providers": providers,
+            "provider_models": [
+                {"id": model_id, "description": description}
+                for model_id, description in provider_models
+            ],
+            "catalog": {
+                "tts_providers": ["edge", "elevenlabs", "openai", "kokoro", "neutts", "f5"],
+                "stt_providers": ["local", "groq", "openai"],
+                "date_awareness_modes": [
+                    {"id": "smart", "label": "Smart date grounding"},
+                    {"id": "off", "label": "Literal dates only"},
+                ],
+            },
+            "paths": {
+                "config_path": str(config_path),
+                "env_path": str(env_path),
+            },
+            "raw_config_text": config_text,
+        }
+
+    def _save_runtime_config_snapshot(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from hermes_cli.config import load_config, save_config, save_env_value, save_env_value_secure
+        from tools.environments.shell_utils import normalize_windows_shell_override
+
+        config = load_config()
+        config_patch = payload.get("config_patch")
+        if isinstance(config_patch, dict):
+            self._deep_merge_browser_bridge_config(config, config_patch)
+            save_config(config)
+            terminal_patch = config_patch.get("terminal")
+            if isinstance(terminal_patch, dict) and "windows_shell" in terminal_patch:
+                os.environ["HERMES_WINDOWS_SHELL"] = normalize_windows_shell_override(
+                    str(terminal_patch.get("windows_shell") or "auto")
+                )
+
+        env_updates = payload.get("env_updates")
+        if isinstance(env_updates, dict):
+            for key, raw_value in env_updates.items():
+                env_key = str(key or "").strip()
+                if not env_key:
+                    continue
+                value = str(raw_value or "")
+                if any(token in env_key.upper() for token in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+                    save_env_value_secure(env_key, value)
+                else:
+                    save_env_value(env_key, value)
+
+        selected_provider = str(payload.get("selected_provider") or "").strip()
+        return self._build_runtime_config_snapshot(selected_provider=selected_provider)
+
+    def _build_sidebar_session_inspection(self, session_ref: str) -> Dict[str, Any]:
+        snapshot = self._get_sidebar_session_snapshot(session_ref)
+        resolved_session_id = str(snapshot.get("session_id") or "").strip()
+        resolved_session_key = str(snapshot.get("session_key") or resolved_session_id).strip()
+        active_entry = self._get_active_session_entry_by_key_or_session_id(resolved_session_key)
+        if not active_entry and resolved_session_id:
+            active_entry = self._get_active_session_entry_by_key_or_session_id(resolved_session_id)
+        session_record = self.session_store._db.get_session(resolved_session_id) if self.session_store._db else None
+        history = self.session_store.load_transcript(resolved_session_id)
+        transcript = self._serialize_browser_bridge_transcript(history)
+        session_log_snapshot = self._load_browser_bridge_session_log(resolved_session_id)
+        session_log = session_log_snapshot.get("data") if isinstance(session_log_snapshot.get("data"), dict) else None
+        raw_messages = session_log.get("messages") if isinstance(session_log, dict) else None
+        if not isinstance(raw_messages, list):
+            raw_messages = []
+
+        role_counts: Dict[str, int] = {}
+        tool_names: List[str] = []
+        configured_tools: List[str] = []
+        tool_call_count = 0
+        tool_result_count = 0
+        reasoning_message_count = 0
+
+        for message in raw_messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip()
+            if role:
+                role_counts[role] = role_counts.get(role, 0) + 1
+            if role == "tool":
+                tool_result_count += 1
+            if message.get("reasoning"):
+                reasoning_message_count += 1
+            tool_name = str(message.get("tool_name") or "").strip()
+            if tool_name and tool_name not in tool_names:
+                tool_names.append(tool_name)
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                tool_calls = []
+            tool_call_count += len(tool_calls)
+            for tool_call in tool_calls:
+                call_name = self._extract_session_log_tool_name(tool_call)
+                if call_name and call_name not in tool_names:
+                    tool_names.append(call_name)
+
+        raw_configured_tools = session_log.get("tools") if isinstance(session_log, dict) else None
+        if isinstance(raw_configured_tools, list):
+            for item in raw_configured_tools:
+                if not isinstance(item, dict):
+                    continue
+                name = self._extract_session_log_tool_name(item)
+                if name and name not in configured_tools:
+                    configured_tools.append(name)
+
+        source_details: Dict[str, Any] = {}
+        if active_entry and active_entry.origin:
+            source_details = {
+                "platform": active_entry.origin.platform.value,
+                "chat_id": str(active_entry.origin.chat_id or ""),
+                "chat_name": str(active_entry.origin.chat_name or ""),
+                "user_id": str(active_entry.origin.user_id or ""),
+                "user_name": str(active_entry.origin.user_name or ""),
+                "session_key": active_entry.session_key,
+            }
+        elif session_record:
+            source_details = {
+                "platform": str(session_record.get("source") or ""),
+                "session_key": resolved_session_key,
+            }
+
+        progress = snapshot.get("progress") if isinstance(snapshot.get("progress"), dict) else {}
+        activity_log = progress.get("activity_log") if isinstance(progress, dict) else None
+        if not isinstance(activity_log, list):
+            activity_log = []
+        audit_events: List[Dict[str, Any]] = []
+        audit_metrics: Dict[str, Any] = {}
+        if self.session_store._db and resolved_session_id:
+            try:
+                audit_events = self.session_store._db.get_audit_events(resolved_session_id, limit=500)
+                audit_metrics = self.session_store._db.get_session_metrics(resolved_session_id)
+            except Exception:
+                audit_events = []
+                audit_metrics = {}
+        delegate_summary = self._build_delegate_branch_summary(audit_events)
+        benchmark_summary = self._build_tool_benchmark_summary(audit_events, audit_metrics)
+
+        return {
+            **snapshot,
+            "inspect_generated_at": datetime.now().isoformat(),
+            "transcript": transcript,
+            "session_log": session_log,
+            "session_log_available": bool(session_log),
+            "session_log_exists": bool(session_log_snapshot.get("exists")),
+            "session_log_error": str(session_log_snapshot.get("error") or "").strip(),
+            "configured_tools": configured_tools,
+            "source_details": source_details,
+            "session_record": session_record or {},
+            "audit_events": audit_events,
+            "audit_metrics": audit_metrics,
+            "delegate_summary": delegate_summary,
+            "benchmark_summary": benchmark_summary,
+            "paths": {
+                "hermes_home": str(_hermes_home),
+                "config_path": str(_hermes_home / "config.yaml"),
+                "logs_dir": str(_hermes_home / "logs"),
+                "sessions_dir": str(_hermes_home / "sessions"),
+                "session_log_path": str(session_log_snapshot.get("path") or ""),
+            },
+            "stats": {
+                "visible_message_count": len(snapshot.get("messages") or []),
+                "transcript_message_count": len(transcript),
+                "raw_message_count": len(raw_messages),
+                "activity_event_count": len(activity_log),
+                "system_prompt_chars": len(str(session_log.get("system_prompt") or "")) if session_log else 0,
+                "configured_tool_count": len(configured_tools),
+                "tool_call_count": tool_call_count,
+                "tool_result_count": tool_result_count,
+                "reasoning_message_count": reasoning_message_count,
+                "audit_event_count": len(audit_events),
+                "delegate_call_count": delegate_summary.get("total_delegate_calls", 0),
+                "delegate_branch_count": delegate_summary.get("total_branches", 0),
+                "roles": role_counts,
+                "tool_names": tool_names,
+                "elapsed_seconds": int(progress.get("elapsed_seconds") or 0),
+                "last_updated": str(session_log.get("last_updated") or "").strip() if session_log else "",
+            },
+        }
+
+    def _resolve_sidebar_active_session_key(
+        self,
+        *,
+        browser_label: str,
+        client_session_id: str = "",
+        session_key: str = "",
+    ) -> str:
+        normalized_session_key = str(session_key or "").strip()
+        if normalized_session_key:
+            try:
+                snapshot = self._get_sidebar_session_snapshot(normalized_session_key)
+                resolved = str(snapshot.get("session_key") or "").strip()
+                if resolved:
+                    return resolved
+            except ValueError:
+                pass
+
+        try:
+            source = self._build_browser_bridge_source(browser_label, client_session_id)
+            session_entry = self.session_store.get_or_create_session(source)
+            return session_entry.session_key
+        except Exception:
+            return ""
+
+    def _extract_browser_bridge_image_attachments(
+        self,
+        payload: Dict[str, Any],
+    ) -> tuple[List[str], List[str]]:
+        """Decode sidepanel image attachments to local files for vision-capable turns."""
+        attachments = payload.get("attachments")
+        if not isinstance(attachments, list):
+            return [], []
+
+        target_dir = _hermes_home / "browser_bridge_uploads"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        for item in attachments:
+            if not isinstance(item, dict):
+                continue
+            data_url = str(item.get("data_url") or "").strip()
+            if not data_url:
+                continue
+            mime_type = str(item.get("mime_type") or "image/png").strip().lower()
+            if not mime_type.startswith("image/"):
+                continue
+            try:
+                if data_url.startswith("data:"):
+                    if "," not in data_url:
+                        continue
+                    _, encoded = data_url.split(",", 1)
+                else:
+                    encoded = data_url
+                raw_bytes = base64.b64decode(encoded, validate=False)
+            except Exception:
+                continue
+            ext = mimetypes.guess_extension(mime_type) or ".png"
+            filename = f"sidecar_{uuid.uuid4().hex[:12]}{ext}"
+            out_path = target_dir / filename
+            try:
+                out_path.write_bytes(raw_bytes)
+            except Exception:
+                continue
+            media_urls.append(str(out_path))
+            media_types.append("photo")
+        return media_urls, media_types
+
+    async def _handle_browser_bridge_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        route = str(payload.get("_bridge_route") or "").strip()
+        if route == "/session":
+            return await self._handle_browser_bridge_session(payload)
+        return await self._handle_browser_bridge_payload(payload)
+
+    async def _handle_browser_bridge_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        source = self._build_browser_bridge_source(
+            str(payload.get("browserLabel") or "").strip() or "Chrome Extension",
+            str(payload.get("clientSessionId") or "").strip(),
+        )
+        message = build_browser_context_message(payload)
+        event = MessageEvent(text=message, source=source, message_type=MessageType.TEXT)
+        await self._handle_message(event)
+        snapshot = self._get_browser_bridge_session_snapshot(source)
+        snapshot["accepted"] = True
+        snapshot["detail"] = "Page context queued."
+        return snapshot
+
+    async def _handle_browser_bridge_session(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        action = str(payload.get("action") or "state").strip().lower()
+        browser_label = str(
+            payload.get("browserLabel") or payload.get("browser_label") or "Chrome Extension"
+        ).strip() or "Chrome Extension"
+        client_session_id = str(
+            payload.get("clientSessionId") or payload.get("client_session_id") or ""
+        ).strip()
+        selected_session_key = str(payload.get("sessionKey") or payload.get("session_key") or "").strip()
+
+        if action == "fetch_pdf_text":
+            pdf_url = str(payload.get("url") or "").strip()
+            return {"pdf_text": fetch_pdf_text(pdf_url)}
+
+        if action == "fetch_pdf_preview_info":
+            pdf_url = str(payload.get("url") or "").strip()
+            images = fetch_pdf_page_images(pdf_url, max_pages=2)
+            return {"image_count": len(images)}
+
+        if action == "fetch_transcript":
+            target = str(payload.get("url") or payload.get("video_id") or "").strip()
+            language = str(payload.get("language") or "").strip()
+            if not target:
+                raise ValueError("fetch_transcript requires a YouTube URL or video_id.")
+
+            try:
+                result = await asyncio.to_thread(
+                    self._fetch_bridge_youtube_transcript,
+                    target,
+                    language,
+                )
+            except BrowserBridgeTranscriptUnavailable as exc:
+                return {
+                    "ok": True,
+                    "available": False,
+                    "video_id": exc.video_id or self._extract_youtube_video_id(target),
+                    "language": exc.requested_language,
+                    "transcript_text": "",
+                    "char_count": 0,
+                    "segment_count": 0,
+                    "error": str(exc),
+                    "available_languages": exc.available_languages,
+                }
+            return {
+                "ok": True,
+                "available": True,
+                **result,
+            }
+
+        if action == "tts":
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                raise ValueError("Text is required for tts.")
+            from tools.tts_tool import text_to_speech_tool
+
+            raw = await asyncio.to_thread(text_to_speech_tool, text)
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else {}
+            except Exception:
+                parsed = {}
+            if not parsed.get("success"):
+                raise ValueError(parsed.get("error") or "TTS generation failed.")
+            file_path = str(parsed.get("file_path") or "").strip()
+            if not file_path:
+                media_tag = str(parsed.get("media_tag") or "")
+                match = re.search(r"MEDIA:(\S+)", media_tag)
+                file_path = match.group(1) if match else ""
+            if not file_path:
+                raise ValueError("TTS output path missing.")
+            audio_path = Path(file_path).expanduser()
+            if not audio_path.exists():
+                raise ValueError("TTS output file is missing.")
+            audio_bytes = audio_path.read_bytes()
+            mime_type = mimetypes.guess_type(str(audio_path))[0] or "audio/mpeg"
+            return {
+                "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                "mime_type": mime_type,
+                "provider": str(parsed.get("provider") or "").strip(),
+            }
+
+        if action == "transcribe_audio":
+            raw_audio = str(payload.get("audio_base64") or "").strip()
+            if not raw_audio:
+                raise ValueError("audio_base64 is required for transcribe_audio.")
+            mime_type = str(payload.get("mime_type") or "audio/webm").strip().lower()
+            if raw_audio.startswith("data:") and "," in raw_audio:
+                _, raw_audio = raw_audio.split(",", 1)
+            try:
+                audio_bytes = base64.b64decode(raw_audio, validate=False)
+            except Exception as exc:
+                raise ValueError("Invalid audio_base64 payload.") from exc
+
+            ext_map = {
+                "audio/webm": ".webm",
+                "audio/ogg": ".ogg",
+                "audio/mpeg": ".mp3",
+                "audio/mp3": ".mp3",
+                "audio/wav": ".wav",
+                "audio/x-wav": ".wav",
+                "audio/mp4": ".m4a",
+            }
+            ext = ext_map.get(mime_type) or mimetypes.guess_extension(mime_type) or ".webm"
+            if ext == ".weba":
+                ext = ".webm"
+            upload_dir = _hermes_home / "browser_bridge_uploads"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            audio_path = upload_dir / f"sidecar_audio_{uuid.uuid4().hex[:12]}{ext}"
+            audio_path.write_bytes(audio_bytes)
+
+            from tools.transcription_tools import transcribe_audio
+
+            result = await asyncio.to_thread(transcribe_audio, str(audio_path))
+            if not result.get("success"):
+                raise ValueError(result.get("error") or "Audio transcription failed.")
+            return {
+                "transcript": str(result.get("transcript") or "").strip(),
+                "provider": str(result.get("provider") or "").strip(),
+            }
+
+        if action == "runtime_config_get":
+            return {
+                "ok": True,
+                **self._build_runtime_config_snapshot(
+                    selected_provider=str(payload.get("selected_provider") or "").strip()
+                ),
+            }
+
+        if action == "runtime_config_save":
+            return {
+                "ok": True,
+                **self._save_runtime_config_snapshot(payload),
+            }
+
+        if action == "runtime_provider_models":
+            from hermes_cli.models import curated_models_for_provider
+
+            selected_provider = str(payload.get("selected_provider") or "openrouter").strip() or "openrouter"
+            models = curated_models_for_provider(selected_provider if selected_provider != "auto" else "openrouter")
+            return {
+                "ok": True,
+                "provider_models": [
+                    {"id": model_id, "description": description}
+                    for model_id, description in models
+                ],
+            }
+
+        if action == "recall_search":
+            from tools.session_search_tool import session_search
+
+            query = str(payload.get("query") or "").strip()
+            if not query:
+                raise ValueError("Query is required for recall_search.")
+            limit = max(1, min(8, int(payload.get("limit") or 5)))
+            date_awareness = str(payload.get("date_awareness") or "smart").strip().lower() or "smart"
+            recall_session_key = str(payload.get("sessionKey") or payload.get("session_key") or selected_session_key).strip()
+            recall_session_id = ""
+            if recall_session_key:
+                try:
+                    recall_snapshot = self._get_sidebar_session_snapshot(recall_session_key)
+                    recall_session_id = str(recall_snapshot.get("session_id") or "").strip()
+                except Exception:
+                    recall_session_id = ""
+            raw_result = session_search(
+                query=query,
+                limit=limit,
+                db=self.session_store._db,
+                current_session_id=recall_session_id,
+                date_awareness=date_awareness,
+            )
+            parsed = json.loads(raw_result) if isinstance(raw_result, str) else {}
+            return {"ok": True, **parsed}
+
+        if action == "list":
+            active_session_key = self._resolve_sidebar_active_session_key(
+                browser_label=browser_label,
+                client_session_id=client_session_id,
+                session_key=selected_session_key,
+            )
+            return {
+                "ok": True,
+                "sessions": self._list_sidebar_sessions(limit=int(payload.get("limit") or 25)),
+                "active_session_key": active_session_key,
+                **self._empty_sidebar_session_snapshot(),
+            }
+
+        if selected_session_key:
+            sidebar_snapshot = None
+            try:
+                sidebar_snapshot = self._get_sidebar_session_snapshot(selected_session_key)
+            except ValueError:
+                sidebar_snapshot = None
+
+            if sidebar_snapshot and not sidebar_snapshot.get("is_browser_session"):
+                if action == "state":
+                    return {
+                        "ok": True,
+                        **sidebar_snapshot,
+                    }
+                if action == "inspect":
+                    return {
+                        "ok": True,
+                        **self._build_sidebar_session_inspection(selected_session_key),
+                    }
+                raise ValueError(
+                    "This session is read-only in the browser side panel right now. "
+                    "You can browse it here, but sending new turns is only supported for browser sidecar sessions."
+                )
+
+        source = self._resolve_browser_bridge_source(payload)
+        session_entry = self.session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+
+        if action == "state":
+            return self._get_browser_bridge_session_snapshot(source)
+
+        if action == "inspect":
+            return {
+                "ok": True,
+                **self._build_sidebar_session_inspection(session_key),
+            }
+
+        if action == "reset":
+            session_entry = self.session_store.get_or_create_session(source, force_new=True)
+            self._browser_bridge_tasks.pop(session_entry.session_key, None)
+            self._set_browser_bridge_progress(
+                session_entry.session_key,
+                running=False,
+                detail="Started a fresh sidecar session.",
+                recent_events=self._append_browser_bridge_progress_event(
+                    session_entry.session_key,
+                    "Started a fresh sidecar session.",
+                ),
+            )
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            snapshot["detail"] = "Started a fresh sidecar session."
+            return snapshot
+
+        if action == "interrupt":
+            task = self._browser_bridge_tasks.get(session_key)
+            if task and not task.done():
+                self._browser_bridge_pending_interrupts.add(session_key)
+                running_agent = self._running_agents.get(session_key)
+                if running_agent:
+                    running_agent.interrupt("Browser sidecar requested interrupt.")
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=True,
+                    detail="Interrupt requested. Hermes will stop after the current step.",
+                    interrupt_requested=True,
+                    recent_events=self._append_browser_bridge_progress_event(
+                        session_key,
+                        "Interrupt requested.",
+                    ),
+                )
+                snapshot = self._get_browser_bridge_session_snapshot(source)
+                snapshot["interrupt_requested"] = True
+                snapshot["detail"] = "Interrupt requested. Hermes will stop after the current step."
+                return snapshot
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            snapshot["interrupt_requested"] = False
+            snapshot["detail"] = "No active Hermes turn to interrupt."
+            return snapshot
+
+        if action in {"send", "send_async"}:
+            return await self._handle_browser_bridge_send(payload, source, async_mode=(action == "send_async"))
+
+        raise ValueError(f"Unsupported browser bridge action: {action}")
+
+    async def _handle_browser_bridge_send(
+        self,
+        payload: Dict[str, Any],
+        source: SessionSource,
+        *,
+        async_mode: bool,
+    ) -> Dict[str, Any]:
+        session_entry = self.session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+        existing_task = self._browser_bridge_tasks.get(session_key)
+        if existing_task and not existing_task.done():
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            snapshot["accepted"] = False
+            snapshot["busy"] = True
+            snapshot["detail"] = "Hermes is already working on this sidecar session."
+            return snapshot
+
+        page_payload = payload.get("pageContext")
+        if not isinstance(page_payload, dict):
+            page_payload = None
+        user_message = str(payload.get("message") or payload.get("note") or "").strip()
+        media_urls, media_types = self._extract_browser_bridge_image_attachments(payload)
+        if not user_message and not page_payload and media_urls:
+            user_message = "Please analyze the attached image(s)."
+        message = build_browser_chat_message(user_message, page_payload)
+        if not message.strip():
+            raise ValueError("Sidecar message is empty.")
+
+        async def _run_turn() -> None:
+            self._set_browser_bridge_progress(
+                session_key,
+                running=True,
+                detail="Hermes is thinking...",
+                recent_events=self._append_browser_bridge_progress_event(
+                    session_key,
+                    "Turn started.",
+                ),
+            )
+            try:
+                is_slash_command_turn = message.strip().startswith("/")
+                history_len_before = 0
+                if is_slash_command_turn:
+                    try:
+                        history_len_before = len(self.session_store.load_transcript(session_entry.session_id))
+                    except Exception:
+                        history_len_before = 0
+
+                event = MessageEvent(
+                    text=message,
+                    message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
+                    source=source,
+                    media_urls=media_urls,
+                    media_types=media_types,
+                )
+                command_result = await self._handle_message(event)
+
+                # Sidecar slash commands return text immediately from _handle_message
+                # and do not pass through adapter send/transcript hooks. Persist a
+                # minimal user/assistant exchange when the command handler did not
+                # already append to transcript so sidepanel queue sync can clear.
+                if is_slash_command_turn:
+                    try:
+                        history_len_after = len(self.session_store.load_transcript(session_entry.session_id))
+                    except Exception:
+                        history_len_after = history_len_before
+                    transcript_already_updated = history_len_after > history_len_before
+                    result_text = str(command_result or "").strip()
+                    if result_text and not transcript_already_updated:
+                        ts = datetime.now().isoformat()
+                        self.session_store.append_to_transcript(
+                            session_entry.session_id,
+                            {"role": "user", "content": message, "timestamp": ts},
+                        )
+                        self.session_store.append_to_transcript(
+                            session_entry.session_id,
+                            {"role": "assistant", "content": result_text, "timestamp": ts},
+                        )
+
+                interrupted = session_key in self._browser_bridge_pending_interrupts
+                if interrupted:
+                    self._browser_bridge_pending_interrupts.discard(session_key)
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=False,
+                    detail="Interrupted." if interrupted else "Reply ready.",
+                    interrupt_requested=False,
+                    recent_events=self._append_browser_bridge_progress_event(
+                        session_key,
+                        "Interrupted." if interrupted else "Turn finished.",
+                    ),
+                )
+            except asyncio.CancelledError:
+                self._browser_bridge_pending_interrupts.discard(session_key)
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=False,
+                    detail="Interrupted.",
+                    interrupt_requested=False,
+                    recent_events=self._append_browser_bridge_progress_event(
+                        session_key,
+                        "Interrupted.",
+                    ),
+                )
+                raise
+            except Exception as exc:
+                logger.exception("Browser sidecar turn failed")
+                self._browser_bridge_pending_interrupts.discard(session_key)
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=False,
+                    detail="Sidecar turn failed.",
+                    error=str(exc),
+                    interrupt_requested=False,
+                    recent_events=self._append_browser_bridge_progress_event(
+                        session_key,
+                        f"Error: {exc}",
+                    ),
+                )
+            except BaseException as exc:
+                # Guard against fatal worker exceptions (e.g. SystemExit/
+                # KeyboardInterrupt escaping from tool internals). These should
+                # fail the sidecar turn, not terminate the whole gateway.
+                logger.exception("Browser sidecar turn crashed with fatal error")
+                self._browser_bridge_pending_interrupts.discard(session_key)
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=False,
+                    detail="Sidecar turn failed.",
+                    error=f"{type(exc).__name__}: {exc}",
+                    interrupt_requested=False,
+                    recent_events=self._append_browser_bridge_progress_event(
+                        session_key,
+                        f"Fatal error: {type(exc).__name__}: {exc}",
+                    ),
+                )
+            finally:
+                self._browser_bridge_tasks.pop(session_key, None)
+
+        task = asyncio.create_task(_run_turn(), name=f"browser-bridge-{session_key}")
+        self._browser_bridge_tasks[session_key] = task
+
+        if async_mode:
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            snapshot["accepted"] = True
+            snapshot["busy"] = True
+            snapshot["detail"] = "Turn accepted."
+            return snapshot
+
+        try:
+            await asyncio.wait_for(task, timeout=_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+            self._browser_bridge_pending_interrupts.discard(session_key)
+            self._set_browser_bridge_progress(
+                session_key,
+                running=False,
+                detail="Sidecar turn timed out.",
+                error=(
+                    "Sidecar turn exceeded "
+                    f"{_format_timeout_seconds(_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS)} seconds and was cancelled."
+                ),
+                interrupt_requested=False,
+                recent_events=self._append_browser_bridge_progress_event(
+                    session_key,
+                    (
+                        "Timed out after "
+                        f"{_format_timeout_seconds(_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS)} seconds."
+                    ),
+                ),
+            )
+            raise TimeoutError(
+                f"Sidecar turn exceeded {_format_timeout_seconds(_BROWSER_SIDECAR_SYNC_TIMEOUT_SECONDS)} seconds."
+            )
+        snapshot = self._get_browser_bridge_session_snapshot(source)
+        snapshot["accepted"] = True
+        snapshot["busy"] = False
+        snapshot["detail"] = snapshot.get("progress", {}).get("detail") or "Reply ready."
+        return snapshot
 
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
@@ -937,20 +3303,6 @@ class GatewayRunner:
             pass
         return None
 
-    @staticmethod
-    def _load_smart_model_routing() -> dict:
-        """Load optional smart cheap-vs-strong model routing config."""
-        try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                return cfg.get("smart_model_routing", {}) or {}
-        except Exception:
-            pass
-        return {}
-
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -964,7 +3316,11 @@ class GatewayRunner:
             write_runtime_status(gateway_state="starting", exit_reason=None)
         except Exception:
             pass
-        
+
+        collision_warning = _build_windows_wsl_localhost_collision_warning(self.config)
+        if collision_warning:
+            logger.warning(collision_warning)
+
         # Warn if no user allowlists are configured and open access is not opted in
         _any_allowlist = any(
             os.getenv(v)
@@ -1031,9 +3387,9 @@ class GatewayRunner:
                     self.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
                     connected_count += 1
-                    logger.info("✓ %s connected", platform.value)
+                    logger.info("%s connected", platform.value)
                 else:
-                    logger.warning("✗ %s failed to connect", platform.value)
+                    logger.warning("%s failed to connect", platform.value)
                     if adapter.has_fatal_error:
                         target = (
                             startup_retryable_errors
@@ -1061,7 +3417,7 @@ class GatewayRunner:
                             "next_retry": time.monotonic() + 30,
                         }
             except Exception as e:
-                logger.error("✗ %s error: %s", platform.value, e)
+                logger.error("%s error: %s", platform.value, e)
                 startup_retryable_errors.append(f"{platform.value}: {e}")
                 # Unexpected exceptions are typically transient — queue for retry
                 self._failed_platforms[platform] = {
@@ -1102,6 +3458,18 @@ class GatewayRunner:
             write_runtime_status(gateway_state="running", exit_reason=None)
         except Exception:
             pass
+
+        # Start localhost browser sidecar bridge (used by the Chrome extension).
+        try:
+            self._browser_bridge = BrowserBridgeServer(
+                loop=asyncio.get_running_loop(),
+                handle_payload=self._handle_browser_bridge_request,
+                config=BrowserBridgeConfig.from_env(),
+            )
+            self._browser_bridge.start()
+        except Exception as e:
+            logger.warning("Failed to start browser bridge: %s", e)
+            self._browser_bridge = None
         
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
@@ -1135,15 +3503,14 @@ class GatewayRunner:
         ):
             self._schedule_update_notification_watch()
 
-        # Drain any recovered process watchers (from crash recovery checkpoint)
-        try:
-            from tools.process_registry import process_registry
-            while process_registry.pending_watchers:
-                watcher = process_registry.pending_watchers.pop(0)
-                asyncio.create_task(self._run_process_watcher(watcher))
-                logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
-        except Exception as e:
-            logger.error("Recovered watcher setup error: %s", e)
+        wiki_cfg = _get_wiki_host_config()
+        if wiki_cfg.get("enabled"):
+            try:
+                wiki_port = int(wiki_cfg.get("port") or 8008)
+                logger.info("Restoring wiki host on port %s", wiki_port)
+                self._start_wiki_host(wiki_port)
+            except Exception as e:
+                logger.warning("Failed to restore wiki host: %s", e)
 
         # Start background session expiry watcher for proactive memory flushing
         asyncio.create_task(self._session_expiry_watcher())
@@ -1304,6 +3671,23 @@ class GatewayRunner:
         """Stop the gateway and disconnect all adapters."""
         logger.info("Stopping gateway...")
         self._running = False
+        self._stop_wiki_host()
+
+        # Stop browser sidecar work first so no new sidecar requests are accepted.
+        browser_bridge = getattr(self, "_browser_bridge", None)
+        if browser_bridge:
+            try:
+                browser_bridge.stop()
+            except Exception as e:
+                logger.debug("Failed stopping browser bridge: %s", e)
+            self._browser_bridge = None
+        for session_key, task in list(getattr(self, "_browser_bridge_tasks", {}).items()):
+            if not task.done():
+                task.cancel()
+            self._browser_bridge_tasks.pop(session_key, None)
+        pending_interrupts = getattr(self, "_browser_bridge_pending_interrupts", None)
+        if pending_interrupts is not None:
+            pending_interrupts.clear()
 
         for session_key, agent in list(self._running_agents.items()):
             if agent is _AGENT_PENDING_SENTINEL:
@@ -1318,12 +3702,12 @@ class GatewayRunner:
             try:
                 await adapter.cancel_background_tasks()
             except Exception as e:
-                logger.debug("✗ %s background-task cancel error: %s", platform.value, e)
+                logger.debug("%s background-task cancel error: %s", platform.value, e)
             try:
                 await adapter.disconnect()
-                logger.info("✓ %s disconnected", platform.value)
+                logger.info("%s disconnected", platform.value)
             except Exception as e:
-                logger.error("✗ %s disconnect error: %s", platform.value, e)
+                logger.error("%s disconnect error: %s", platform.value, e)
 
         # Cancel any pending background tasks
         for _task in list(self._background_tasks):
@@ -1454,7 +3838,6 @@ class GatewayRunner:
             adapter = WebhookAdapter(config)
             adapter.gateway_runner = self  # For cross-platform delivery
             return adapter
-
         return None
     
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -1475,6 +3858,9 @@ class GatewayRunner:
         # the adapter itself — no user allowlist applies.
         if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
             return True
+        # Browser sidecar and other local-origin messages are trusted on this machine.
+        if source.platform == Platform.LOCAL:
+            return True
 
         user_id = source.user_id
         if not user_id:
@@ -1487,10 +3873,6 @@ class GatewayRunner:
             Platform.SLACK: "SLACK_ALLOWED_USERS",
             Platform.SIGNAL: "SIGNAL_ALLOWED_USERS",
             Platform.EMAIL: "EMAIL_ALLOWED_USERS",
-            Platform.SMS: "SMS_ALLOWED_USERS",
-            Platform.MATTERMOST: "MATTERMOST_ALLOWED_USERS",
-            Platform.MATRIX: "MATRIX_ALLOWED_USERS",
-            Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
         }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
@@ -1499,10 +3881,6 @@ class GatewayRunner:
             Platform.SLACK: "SLACK_ALLOW_ALL_USERS",
             Platform.SIGNAL: "SIGNAL_ALLOW_ALL_USERS",
             Platform.EMAIL: "EMAIL_ALLOW_ALL_USERS",
-            Platform.SMS: "SMS_ALLOW_ALL_USERS",
-            Platform.MATTERMOST: "MATTERMOST_ALLOW_ALL_USERS",
-            Platform.MATRIX: "MATRIX_ALLOW_ALL_USERS",
-            Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
@@ -1535,13 +3913,6 @@ class GatewayRunner:
         if "@" in user_id:
             check_ids.add(user_id.split("@")[0])
         return bool(check_ids & allowed_ids)
-
-    def _get_unauthorized_dm_behavior(self, platform: Optional[Platform]) -> str:
-        """Return how unauthorized DMs should be handled for a platform."""
-        config = getattr(self, "config", None)
-        if config and hasattr(config, "get_unauthorized_dm_behavior"):
-            return config.get_unauthorized_dm_behavior(platform)
-        return "pair"
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -1561,8 +3932,18 @@ class GatewayRunner:
         # Check if user is authorized
         if not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
-            if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
+            # In DMs: offer pairing code unless config says to ignore. In groups:
+            # silently ignore.
+            unauthorized_behavior = "pair"
+            try:
+                if hasattr(self.config, "get_unauthorized_dm_behavior"):
+                    unauthorized_behavior = self.config.get_unauthorized_dm_behavior(source.platform)
+                elif isinstance(self.config, dict):
+                    unauthorized_behavior = str(self.config.get("unauthorized_dm_behavior") or "pair")
+            except Exception:
+                unauthorized_behavior = "pair"
+
+            if source.chat_type == "dm" and unauthorized_behavior != "ignore":
                 platform_name = source.platform.value if source.platform else "unknown"
                 code = self.pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
@@ -1598,6 +3979,14 @@ class GatewayRunner:
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
+            if event.get_command() in {"terminal", "shell"}:
+                return await self._handle_terminal_command(event)
+            if event.get_command() == "cron":
+                return await self._handle_cron_command(event)
+            if event.get_command() in {"invokeai-defaults", "invokeai_defaults"}:
+                return await self._handle_image_defaults_command(event)
+            if event.get_command() in {"wiki-host", "wiki_host"}:
+                return await self._handle_wiki_host_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -1709,111 +4098,127 @@ class GatewayRunner:
         # Check for commands
         command = event.get_command()
         
-        # Emit command:* hook for any recognized slash command.
-        # GATEWAY_KNOWN_COMMANDS is derived from the central COMMAND_REGISTRY
-        # in hermes_cli/commands.py — no hardcoded set to maintain here.
-        from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS, resolve_command as _resolve_cmd
-        if command and command in GATEWAY_KNOWN_COMMANDS:
+        # Emit command:* hook for any recognized slash command
+        _known_commands = {"new", "reset", "help", "status", "stop", "model", "reasoning",
+                           "personality", "plan", "retry", "undo", "sethome", "set-home",
+                           "compress", "usage", "insights", "reload-mcp", "reload_mcp",
+                           "update", "title", "resume", "provider", "verbose", "rollback",
+                           "background", "reasoning", "voice", "terminal", "shell", "cron",
+                           "invokeai-defaults", "invokeai_defaults", "wiki-host", "wiki_host",
+                           "browser"}
+        if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
                 "command": command,
                 "args": event.get_command_args().strip(),
             })
-
-        # Resolve aliases to canonical name so dispatch only checks canonicals.
-        _cmd_def = _resolve_cmd(command) if command else None
-        canonical = _cmd_def.name if _cmd_def else command
-
-        if canonical == "new":
+        
+        if command in ["new", "reset"]:
             return await self._handle_reset_command(event)
         
-        if canonical == "help":
+        if command == "help":
             return await self._handle_help_command(event)
         
-        if canonical == "status":
+        if command == "status":
             return await self._handle_status_command(event)
         
-        if canonical == "stop":
+        if command == "stop":
             return await self._handle_stop_command(event)
         
-        if canonical == "reasoning":
+        if command == "model":
+            return await self._handle_model_command(event)
+
+        if command in ["invokeai-defaults", "invokeai_defaults"]:
+            return await self._handle_image_defaults_command(event)
+
+        if command in ["wiki-host", "wiki_host"]:
+            return await self._handle_wiki_host_command(event)
+
+        if command == "reasoning":
             return await self._handle_reasoning_command(event)
 
-        if canonical == "verbose":
+        if command == "verbose":
             return await self._handle_verbose_command(event)
 
-        if canonical == "provider":
+        if command == "provider":
             return await self._handle_provider_command(event)
         
-        if canonical == "personality":
+        if command == "personality":
             return await self._handle_personality_command(event)
 
-        if canonical == "plan":
+        if command in ["terminal", "shell"]:
+            return await self._handle_terminal_command(event)
+
+        if command == "browser":
+            return await self._handle_browser_command(event)
+
+        if command == "cron":
+            return await self._handle_cron_command(event)
+
+        if command == "plan":
             try:
                 from agent.skill_commands import build_plan_path, build_skill_invocation_message
 
                 user_instruction = event.get_command_args().strip()
                 plan_path = build_plan_path(user_instruction)
+                plan_path_text = plan_path.as_posix()
                 event.text = build_skill_invocation_message(
                     "/plan",
                     user_instruction,
                     task_id=_quick_key,
                     runtime_note=(
                         "Save the markdown plan with write_file to this exact relative path "
-                        f"inside the active workspace/backend cwd: {plan_path}"
+                        f"inside the active workspace/backend cwd: {plan_path_text}"
                     ),
                 )
                 if not event.text:
                     return "Failed to load the bundled /plan skill."
-                canonical = None
+                command = None
             except Exception as e:
                 logger.exception("Failed to prepare /plan command")
                 return f"Failed to enter plan mode: {e}"
         
-        if canonical == "retry":
+        if command == "retry":
             return await self._handle_retry_command(event)
         
-        if canonical == "undo":
+        if command == "undo":
             return await self._handle_undo_command(event)
         
-        if canonical == "sethome":
+        if command in ["sethome", "set-home"]:
             return await self._handle_set_home_command(event)
 
-        if canonical == "compress":
+        if command == "compress":
             return await self._handle_compress_command(event)
 
-        if canonical == "usage":
+        if command == "usage":
             return await self._handle_usage_command(event)
 
-        if canonical == "insights":
+        if command == "insights":
             return await self._handle_insights_command(event)
 
-        if canonical == "reload-mcp":
+        if command in ("reload-mcp", "reload_mcp"):
             return await self._handle_reload_mcp_command(event)
 
-        if canonical == "approve":
-            return await self._handle_approve_command(event)
-
-        if canonical == "deny":
-            return await self._handle_deny_command(event)
-
-        if canonical == "update":
+        if command == "update":
             return await self._handle_update_command(event)
 
-        if canonical == "title":
+        if command == "title":
             return await self._handle_title_command(event)
 
-        if canonical == "resume":
+        if command == "resume":
             return await self._handle_resume_command(event)
 
-        if canonical == "rollback":
+        if command == "rollback":
             return await self._handle_rollback_command(event)
 
-        if canonical == "background":
+        if command == "background":
             return await self._handle_background_command(event)
 
-        if canonical == "voice":
+        if command == "reasoning":
+            return await self._handle_reasoning_command(event)
+
+        if command == "voice":
             return await self._handle_voice_command(event)
 
         # User-defined quick commands (bypass agent loop, no LLM call)
@@ -1829,34 +4234,45 @@ class GatewayRunner:
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        proc = None
+                        communicate_task = None
                         try:
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
                             )
-                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                            communicate_task = asyncio.create_task(proc.communicate())
+                            stdout, stderr = await asyncio.wait_for(communicate_task, timeout=30)
                             output = (stdout or stderr).decode().strip()
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
+                            if proc is not None and proc.returncode is None:
+                                proc.kill()
+                            if communicate_task is not None:
+                                try:
+                                    await communicate_task
+                                except Exception:
+                                    pass
                             return "Quick command timed out (30s)."
                         except Exception as e:
+                            if communicate_task is not None and not communicate_task.done():
+                                communicate_task.cancel()
+                                try:
+                                    await communicate_task
+                                except Exception:
+                                    pass
+                            elif proc is not None and proc.returncode is None:
+                                proc.kill()
+                                try:
+                                    await proc.communicate()
+                                except Exception:
+                                    pass
                             return f"Quick command error: {e}"
                     else:
                         return f"Quick command '/{command}' has no command defined."
-                elif qcmd.get("type") == "alias":
-                    target = qcmd.get("target", "").strip()
-                    if target:
-                        target = target if target.startswith("/") else f"/{target}"
-                        target_command = target.lstrip("/")
-                        user_args = event.get_command_args().strip()
-                        event.text = f"{target} {user_args}".strip()
-                        command = target_command
-                        # Fall through to normal command dispatch below
-                    else:
-                        return f"Quick command '/{command}' has no target defined."
                 else:
-                    return f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias')."
+                    return f"Quick command '/{command}' has unsupported type (only 'exec' is supported)."
 
         # Plugin-registered slash commands
         if command:
@@ -1882,7 +4298,7 @@ class GatewayRunner:
                 if cmd_key in skill_cmds:
                     user_instruction = event.get_command_args().strip()
                     msg = build_skill_invocation_message(
-                        cmd_key, user_instruction, task_id=_quick_key
+                        cmd_key, user_instruction, task_id=session_key
                     )
                     if msg:
                         event.text = msg
@@ -1915,7 +4331,6 @@ class GatewayRunner:
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str):
         """Inner handler that runs under the _running_agents sentinel guard."""
-
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
@@ -1942,9 +4357,8 @@ class GatewayRunner:
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
         try:
-            import yaml as _pii_yaml
             with open(_config_path, encoding="utf-8") as _pf:
-                _pcfg = _pii_yaml.safe_load(_pf) or {}
+                _pcfg = yaml.safe_load(_pf) or {}
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
         except Exception:
             pass
@@ -2126,6 +4540,10 @@ class GatewayRunner:
                         pass
             except Exception:
                 pass
+
+            # Check env override for disabling compression entirely
+            if os.getenv("CONTEXT_COMPRESSION_ENABLED", "").lower() in ("false", "0", "no"):
+                _hyg_compression_enabled = False
 
             if _hyg_compression_enabled:
                 _hyg_context_length = get_model_context_length(
@@ -2383,37 +4801,6 @@ class GatewayRunner:
                 message_text = await self._enrich_message_with_transcription(
                     message_text, audio_paths
                 )
-                # If STT failed, send a direct message to the user so they
-                # know voice isn't configured — don't rely on the agent to
-                # relay the error clearly.
-                _stt_fail_markers = (
-                    "No STT provider",
-                    "STT is disabled",
-                    "can't listen",
-                    "VOICE_TOOLS_OPENAI_KEY",
-                )
-                if any(m in message_text for m in _stt_fail_markers):
-                    _stt_adapter = self.adapters.get(source.platform)
-                    _stt_meta = {"thread_id": source.thread_id} if source.thread_id else None
-                    if _stt_adapter:
-                        try:
-                            _stt_msg = (
-                                "🎤 I received your voice message but can't transcribe it — "
-                                "no speech-to-text provider is configured.\n\n"
-                                "To enable voice: install faster-whisper "
-                                "(`pip install faster-whisper` in the Hermes venv) "
-                                "and set `stt.enabled: true` in config.yaml, "
-                                "then /restart the gateway."
-                            )
-                            # Point to setup skill if it's installed
-                            if self._has_setup_skill():
-                                _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
-                            await _stt_adapter.send(
-                                source.chat_id, _stt_msg,
-                                metadata=_stt_meta,
-                            )
-                        except Exception:
-                            pass
 
         # -----------------------------------------------------------------
         # Enrich document messages with context notes for the agent
@@ -2446,23 +4833,6 @@ class GatewayRunner:
                         f"Ask the user what they'd like you to do with it.]"
                     )
                 message_text = f"{context_note}\n\n{message_text}"
-
-        # -----------------------------------------------------------------
-        # Inject reply context when user replies to a message not in history.
-        # Telegram (and other platforms) let users reply to specific messages,
-        # but if the quoted message is from a previous session, cron delivery,
-        # or background task, the agent has no context about what's being
-        # referenced. Prepend the quoted text so the agent understands. (#1594)
-        # -----------------------------------------------------------------
-        if getattr(event, 'reply_to_text', None) and event.reply_to_message_id:
-            reply_snippet = event.reply_to_text[:500]
-            found_in_history = any(
-                reply_snippet[:200] in (msg.get("content") or "")
-                for msg in history
-                if msg.get("role") in ("assistant", "user", "tool")
-            )
-            if not found_in_history:
-                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
         try:
             # Emit agent:start hook
@@ -2520,34 +4890,6 @@ class GatewayRunner:
             response = agent_result.get("final_response") or ""
             agent_messages = agent_result.get("messages", [])
 
-            # Surface error details when the agent failed silently (final_response=None)
-            if not response and agent_result.get("failed"):
-                error_detail = agent_result.get("error", "unknown error")
-                error_str = str(error_detail).lower()
-
-                # Detect context-overflow failures and give specific guidance.
-                # Generic 400 "Error" from Anthropic with large sessions is the
-                # most common cause of this (#1630).
-                _is_ctx_fail = any(p in error_str for p in (
-                    "context", "token", "too large", "too long",
-                    "exceed", "payload",
-                )) or (
-                    "400" in error_str
-                    and len(history) > 50
-                )
-
-                if _is_ctx_fail:
-                    response = (
-                        "⚠️ Session too large for the model's context window.\n"
-                        "Use /compact to compress the conversation, or "
-                        "/reset to start fresh."
-                    )
-                else:
-                    response = (
-                        f"The request failed: {str(error_detail)[:300]}\n"
-                        "Try again or use /reset to start a fresh session."
-                    )
-
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
@@ -2584,22 +4926,9 @@ class GatewayRunner:
             # Check if the agent encountered a dangerous command needing approval
             try:
                 from tools.approval import pop_pending
-                import time as _time
                 pending = pop_pending(session_key)
                 if pending:
-                    pending["timestamp"] = _time.time()
                     self._pending_approvals[session_key] = pending
-                    # Append structured instructions so the user knows how to respond
-                    cmd_preview = pending.get("command", "")
-                    if len(cmd_preview) > 200:
-                        cmd_preview = cmd_preview[:200] + "..."
-                    approval_hint = (
-                        f"\n\n⚠️ **Dangerous command requires approval:**\n"
-                        f"```\n{cmd_preview}\n```\n"
-                        f"Reply `/approve` to execute, `/approve session` to approve this pattern "
-                        f"for the session, or `/deny` to cancel."
-                    )
-                    response = (response or "") + approval_hint
             except Exception as e:
                 logger.debug("Failed to check pending approvals: %s", e)
             
@@ -2607,30 +4936,12 @@ class GatewayRunner:
             # This preserves the complete agent loop (tool_calls, tool results,
             # intermediate reasoning) so sessions can be resumed with full context
             # and transcripts are useful for debugging and training data.
-            #
-            # IMPORTANT: When the agent failed before producing any response
-            # (e.g. context-overflow 400), do NOT persist the user's message.
-            # Persisting it would make the session even larger, causing the
-            # same failure on the next attempt — an infinite loop. (#1630)
-            agent_failed_early = (
-                agent_result.get("failed")
-                and not agent_result.get("final_response")
-            )
-            if agent_failed_early:
-                logger.info(
-                    "Skipping transcript persistence for failed request in "
-                    "session %s to prevent session growth loop.",
-                    session_entry.session_id,
-                )
-
             ts = datetime.now().isoformat()
             
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
             # -- the same list of dicts sent as tools=[...] in the API request.
-            if agent_failed_early:
-                pass  # Skip all transcript writes — don't grow a broken session
-            elif not history:
+            if not history:
                 tool_defs = agent_result.get("tools", [])
                 self.session_store.append_to_transcript(
                     session_entry.session_id,
@@ -2647,37 +4958,36 @@ class GatewayRunner:
             # Use the filtered history length (history_offset) that was actually
             # passed to the agent, not len(history) which includes session_meta
             # entries that were stripped before the agent saw them.
-            if not agent_failed_early:
-                history_len = agent_result.get("history_offset", len(history))
-                new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
-                
-                # If no new messages found (edge case), fall back to simple user/assistant
-                if not new_messages:
+            history_len = agent_result.get("history_offset", len(history))
+            new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
+            
+            # If no new messages found (edge case), fall back to simple user/assistant
+            if not new_messages:
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {"role": "user", "content": message_text, "timestamp": ts}
+                )
+                if response:
                     self.session_store.append_to_transcript(
                         session_entry.session_id,
-                        {"role": "user", "content": message_text, "timestamp": ts}
+                        {"role": "assistant", "content": response, "timestamp": ts}
                     )
-                    if response:
-                        self.session_store.append_to_transcript(
-                            session_entry.session_id,
-                            {"role": "assistant", "content": response, "timestamp": ts}
-                        )
-                else:
-                    # The agent already persisted these messages to SQLite via
-                    # _flush_messages_to_session_db(), so skip the DB write here
-                    # to prevent the duplicate-write bug (#860).  We still write
-                    # to JSONL for backward compatibility and as a backup.
-                    agent_persisted = self._session_db is not None
-                    for msg in new_messages:
-                        # Skip system messages (they're rebuilt each run)
-                        if msg.get("role") == "system":
-                            continue
-                        # Add timestamp to each message for debugging
-                        entry = {**msg, "timestamp": ts}
-                        self.session_store.append_to_transcript(
-                            session_entry.session_id, entry,
-                            skip_db=agent_persisted,
-                        )
+            else:
+                # The agent already persisted these messages to SQLite via
+                # _flush_messages_to_session_db(), so skip the DB write here
+                # to prevent the duplicate-write bug (#860).  We still write
+                # to JSONL for backward compatibility and as a backup.
+                agent_persisted = self._session_db is not None
+                for msg in new_messages:
+                    # Skip system messages (they're rebuilt each run)
+                    if msg.get("role") == "system":
+                        continue
+                    # Add timestamp to each message for debugging
+                    entry = {**msg, "timestamp": ts}
+                    self.session_store.append_to_transcript(
+                        session_entry.session_id, entry,
+                        skip_db=agent_persisted,
+                    )
             
             # Update session with actual prompt token count and model from the agent
             self.session_store.update_session(
@@ -2714,9 +5024,24 @@ class GatewayRunner:
                             response, event, _media_adapter,
                         )
                 return None
-
             return response
             
+        except asyncio.CancelledError:
+            running = bool(getattr(self, "_running", False))
+            shutdown_requested = bool(
+                getattr(self, "_shutdown_event", None) and self._shutdown_event.is_set()
+            )
+            if running and not shutdown_requested:
+                logger.error(
+                    "Agent turn cancelled unexpectedly in active session %s; "
+                    "returning interrupted-turn response.",
+                    session_key,
+                )
+                return (
+                    "Sorry, that turn was interrupted unexpectedly. "
+                    "Hermes is still running; please send it again."
+                )
+            raise
         except Exception as e:
             # Stop typing indicator on error too
             try:
@@ -2726,51 +5051,18 @@ class GatewayRunner:
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
-            error_type = type(e).__name__
-            error_detail = str(e)[:300] if str(e) else "no details available"
-            status_hint = ""
-            status_code = getattr(e, "status_code", None)
-            _hist_len = len(history) if 'history' in locals() else 0
-            if status_code == 401:
-                status_hint = " Check your API key or run `claude /login` to refresh OAuth credentials."
-            elif status_code == 429:
-                # Check if this is a plan usage limit (resets on a schedule) vs a transient rate limit
-                _err_body = getattr(e, "response", None)
-                _err_json = {}
-                try:
-                    if _err_body is not None:
-                        _err_json = _err_body.json().get("error", {})
-                except Exception:
-                    pass
-                if _err_json.get("type") == "usage_limit_reached":
-                    _resets_in = _err_json.get("resets_in_seconds")
-                    if _resets_in and _resets_in > 0:
-                        import math
-                        _hours = math.ceil(_resets_in / 3600)
-                        status_hint = f" Your plan's usage limit has been reached. It resets in ~{_hours}h."
-                    else:
-                        status_hint = " Your plan's usage limit has been reached. Please wait until it resets."
-                else:
-                    status_hint = " You are being rate-limited. Please wait a moment and try again."
-            elif status_code == 529:
-                status_hint = " The API is temporarily overloaded. Please try again shortly."
-            elif status_code in (400, 500):
-                # 400 with a large session is context overflow.
-                # 500 with a large session often means the payload is too large
-                # for the API to process — treat it the same way.
-                if _hist_len > 50:
-                    return (
-                        "⚠️ Session too large for the model's context window.\n"
-                        "Use /compact to compress the conversation, or "
-                        "/reset to start fresh."
-                    )
-                elif status_code == 400:
-                    status_hint = " The request was rejected by the API."
             return (
-                f"Sorry, I encountered an error ({error_type}).\n"
-                f"{error_detail}\n"
-                f"{status_hint}"
+                "Sorry, I encountered an unexpected error. "
+                "The details have been logged for debugging. "
                 "Try again or use /reset to start a fresh session."
+            )
+        except BaseException as e:
+            # Keep gateway alive when underlying tools raise fatal exceptions
+            # (KeyboardInterrupt/SystemExit) from worker threads.
+            logger.exception("Fatal agent error in session %s", session_key)
+            return (
+                "Sorry, the turn hit a fatal runtime error and was aborted. "
+                "Hermes is still running; please try again."
             )
         finally:
             # Clear session env
@@ -2880,14 +5172,7 @@ class GatewayRunner:
         
         # Reset the session
         new_entry = self.session_store.reset_session(session_key)
-
-        # Emit session:end hook (session is ending)
-        await self.hooks.emit("session:end", {
-            "platform": source.platform.value if source.platform else "",
-            "user_id": source.user_id,
-            "session_key": session_key,
-        })
-
+        
         # Emit session:reset hook
         await self.hooks.emit("session:reset", {
             "platform": source.platform.value if source.platform else "",
@@ -2969,10 +5254,34 @@ class GatewayRunner:
     
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
-        from hermes_cli.commands import gateway_help_lines
         lines = [
             "📖 **Hermes Commands**\n",
-            *gateway_help_lines(),
+            "`/new` — Start a new conversation",
+            "`/reset` — Reset conversation history",
+            "`/status` — Show session info",
+            "`/stop` — Interrupt the running agent",
+            "`/model [provider:model]` — Show/change model (or switch provider)",
+            "`/invokeai-defaults [model] [aspect]` — Show or change default InvokeAI image settings",
+            "`/wiki-host [enable|disable|status] [port]` — Toggle LAN hosting for the local wiki",
+            "`/provider` — Show available providers and auth status",
+            "`/personality [name]` — Set a personality",
+            "`/retry` — Retry your last message",
+            "`/undo` — Remove the last exchange",
+            "`/sethome` — Set this chat as the home channel",
+            "`/compress` — Compress conversation context",
+            "`/title [name]` — Set or show the session title",
+            "`/resume [name]` — Resume a previously-named session",
+            "`/usage` — Show token usage for this session",
+            "`/insights [days]` — Show usage insights and analytics",
+            "`/reasoning [level|show|hide]` — Set reasoning effort or toggle display",
+            "`/rollback [number]` — List or restore filesystem checkpoints",
+            "`/background <prompt>` — Run a prompt in a separate background session",
+            "`/voice [on|off|tts|status]` — Toggle voice reply mode",
+            "`/cron [list|add|remove|run|pause|resume|status|tick]` — Manage cron jobs",
+            "`/browser [connect|disconnect|status]` — Manage live CDP browser link for sidecar/browser tools",
+            "`/reload-mcp` — Reload MCP servers from config",
+            "`/update` — Update Hermes Agent to the latest version",
+            "`/help` — Show this message",
         ]
         try:
             from agent.skill_commands import get_skill_commands
@@ -2984,7 +5293,749 @@ class GatewayRunner:
         except Exception:
             pass
         return "\n".join(lines)
+
+    async def _run_cron_job_interactive(self, job: dict, source: SessionSource) -> None:
+        """Execute a cron job immediately and stream progress back to the source chat."""
+        from cron.jobs import mark_job_run, save_job_output
+        from cron.scheduler import SILENT_MARKER, _deliver_result, _resolve_delivery_target, run_job
+        import queue
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.warning("Interactive cron run requested for %s but no adapter is connected", source.platform)
+            return
+
+        progress_queue = queue.Queue()
+        last_tool = [None]
+        progress_state = {
+            "started_at": time.monotonic(),
+            "phase": "thinking",
+            "last_detail": f"Queued cron job {job.get('name', job.get('id', '?'))}...",
+            "tool_calls": 0,
+            "updates": 0,
+            "recent_events": [],
+        }
+
+        def _push_recent_event(detail: str) -> None:
+            text = (detail or "").strip()
+            if not text:
+                return
+            ts = datetime.now().strftime("%H:%M:%S")
+            event_line = f"`{ts}` {text}"
+            recent_events = progress_state.setdefault("recent_events", [])
+            if recent_events and recent_events[-1] == event_line:
+                return
+            recent_events.append(event_line)
+            while len(recent_events) > 4:
+                recent_events.pop(0)
+
+        def _set_progress_state(*, phase: str | None = None, detail: str | None = None, tool_call: bool = False) -> None:
+            if phase:
+                progress_state["phase"] = phase
+            if detail:
+                progress_state["last_detail"] = detail
+                _push_recent_event(detail)
+            if tool_call:
+                progress_state["tool_calls"] += 1
+            progress_state["updates"] += 1
+            progress_queue.put("__tick__")
+
+        _set_progress_state(
+            phase="starting",
+            detail=f"Starting cron job {job.get('name', job.get('id', '?'))}...",
+        )
+
+        def _summarize_result_for_status(result_text: str, is_error: bool) -> str:
+            text = (result_text or "").strip()
+            if not text:
+                return ""
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return text if is_error else ""
+
+            if isinstance(parsed, dict):
+                parts: list[str] = []
+                status = str(parsed.get("status") or "").strip()
+                details = str(parsed.get("details") or "").strip()
+                if status:
+                    parts.append(f"status={status}")
+                if details:
+                    parts.append(details)
+                if "exit_code" in parsed:
+                    parts.append(f"exit={parsed.get('exit_code')}")
+                err = parsed.get("error")
+                if err:
+                    parts.append(f"error={err}")
+                stderr = parsed.get("stderr")
+                if not err and is_error and isinstance(stderr, str) and stderr.strip():
+                    parts.append(f"stderr={stderr.strip()}")
+                return " | ".join(parts)
+            return text if is_error else ""
+
+        def _build_progress_message() -> str:
+            elapsed = int(max(0, time.monotonic() - progress_state["started_at"]))
+            phase = progress_state.get("phase", "thinking")
+            phase_label = {
+                "starting": "starting",
+                "thinking": "thinking",
+                "tool": "running tools",
+                "finalizing": "finalizing",
+            }.get(phase, "working")
+            phase_emoji = {
+                "starting": "🚀",
+                "thinking": "💡",
+                "tool": "🛠️",
+                "finalizing": "🧾",
+            }.get(phase, "⚙️")
+            header = f"{phase_emoji} Hermes is {phase_label} on cron job `{job.get('id', '?')}`... ({elapsed}s)"
+            footer = f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
+            events = list(progress_state.get("recent_events") or [])
+            if not events:
+                fallback = (progress_state.get("last_detail") or "Working...").strip()
+                events = [f"`{datetime.now().strftime('%H:%M:%S')}` {fallback}"]
+            body = "\n".join(f"• {line}" for line in events[-4:])
+            return f"{header}\n{body}\n{footer}"
+
+        def progress_callback(tool_name: str, preview: str = None, args: dict = None) -> None:
+            if tool_name == "_tool_result":
+                payload = args or {}
+                completed_tool = str(payload.get("tool") or preview or "tool")
+                duration = payload.get("duration_seconds")
+                is_error = bool(payload.get("is_error"))
+                status_suffix = str(payload.get("status_suffix") or "").strip()
+                result_text = str(payload.get("result") or "").strip()
+                status_emoji = "❌" if is_error else "✅"
+                duration_text = f" in {float(duration):.2f}s" if isinstance(duration, (int, float)) else ""
+                detail = f"{status_emoji} {completed_tool} finished{duration_text}"
+                if status_suffix:
+                    detail = f"{detail} {status_suffix}"
+                summary_suffix = _summarize_result_for_status(result_text, is_error)
+                if summary_suffix:
+                    detail = f"{detail} | {summary_suffix}"
+                _set_progress_state(phase="tool", detail=detail, tool_call=False)
+                return
+
+            if tool_name == last_tool[0] and tool_name != "_thinking":
+                return
+            last_tool[0] = tool_name
+
+            from agent.display import get_tool_emoji
+            emoji = get_tool_emoji(tool_name, default="⚙️")
+            if tool_name == "_thinking":
+                _set_progress_state(phase="thinking", detail=f"💡 thinking: {preview or 'working...'}")
+                return
+            if preview:
+                if len(preview) > 80:
+                    preview = preview[:77] + "..."
+                detail = f"{emoji} {tool_name}: \"{preview}\""
+            else:
+                detail = f"{emoji} {tool_name}..."
+            _set_progress_state(phase="tool", detail=detail, tool_call=True)
+
+        def progress_thinking_callback(text: str) -> None:
+            cleaned = str(text or "").strip()
+            if cleaned:
+                progress_callback("_thinking", cleaned)
+
+        progress_metadata = {"tool_progress": True}
+        if source.thread_id:
+            progress_metadata["thread_id"] = source.thread_id
+
+        async def send_progress_messages() -> None:
+            progress_msg_id = None
+            last_rendered = ""
+            while True:
+                try:
+                    updated = False
+                    while True:
+                        try:
+                            progress_queue.get_nowait()
+                            updated = True
+                        except queue.Empty:
+                            break
+                    if not updated and progress_state["updates"] <= 0:
+                        await asyncio.sleep(0.25)
+                        continue
+                    msg = _build_progress_message()
+                    if progress_msg_id is not None:
+                        result = await adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=progress_msg_id,
+                            content=msg,
+                        )
+                        if not result.success:
+                            progress_msg_id = None
+                    if progress_msg_id is None:
+                        result = await adapter.send(
+                            chat_id=source.chat_id,
+                            content=msg,
+                            metadata=progress_metadata,
+                        )
+                        if result.success and result.message_id:
+                            progress_msg_id = result.message_id
+                    last_rendered = msg
+                    await adapter.send_typing(source.chat_id, metadata=progress_metadata)
+                    await asyncio.sleep(0.25)
+                except asyncio.CancelledError:
+                    if progress_msg_id and last_rendered:
+                        with contextlib.suppress(Exception):
+                            await adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=progress_msg_id,
+                                content=last_rendered,
+                            )
+                    with contextlib.suppress(Exception):
+                        if hasattr(adapter, "stop_typing"):
+                            await adapter.stop_typing(source.chat_id)
+                    return
+                except Exception as exc:
+                    logger.error("Interactive cron progress error: %s", exc)
+                    await asyncio.sleep(1)
+
+        progress_task = asyncio.create_task(send_progress_messages())
+        job_id = str(job.get("id") or "?")
+        success = False
+        output = ""
+        final_response = ""
+        error = None
+        try:
+            import concurrent.futures
+
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="gateway-cron-run",
+            ) as pool:
+                success, output, final_response, error = await loop.run_in_executor(
+                    pool,
+                    lambda: run_job(
+                        job,
+                        tool_progress_callback=progress_callback,
+                        thinking_callback=progress_thinking_callback,
+                        platform=source.platform.value if source.platform else "cron",
+                        session_id=f"cron_manual_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    ),
+                )
+        except Exception as exc:
+            error = str(exc)
+            logger.error("Interactive cron run failed for %s: %s", job_id, exc, exc_info=True)
+        finally:
+            progress_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await progress_task
+
+        output_file = save_job_output(job_id, output or f"# Cron Job: {job.get('name', job_id)}\n\n(No output captured)")
+        deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job_id)}' failed:\n{error or 'unknown error'}"
+        if success and deliver_content and deliver_content.strip().upper().startswith(SILENT_MARKER):
+            deliver_content = f"✅ Cron job `{job_id}` finished with no new report."
+        if success and not str(deliver_content or "").strip():
+            deliver_content = f"✅ Cron job `{job_id}` finished, but returned no message."
+
+        try:
+            await adapter.send(
+                chat_id=source.chat_id,
+                content=deliver_content,
+                metadata={"thread_id": source.thread_id} if source.thread_id else None,
+            )
+        except Exception as exc:
+            logger.error("Interactive cron completion delivery failed for %s: %s", job_id, exc)
+
+        try:
+            delivery_target = _resolve_delivery_target(job)
+            same_target = (
+                delivery_target
+                and str(delivery_target.get("platform")) == source.platform.value
+                and str(delivery_target.get("chat_id")) == str(source.chat_id)
+                and str(delivery_target.get("thread_id") or "") == str(source.thread_id or "")
+            )
+            if delivery_target and not same_target and deliver_content:
+                import concurrent.futures
+
+                loop = asyncio.get_running_loop()
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="gateway-cron-delivery",
+                ) as pool:
+                    await loop.run_in_executor(pool, lambda: _deliver_result(job, deliver_content))
+        except Exception as exc:
+            logger.error("Interactive cron secondary delivery failed for %s: %s", job_id, exc)
+
+        mark_job_run(job_id, bool(success), error if not success else None)
+
+    async def _handle_cron_command(self, event: MessageEvent) -> str:
+        """Handle /cron command in gateway chats."""
+        from tools.cronjob_tools import cronjob as cronjob_tool
+
+        args = event.get_command_args().strip()
+        if not args:
+            action = "list"
+            tokens: list[str] = []
+        else:
+            try:
+                tokens = shlex.split(args)
+            except ValueError as e:
+                return f"Invalid /cron arguments: {e}"
+            action = (tokens[0].strip().lower() if tokens else "list")
+
+        def _cron_api(**kwargs):
+            try:
+                payload = cronjob_tool(**kwargs)
+                return json.loads(payload)
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+        def _format_job_line(job: dict) -> str:
+            job_id = str(job.get("job_id", "?"))
+            name = str(job.get("name", "(unnamed)"))
+            schedule = str(job.get("schedule", "?"))
+            state = str(job.get("state", "scheduled"))
+            deliver = str(job.get("deliver", "local"))
+            next_run = str(job.get("next_run_at") or "n/a")
+            return (
+                f"- `{job_id}` **{name}**\n"
+                f"  schedule: `{schedule}` | state: `{state}` | deliver: `{deliver}` | next: `{next_run}`"
+            )
+
+        if action in {"list", "ls"}:
+            include_disabled = any(t in {"--all", "-a"} for t in tokens[1:])
+            result = _cron_api(action="list", include_disabled=include_disabled)
+            if not result.get("success"):
+                return f"Failed to list cron jobs: {result.get('error', 'unknown error')}"
+            jobs = result.get("jobs", [])
+            if not jobs:
+                return (
+                    "No scheduled jobs.\n"
+                    "Create one with `/cron add <schedule> <prompt>`."
+                )
+            lines = [f"⏰ **Scheduled Jobs ({len(jobs)})**"]
+            lines.extend(_format_job_line(job) for job in jobs)
+            return "\n".join(lines)
+
+        if action in {"add", "create"}:
+            if len(tokens) < 3:
+                return (
+                    "Usage: `/cron add <schedule> <prompt>`\n"
+                    "If your schedule has spaces, quote it. Example: "
+                    "`/cron add \"0 9 * * *\" Daily standup summary`"
+                )
+            schedule = tokens[1]
+            prompt = " ".join(tokens[2:]).strip()
+            result = _cron_api(action="create", schedule=schedule, prompt=prompt)
+            if not result.get("success"):
+                return f"Failed to create cron job: {result.get('error', 'unknown error')}"
+            return (
+                f"✅ Created cron job `{result.get('job_id', '?')}`\n"
+                f"name: **{result.get('name', '(unnamed)')}**\n"
+                f"schedule: `{result.get('schedule', schedule)}`\n"
+                f"next: `{result.get('next_run_at', 'n/a')}`"
+            )
+
+        if action in {"remove", "rm", "delete"}:
+            if len(tokens) < 2:
+                return "Usage: `/cron remove <job_id>`"
+            job_id = tokens[1]
+            result = _cron_api(action="remove", job_id=job_id)
+            if not result.get("success"):
+                return f"Failed to remove cron job: {result.get('error', 'unknown error')}"
+            removed = result.get("removed_job", {})
+            return f"🗑️ Removed cron job `{removed.get('id', job_id)}` ({removed.get('name', 'unnamed')})."
+
+        if action in {"run", "run_now", "trigger"}:
+            from cron.jobs import get_job
+
+            if len(tokens) < 2:
+                return "Usage: `/cron run <job_id>`"
+            job_id = tokens[1]
+            job = get_job(job_id)
+            if not job:
+                return "Failed to trigger cron job: Job not found."
+            asyncio.create_task(self._run_cron_job_interactive(job, event.source))
+            return (
+                f"▶️ Running cron job `{job.get('id', job_id)}` ({job.get('name', 'unnamed')}) now.\n"
+                "I’ll stream progress here and post the result when it finishes."
+            )
+
+        if action == "pause":
+            if len(tokens) < 2:
+                return "Usage: `/cron pause <job_id>`"
+            job_id = tokens[1]
+            reason = " ".join(tokens[2:]).strip() or None
+            result = _cron_api(action="pause", job_id=job_id, reason=reason)
+            if not result.get("success"):
+                return f"Failed to pause cron job: {result.get('error', 'unknown error')}"
+            job = result.get("job", {})
+            return f"⏸️ Paused cron job `{job.get('job_id', job_id)}` ({job.get('name', 'unnamed')})."
+
+        if action == "resume":
+            if len(tokens) < 2:
+                return "Usage: `/cron resume <job_id>`"
+            job_id = tokens[1]
+            result = _cron_api(action="resume", job_id=job_id)
+            if not result.get("success"):
+                return f"Failed to resume cron job: {result.get('error', 'unknown error')}"
+            job = result.get("job", {})
+            return f"✅ Resumed cron job `{job.get('job_id', job_id)}` ({job.get('name', 'unnamed')})."
+
+        if action == "status":
+            try:
+                from hermes_cli.gateway import find_gateway_pids
+                pids = find_gateway_pids()
+            except Exception:
+                pids = []
+            result = _cron_api(action="list", include_disabled=False)
+            if not result.get("success"):
+                return f"Failed to load cron status: {result.get('error', 'unknown error')}"
+            jobs = result.get("jobs", [])
+            if pids:
+                run_state = f"running (PID: {', '.join(map(str, pids))})"
+            else:
+                run_state = "not running"
+            next_runs = [j.get("next_run_at") for j in jobs if j.get("next_run_at")]
+            next_run = min(next_runs) if next_runs else "n/a"
+            return (
+                f"⏱️ **Cron Status**\n"
+                f"gateway: `{run_state}`\n"
+                f"active jobs: `{len(jobs)}`\n"
+                f"next run: `{next_run}`"
+            )
+
+        if action == "tick":
+            try:
+                from cron.scheduler import tick as cron_tick
+                await asyncio.to_thread(cron_tick, False)
+                return "🧪 Ran one cron scheduler tick."
+            except Exception as e:
+                return f"Failed to run cron tick: {e}"
+
+        return (
+            "Unknown `/cron` subcommand.\n"
+            "Use: `/cron list`, `/cron add <schedule> <prompt>`, "
+            "`/cron remove <job_id>`, `/cron run <job_id>`, `/cron pause <job_id>`, "
+            "`/cron resume <job_id>`, `/cron status`, or `/cron tick`."
+        )
     
+    async def _handle_model_command(self, event: MessageEvent) -> str:
+        """Handle /model command - show or change the current model."""
+        import yaml
+        from hermes_cli.models import (
+            curated_models_for_provider,
+            normalize_provider,
+            parse_model_input,
+            _PROVIDER_LABELS,
+        )
+
+        args = event.get_command_args().strip()
+        config_path = _hermes_home / 'config.yaml'
+
+        # Resolve current model and provider from config
+        current = os.getenv("HERMES_MODEL") or "anthropic/claude-opus-4.6"
+        current_provider = "openrouter"
+        try:
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                model_cfg = cfg.get("model", {})
+                if isinstance(model_cfg, str):
+                    current = model_cfg
+                elif isinstance(model_cfg, dict):
+                    current = model_cfg.get("default", current)
+                    current_provider = model_cfg.get("provider", current_provider)
+        except Exception:
+            pass
+
+        # Resolve "auto" to the actual provider using credential detection
+        current_provider = normalize_provider(current_provider)
+        if current_provider == "auto":
+            try:
+                from hermes_cli.auth import resolve_provider as _resolve_provider
+                current_provider = _resolve_provider(current_provider)
+            except Exception:
+                current_provider = "openrouter"
+
+        current = _normalize_gateway_model_for_provider(current, current_provider)
+
+        # Detect custom endpoint: provider resolved to openrouter but a custom
+        # base URL is configured — the user set up a custom endpoint.
+        if current_provider == "openrouter" and os.getenv("OPENAI_BASE_URL", "").strip():
+            current_provider = "custom"
+
+        if not args:
+            provider_label = _PROVIDER_LABELS.get(current_provider, current_provider)
+            lines = [
+                f"🤖 **Current model:** `{current}`",
+                f"**Provider:** {provider_label}",
+                "",
+            ]
+            curated = curated_models_for_provider(current_provider)
+            if curated:
+                lines.append(f"**Available models ({provider_label}):**")
+                for mid, desc in curated:
+                    marker = " ←" if mid == current else ""
+                    label = f"  _{desc}_" if desc else ""
+                    lines.append(f"• `{mid}`{label}{marker}")
+                lines.append("")
+            lines.append("To change: `/model model-name`")
+            lines.append("Switch provider: `/model provider:model-name`")
+            return "\n".join(lines)
+
+        # Handle bare "/model custom" — switch to custom provider
+        # and auto-detect the model from the endpoint.
+        if args.strip().lower() == "custom":
+            from hermes_cli.model_switch import switch_to_custom_provider
+            cust_result = switch_to_custom_provider()
+            if not cust_result.success:
+                return f"⚠️ {cust_result.error_message}"
+            try:
+                user_config = {}
+                if config_path.exists():
+                    with open(config_path, encoding="utf-8") as f:
+                        user_config = yaml.safe_load(f) or {}
+                if "model" not in user_config or not isinstance(user_config["model"], dict):
+                    user_config["model"] = {}
+                user_config["model"]["default"] = cust_result.model
+                user_config["model"]["provider"] = "custom"
+                user_config["model"]["base_url"] = cust_result.base_url
+                with open(config_path, 'w', encoding="utf-8") as f:
+                    yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
+            except Exception as e:
+                return f"⚠️ Failed to save model change: {e}"
+            os.environ["HERMES_MODEL"] = cust_result.model
+            os.environ["HERMES_INFERENCE_PROVIDER"] = "custom"
+            self._effective_model = None
+            self._effective_provider = None
+            return (
+                f"🤖 Model changed to `{cust_result.model}` (saved to config)\n"
+                f"**Provider:** Custom\n"
+                f"**Endpoint:** `{cust_result.base_url}`\n"
+                f"_Model auto-detected from endpoint. Takes effect on next message._"
+            )
+
+        # Core model-switching pipeline (shared with CLI)
+        from hermes_cli.model_switch import switch_model
+
+        # Resolve current base_url for is_custom detection
+        _resolved_base = ""
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider as _rtp
+            _resolved_base = _rtp(requested=current_provider).get("base_url", "")
+        except Exception:
+            pass
+
+        target_provider, requested_model = parse_model_input(args, current_provider)
+        requested_model = _normalize_gateway_model_for_provider(requested_model, target_provider)
+        switch_input = requested_model
+        if target_provider != current_provider:
+            switch_input = f"{target_provider}:{requested_model}"
+
+        result = switch_model(
+            switch_input,
+            current_provider,
+            current_base_url=_resolved_base,
+            current_api_key=os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or "",
+        )
+        result.new_model = _normalize_gateway_model_for_provider(
+            result.new_model,
+            result.target_provider,
+        )
+
+        if not result.success:
+            msg = result.error_message
+            tip = "\n\nUse `/model` to see available models, `/provider` to see providers" if "Did you mean" not in msg else ""
+            return f"⚠️ {msg}{tip}"
+
+        # Persist to config only if validation approves
+        if result.persist:
+            try:
+                user_config = {}
+                if config_path.exists():
+                    with open(config_path, encoding="utf-8") as f:
+                        user_config = yaml.safe_load(f) or {}
+                if "model" not in user_config or not isinstance(user_config["model"], dict):
+                    user_config["model"] = {}
+                user_config["model"]["default"] = result.new_model
+                if result.provider_changed:
+                    user_config["model"]["provider"] = result.target_provider
+                    # Persist base_url for custom endpoints; clear when
+                    # switching away from custom (#2562 Phase 2).
+                    if result.base_url and "openrouter.ai" not in (result.base_url or ""):
+                        user_config["model"]["base_url"] = result.base_url
+                    else:
+                        user_config["model"].pop("base_url", None)
+                with open(config_path, 'w', encoding="utf-8") as f:
+                    yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
+            except Exception as e:
+                return f"⚠️ Failed to save model change: {e}"
+
+        # Set env vars so the next agent run picks up the change
+        os.environ["HERMES_MODEL"] = result.new_model
+        os.environ["HERMES_INFERENCE_PROVIDER"] = result.target_provider
+
+        provider_note = f"\n**Provider:** {result.provider_label}" if result.provider_changed else ""
+
+        warning = ""
+        if result.warning_message:
+            warning = f"\n⚠️ {result.warning_message}"
+
+        persist_note = "saved to config" if result.persist else "this session only — will revert on restart"
+
+        # Clear fallback state since user explicitly chose a model
+        self._effective_model = None
+        self._effective_provider = None
+
+        # Show endpoint info for custom providers
+        custom_hint = ""
+        if result.is_custom_target:
+            endpoint = result.base_url or _resolved_base or "custom endpoint"
+            custom_hint = f"\n**Endpoint:** `{endpoint}`"
+            if not result.provider_changed:
+                custom_hint += (
+                    "\n_To switch providers, use_ `/model provider:model`"
+                    "\n_e.g._ `/model openrouter:anthropic/claude-sonnet-4`"
+                )
+
+        return f"🤖 Model changed to `{result.new_model}` ({persist_note}){provider_note}{warning}{custom_hint}\n_(takes effect on next message)_"
+
+    async def _handle_image_defaults_command(self, event: MessageEvent) -> str:
+        """Handle /invokeai-defaults command - show or change InvokeAI image defaults."""
+        aspect_presets = {
+            "1:1": (1024, 1024),
+            "16:9": (1344, 768),
+            "9:16": (768, 1344),
+            "4:3": (1152, 896),
+            "3:4": (896, 1152),
+        }
+
+        args = event.get_command_args().strip()
+        current = _get_image_generation_defaults()
+
+        if not args:
+            if current:
+                return (
+                    f"{_format_image_defaults(current)}\n"
+                    "\nTo change these, use `/invokeai-defaults <model> <aspect_ratio>`."
+                )
+            return (
+                "No image defaults saved yet.\n\n"
+                "Use `/invokeai-defaults <model> <aspect_ratio>`.\n"
+                "Supported aspect ratios: `1:1`, `16:9`, `9:16`, `4:3`, `3:4`."
+            )
+
+        try:
+            tokens = shlex.split(args)
+        except ValueError as e:
+            return f"Could not parse image defaults: {e}"
+
+        if len(tokens) > 2:
+            return (
+                "Too many arguments for `/invokeai-defaults`.\n\n"
+                "Usage: `/invokeai-defaults <model> <aspect_ratio>`\n"
+                "Example: `/invokeai-defaults \"Z-Image Turbo (quantized)\" 1:1`"
+            )
+
+        model = current.get("model") if current else None
+        aspect_ratio = current.get("aspect_ratio") if current else None
+
+        if len(tokens) == 1:
+            token = tokens[0]
+            if token in aspect_presets:
+                aspect_ratio = token
+            else:
+                model = token
+        elif len(tokens) == 2:
+            model, aspect_ratio = tokens
+
+        if not model:
+            return (
+                "Please pick a model.\n\n"
+                "The command can update just the aspect ratio if a model is already saved."
+            )
+
+        if not aspect_ratio:
+            aspect_ratio = "1:1"
+
+        if aspect_ratio not in aspect_presets:
+            valid = ", ".join(f"`{key}`" for key in aspect_presets)
+            return (
+                f"Unknown aspect ratio: `{aspect_ratio}`\n\n"
+                f"Valid options: {valid}"
+            )
+
+        width, height = aspect_presets[aspect_ratio]
+
+        try:
+            _save_image_generation_defaults(
+                model=model,
+                aspect_ratio=aspect_ratio,
+                width=width,
+                height=height,
+            )
+        except Exception as e:
+            return f"Failed to save image defaults: {e}"
+
+        os.environ["HERMES_IMAGE_DEFAULT_MODEL"] = model
+        os.environ["HERMES_IMAGE_DEFAULT_ASPECT_RATIO"] = aspect_ratio
+        os.environ["HERMES_IMAGE_DEFAULT_WIDTH"] = str(width)
+        os.environ["HERMES_IMAGE_DEFAULT_HEIGHT"] = str(height)
+
+        saved = {
+            "model": model,
+            "aspect_ratio": aspect_ratio,
+            "width": width,
+            "height": height,
+        }
+        return (
+            "Saved image defaults.\n\n"
+            f"{_format_image_defaults(saved)}\n"
+            "\nThese will be used as the starting image settings after your next message unless you override them."
+        )
+
+    async def _handle_wiki_host_command(self, event: MessageEvent) -> str:
+        """Handle /wiki-host command for LAN wiki hosting."""
+        args = event.get_command_args().strip()
+        if not args:
+            return self._wiki_host_status_message()
+
+        try:
+            tokens = shlex.split(args)
+        except ValueError as e:
+            return f"Could not parse wiki-host command: {e}"
+
+        action = (tokens[0] or "").strip().lower()
+        port_token = tokens[1].strip() if len(tokens) > 1 else ""
+
+        if action in {"status", "show"}:
+            return self._wiki_host_status_message()
+
+        if action in {"disable", "off", "stop"}:
+            self._stop_wiki_host()
+            _save_wiki_host_config(enabled=False, port=None)
+            return "Wiki hosting disabled."
+
+        if action in {"enable", "on", "start"}:
+            port = self._wiki_host_port or int((_get_wiki_host_config().get("port") or 8008))
+            if port_token:
+                try:
+                    port = int(port_token)
+                except ValueError:
+                    return f"Invalid port: `{port_token}`"
+            if not (1 <= int(port) <= 65535):
+                return f"Invalid port: `{port}`"
+
+            try:
+                return self._start_wiki_host(int(port))
+            except OSError as e:
+                return f"Could not start wiki host on port `{port}`: {e}"
+            except Exception as e:
+                return f"Failed to start wiki host: {e}"
+
+        return (
+            f"Unknown wiki-host action: `{action}`\n\n"
+            "Usage:\n"
+            "- `/wiki-host status`\n"
+            "- `/wiki-host enable 8008`\n"
+            "- `/wiki-host disable`"
+        )
     async def _handle_provider_command(self, event: MessageEvent) -> str:
         """Handle /provider command - show available providers."""
         import yaml
@@ -3088,7 +6139,7 @@ class GatewayRunner:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
                 config["agent"]["system_prompt"] = ""
-                with open(config_path, "w") as f:
+                with open(config_path, "w", encoding="utf-8") as f:
                     yaml.dump(config, f, default_flow_style=False, sort_keys=False)
             except Exception as e:
                 return f"⚠️ Failed to save personality change: {e}"
@@ -3114,6 +6165,308 @@ class GatewayRunner:
 
         available = "`none`, " + ", ".join(f"`{n}`" for n in personalities.keys())
         return f"Unknown personality: `{args}`\n\nAvailable: {available}"
+
+    async def _handle_terminal_command(self, event: MessageEvent) -> str:
+        """Handle /terminal command - show or change current Windows shell mode."""
+        args = event.get_command_args().strip().lower()
+
+        if os.name != "nt":
+            return (
+                "Terminal mode only applies when the **gateway** runs on Windows. "
+                "Right now the gateway is running on Linux/WSL, so local commands "
+                "always use your default POSIX shell."
+            )
+
+        current = os.getenv("HERMES_WINDOWS_SHELL", "auto")
+        if not args:
+            return (
+                "🖥️ **Current terminal mode:** "
+                f"`{current}`\n\n"
+                "Usage: `/terminal cmd`, `/terminal powershell`, `/terminal wsl`, `/terminal auto`"
+            )
+
+        mode_map = {
+            "windows": "powershell",
+            "pwsh": "powershell",
+            "powershell": "powershell",
+            "wsl": "wsl",
+            "linux": "wsl",
+            "auto": "auto",
+            "cmd": "cmd",
+            "cmd.exe": "cmd",
+        }
+
+        if args not in mode_map:
+            return (
+                f"Unknown terminal mode: `{args}`\n\n"
+                "Valid options: `cmd`, `powershell`, `wsl`, `auto` "
+                "(aliases: `windows`, `pwsh`)."
+            )
+
+        new_value = mode_map[args]
+        os.environ["HERMES_WINDOWS_SHELL"] = new_value
+        logger.info(
+            "Terminal mode switched to %s (HERMES_WINDOWS_SHELL=%s) by user",
+            new_value,
+            new_value,
+        )
+
+        # Persist for gateway restarts.
+        try:
+            import yaml
+
+            config_path = _hermes_home / "config.yaml"
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    persisted = yaml.safe_load(f) or {}
+            else:
+                persisted = {}
+
+            persisted["HERMES_WINDOWS_SHELL"] = new_value
+            with open(config_path, "w", encoding="utf-8", newline="") as f:
+                yaml.dump(persisted, f, default_flow_style=False)
+        except Exception as e:
+            logger.warning("Failed to persist terminal mode to config.yaml: %s", e)
+
+        human_mode = {
+            "powershell": "PowerShell",
+            "wsl": "WSL (Linux shell)",
+            "cmd": "cmd.exe",
+            "auto": "auto (cmd.exe > PowerShell > WSL)",
+        }.get(new_value, new_value)
+
+        return (
+            f"🖥️ Terminal mode set to **{human_mode}** "
+            f"(`HERMES_WINDOWS_SHELL={new_value}`).\n"
+            "Future local commands will use this shell."
+        )
+
+    @staticmethod
+    def _normalize_cdp_browser_name(raw: str) -> str:
+        normalized = (raw or "").strip().lower()
+        alias_map = {
+            "": "auto",
+            "auto": "auto",
+            "chrome": "chrome",
+            "google-chrome": "chrome",
+            "edge": "edge",
+            "msedge": "edge",
+            "microsoft-edge": "edge",
+            "brave": "brave",
+            "brave-browser": "brave",
+            "chromium": "chromium",
+            "comet": "comet",
+        }
+        return alias_map.get(normalized, normalized)
+
+    @staticmethod
+    def _default_cdp_port_for_browser(browser: str) -> int:
+        mapping = {
+            "auto": 9222,
+            "chrome": 9222,
+            "edge": 9223,
+            "brave": 9224,
+            "chromium": 9225,
+            "comet": 9226,
+        }
+        return mapping.get(GatewayRunner._normalize_cdp_browser_name(browser), 9222)
+
+    @staticmethod
+    def _is_likely_cdp_endpoint(raw: str) -> bool:
+        token = (raw or "").strip()
+        if not token:
+            return False
+        if token.startswith(("ws://", "wss://", "http://", "https://")):
+            return True
+        if token.isdigit():
+            return True
+        if " " in token:
+            return False
+        host, sep, port = token.rpartition(":")
+        return bool(sep and host and port.isdigit())
+
+    @staticmethod
+    def _resolve_browser_connect_target(raw_arg: str, default_port: int, default_browser: str, default_cdp_url: str):
+        arg = (raw_arg or "").strip()
+        browser_choice = GatewayRunner._normalize_cdp_browser_name(default_browser)
+        if not arg:
+            cdp_url = (default_cdp_url or "").strip() or f"ws://localhost:{default_port}"
+            return cdp_url, browser_choice, ""
+
+        if GatewayRunner._is_likely_cdp_endpoint(arg):
+            endpoint = arg
+            if endpoint.isdigit():
+                endpoint = f"ws://localhost:{endpoint}"
+            elif "://" not in endpoint:
+                endpoint = f"ws://{endpoint}"
+            return endpoint, browser_choice, ""
+
+        candidate = GatewayRunner._normalize_cdp_browser_name(arg)
+        supported = {"auto", "chrome", "edge", "brave", "chromium", "comet"}
+        if candidate in supported:
+            cdp_port = GatewayRunner._default_cdp_port_for_browser(candidate)
+            return f"ws://localhost:{cdp_port}", candidate, ""
+
+        err = (
+            f"Unknown browser target `{arg}`. "
+            "Use one of: auto, chrome, edge, brave, chromium, comet, or pass a CDP endpoint "
+            "(example: ws://localhost:9222)."
+        )
+        return "", "", err
+
+    @staticmethod
+    def _extract_cdp_port(cdp_url: str, fallback_port: int) -> int:
+        try:
+            parsed = urlparse((cdp_url or "").strip())
+            if parsed.port:
+                return int(parsed.port)
+        except Exception:
+            pass
+        try:
+            return int(str(cdp_url).rsplit(":", 1)[-1].split("/")[0])
+        except (ValueError, IndexError):
+            return fallback_port
+
+    @staticmethod
+    def _is_local_cdp_url(cdp_url: str) -> bool:
+        try:
+            parsed = urlparse((cdp_url or "").strip())
+        except Exception:
+            return False
+        host = (parsed.hostname or "").strip().lower()
+        return host in {"localhost", "127.0.0.1"}
+
+    async def _handle_browser_command(self, event: MessageEvent) -> str:
+        """Handle /browser connect|disconnect|status in gateway/sidecar sessions."""
+        try:
+            from tools.browser_tool import (
+                cleanup_all_browsers,
+                read_shared_cdp_state,
+                persist_shared_cdp_state,
+                clear_shared_cdp_state,
+            )
+        except Exception as e:
+            return f"Browser command unavailable: {e}"
+
+        args = event.get_command_args().strip()
+        if not args:
+            sub = "status"
+            target_arg = ""
+        else:
+            parts = args.split(None, 1)
+            sub = (parts[0] or "status").strip().lower()
+            target_arg = (parts[1] if len(parts) > 1 else "").strip()
+
+        default_browser = self._normalize_cdp_browser_name(os.environ.get("BROWSER_CDP_BROWSER", "auto"))
+        try:
+            default_port = int(str(os.environ.get("BROWSER_CDP_PORT", "9222")).strip())
+        except ValueError:
+            default_port = 9222
+
+        shared_state = read_shared_cdp_state() or {}
+        shared_cdp = str(shared_state.get("cdp_url") or "").strip()
+        current_env = os.environ.get("BROWSER_CDP_URL", "").strip()
+        current = current_env or shared_cdp
+        default_cdp = current or f"ws://localhost:{default_port}"
+
+        if sub == "status":
+            if current:
+                lines = [
+                    "🌐 Browser is connected to live CDP.",
+                    f"- Endpoint: `{current}`",
+                ]
+                if not current_env and shared_cdp:
+                    lines.append("- Source: shared runtime state")
+                port = self._extract_cdp_port(current, default_port)
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(1)
+                    s.connect(("127.0.0.1", port))
+                    s.close()
+                    lines.append("- Reachability: ✓ local endpoint reachable")
+                except Exception:
+                    lines.append("- Reachability: ⚠ local endpoint not reachable")
+                lines.append(f"- Preferred target: `{default_browser}`")
+                lines.append(f"- Default port: `{default_port}`")
+                return "\n".join(lines)
+            if os.environ.get("BROWSERBASE_API_KEY"):
+                return (
+                    "🌐 Browser mode: Browserbase (cloud).\n"
+                    "Use `/browser connect` to attach a live local CDP browser."
+                )
+            return (
+                "🌐 Browser mode: local headless Chromium.\n"
+                "Use `/browser connect [target]` to attach live CDP.\n"
+                "Targets: `auto`, `chrome`, `edge`, `brave`, `chromium`, `comet`, `ws://host:port`, `port`."
+            )
+
+        if sub == "disconnect":
+            if not current:
+                return "Browser is already disconnected from live CDP."
+            os.environ.pop("BROWSER_CDP_URL", None)
+            clear_shared_cdp_state()
+            try:
+                cleanup_all_browsers()
+            except Exception:
+                pass
+            return (
+                "🌐 Browser disconnected from live CDP.\n"
+                "Browser tools reverted to default mode (local headless or Browserbase)."
+            )
+
+        if sub == "connect":
+            cdp_url, browser_choice, resolve_err = self._resolve_browser_connect_target(
+                raw_arg=target_arg,
+                default_port=default_port,
+                default_browser=default_browser,
+                default_cdp_url=default_cdp,
+            )
+            if resolve_err:
+                return resolve_err
+
+            port = self._extract_cdp_port(cdp_url, default_port)
+            is_local = self._is_local_cdp_url(cdp_url)
+
+            reachable = True
+            if is_local:
+                reachable = False
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(1)
+                    s.connect(("127.0.0.1", port))
+                    s.close()
+                    reachable = True
+                except Exception:
+                    reachable = False
+
+            if is_local and not reachable:
+                return (
+                    "⚠ Browser not connected yet (CDP endpoint is unreachable).\n"
+                    f"- Expected endpoint: `{cdp_url}`\n"
+                    "- Start your browser with remote debugging enabled, then run `/browser connect` again."
+                )
+
+            os.environ["BROWSER_CDP_URL"] = cdp_url
+            os.environ["BROWSER_CDP_BROWSER"] = browser_choice
+            persisted = persist_shared_cdp_state(cdp_url, browser_choice)
+            try:
+                cleanup_all_browsers()
+            except Exception:
+                pass
+
+            lines = [
+                "🌐 Browser connected to live CDP.",
+                f"- Endpoint: `{cdp_url}`",
+                f"- Target: `{browser_choice}`",
+            ]
+            if not persisted:
+                lines.append("- ⚠ Could not persist shared runtime state.")
+            return "\n".join(lines)
+
+        return (
+            "Usage: `/browser connect [target]`, `/browser disconnect`, `/browser status`\n"
+            "Targets: `auto`, `chrome`, `edge`, `brave`, `chromium`, `comet`, `ws://host:port`, `port`."
+        )
     
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""
@@ -3406,13 +6759,16 @@ class GatewayRunner:
             return
 
         # Show transcript in text channel (after auth, with mention sanitization)
+        # via adapter.send so Discord embed chunking/limits match normal replies.
         try:
-            channel = adapter._client.get_channel(text_ch_id)
-            if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
-        except Exception:
-            pass
+            safe_text = transcript[:4000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+            await adapter.send(
+                chat_id=str(text_ch_id),
+                content=f"**[Voice]** <@{user_id}>: {safe_text}",
+                include_listen_button=False,
+            )
+        except Exception as e:
+            logger.debug("Failed to send voice transcript mirror message: %s", e)
 
         # Build a synthetic MessageEvent and feed through the normal pipeline
         # Use SimpleNamespace as raw_message so _get_guild_id() can extract
@@ -3737,15 +7093,18 @@ class GatewayRunner:
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            progress_mode = (
+                os.getenv("HERMES_TOOL_PROGRESS_MODE")
+                or "all"
+            )
 
             def run_sync():
                 agent = AIAgent(
-                    model=turn_route["model"],
-                    **turn_route["runtime"],
+                    model=model,
+                    **runtime_kwargs,
                     max_iterations=max_iterations,
                     quiet_mode=True,
-                    verbose_logging=False,
+                    verbose_logging=(progress_mode == "verbose"),
                     enabled_toolsets=enabled_toolsets,
                     reasoning_config=reasoning_config,
                     providers_allowed=pr.get("only"),
@@ -4088,12 +7447,12 @@ class GatewayRunner:
             except ValueError as e:
                 return f"⚠️ {e}"
         else:
-            # Show the current title and session ID
+            # Show the current title
             title = self._session_db.get_session_title(session_id)
             if title:
-                return f"📌 Session: `{session_id}`\nTitle: **{title}**"
+                return f"📌 Session title: **{title}**"
             else:
-                return f"📌 Session: `{session_id}`\nNo title set. Usage: `/title My Session Name`"
+                return "No title set. Usage: `/title My Session Name`"
 
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — switch to a previously-named session."""
@@ -4335,13 +7694,7 @@ class GatewayRunner:
     _APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes
 
     async def _handle_approve_command(self, event: MessageEvent) -> str:
-        """Handle /approve command — execute a pending dangerous command.
-
-        Usage:
-            /approve          — approve and execute the pending command
-            /approve session  — approve and remember for this session
-            /approve always   — approve this pattern permanently
-        """
+        """Handle /approve command — execute a pending dangerous command."""
         source = event.source
         session_key = self._session_key_for_source(source)
 
@@ -4349,9 +7702,8 @@ class GatewayRunner:
             return "No pending command to approve."
 
         import time as _time
-        approval = self._pending_approvals[session_key]
 
-        # Check for timeout
+        approval = self._pending_approvals[session_key]
         ts = approval.get("timestamp", 0)
         if _time.time() - ts > self._APPROVAL_TIMEOUT_SECONDS:
             self._pending_approvals.pop(session_key, None)
@@ -4364,9 +7716,8 @@ class GatewayRunner:
             pk = approval.get("pattern_key", "")
             pattern_keys = [pk] if pk else []
 
-        # Determine approval scope from args
         args = event.get_command_args().strip().lower()
-        from tools.approval import approve_session, approve_permanent
+        from tools.approval import approve_permanent, approve_session
 
         if args in ("always", "permanent", "permanently"):
             for pk in pattern_keys:
@@ -4377,14 +7728,13 @@ class GatewayRunner:
                 approve_session(session_key, pk)
             scope_msg = " (pattern approved for this session)"
         else:
-            # One-time approval — just approve for session so the immediate
-            # replay works, but don't advertise it as session-wide
             for pk in pattern_keys:
                 approve_session(session_key, pk)
             scope_msg = ""
 
         logger.info("User approved dangerous command via /approve: %s...%s", cmd[:60], scope_msg)
         from tools.terminal_tool import terminal_tool
+
         result = terminal_tool(command=cmd, force=True)
         return f"✅ Command approved and executed{scope_msg}.\n\n```\n{result[:3500]}\n```"
 
@@ -4413,10 +7763,10 @@ class GatewayRunner:
         import subprocess
         from datetime import datetime
 
-        project_root = Path(__file__).parent.parent.resolve()
-        git_dir = project_root / '.git'
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        git_dir = os.path.join(project_root, ".git")
 
-        if not git_dir.exists():
+        if not os.path.exists(git_dir):
             return "✗ Not a git repository — cannot update."
 
         hermes_cmd = _resolve_hermes_bin()
@@ -4437,7 +7787,7 @@ class GatewayRunner:
             "user_id": event.source.user_id,
             "timestamp": datetime.now().isoformat(),
         }
-        pending_path.write_text(json.dumps(pending))
+        pending_path.write_text(json.dumps(pending), encoding="utf-8")
         exit_code_path.unlink(missing_ok=True)
 
         # Spawn `hermes update` in a separate cgroup so it survives gateway
@@ -4457,6 +7807,33 @@ class GatewayRunner:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
+                )
+            elif os.name == "nt":
+                python_runner = (
+                    "import pathlib, subprocess, sys; "
+                    "hermes = sys.argv[1:-2]; "
+                    "output_path = pathlib.Path(sys.argv[-2]); "
+                    "exit_code_path = pathlib.Path(sys.argv[-1]); "
+                    "output_path.parent.mkdir(parents=True, exist_ok=True); "
+                    "with open(output_path, 'w', encoding='utf-8', errors='replace') as out: "
+                    "    rc = subprocess.run(hermes + ['update'], stdout=out, stderr=subprocess.STDOUT).returncode; "
+                    "exit_code_path.write_text(str(rc), encoding='utf-8')"
+                )
+                creationflags = 0
+                windows_flag_defaults = {
+                    "DETACHED_PROCESS": 0x00000008,
+                    "CREATE_NEW_PROCESS_GROUP": 0x00000200,
+                    "CREATE_NO_WINDOW": 0x08000000,
+                }
+                for flag_name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+                    creationflags |= getattr(subprocess, flag_name, windows_flag_defaults[flag_name])
+                subprocess.Popen(
+                    [sys.executable, "-c", python_runner, *hermes_cmd, str(output_path), str(exit_code_path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    creationflags=creationflags,
                 )
             else:
                 # Fallback: best-effort detach with start_new_session
@@ -4507,7 +7884,7 @@ class GatewayRunner:
 
         if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
             logger.warning("Update watcher timed out waiting for completion marker")
-            exit_code_path.write_text("124")
+            exit_code_path.write_text("124", encoding="utf-8")
             await self._send_update_notification()
 
     async def _send_update_notification(self) -> bool:
@@ -4539,7 +7916,7 @@ class GatewayRunner:
             elif not claimed_path.exists():
                 return True
 
-            pending = json.loads(claimed_path.read_text())
+            pending = json.loads(claimed_path.read_text(encoding="utf-8"))
             platform_str = pending.get("platform")
             chat_id = pending.get("chat_id")
 
@@ -4550,13 +7927,13 @@ class GatewayRunner:
                 claimed_path.replace(pending_path)
                 return False
 
-            exit_code_raw = exit_code_path.read_text().strip() or "1"
+            exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
             exit_code = int(exit_code_raw)
 
             # Read the captured update output
             output = ""
             if output_path.exists():
-                output = output_path.read_text()
+                output = output_path.read_text(encoding="utf-8", errors="replace")
 
             # Resolve adapter
             platform = Platform(platform_str)
@@ -4695,13 +8072,7 @@ class GatewayRunner:
             The enriched message string with transcriptions prepended.
         """
         if not getattr(self.config, "stt_enabled", True):
-            disabled_note = "[The user sent voice message(s), but transcription is disabled in config."
-            if self._has_setup_skill():
-                disabled_note += (
-                    " You have a skill called hermes-agent-setup that can help "
-                    "users configure Hermes features including voice, tools, and more."
-                )
-            disabled_note += "]"
+            disabled_note = "[The user sent voice message(s), but transcription is disabled in config.]"
             if user_text:
                 return f"{disabled_note}\n\n{user_text}"
             return disabled_note
@@ -4728,20 +8099,11 @@ class GatewayRunner:
                         "No STT provider" in error
                         or error.startswith("Neither VOICE_TOOLS_OPENAI_KEY nor OPENAI_API_KEY is set")
                     ):
-                        _no_stt_note = (
+                        enriched_parts.append(
                             "[The user sent a voice message but I can't listen "
-                            "to it right now — no STT provider is configured. "
-                            "A direct message has already been sent to the user "
-                            "with setup instructions."
+                            "to it right now~ No STT provider is configured "
+                            "(';w;') Let them know!]"
                         )
-                        if self._has_setup_skill():
-                            _no_stt_note += (
-                                " You have a skill called hermes-agent-setup "
-                                "that can help users configure Hermes features "
-                                "including voice, tools, and more."
-                            )
-                        _no_stt_note += "]"
-                        enriched_parts.append(_no_stt_note)
                     else:
                         enriched_parts.append(
                             "[The user sent a voice message but I had trouble "
@@ -4904,7 +8266,6 @@ class GatewayRunner:
         if _lock:
             with _lock:
                 self._agent_cache.pop(session_key, None)
-
     async def _run_agent(
         self,
         message: str,
@@ -4913,7 +8274,7 @@ class GatewayRunner:
         source: SessionSource,
         session_id: str,
         session_key: str = None,
-        _interrupt_depth: int = 0,
+        interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -4936,7 +8297,73 @@ class GatewayRunner:
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        browser_sidecar_cfg = {}
+        if isinstance(user_config, dict):
+            browser_sidecar_cfg = user_config.get("browser_sidecar", {}) or {}
 
+        def _as_bool(val: Any, default: bool = False) -> bool:
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                v = val.strip().lower()
+                if v in {"1", "true", "yes", "on"}:
+                    return True
+                if v in {"0", "false", "no", "off"}:
+                    return False
+            return default
+
+        browser_sidecar_max_iterations = None
+        browser_sidecar_max_tool_calls = None
+
+        # Browser sidecar sessions default to dedicated sidecar toolsets.
+        # By default this includes browser automation and excludes delegation.
+        if self._is_browser_bridge_source(source):
+            configured_sidecar_toolsets = browser_sidecar_cfg.get("toolsets")
+            normalized_sidecar_toolsets = []
+            if isinstance(configured_sidecar_toolsets, list):
+                normalized_sidecar_toolsets = [
+                    str(toolset).strip()
+                    for toolset in configured_sidecar_toolsets
+                    if str(toolset).strip()
+                ]
+
+            if normalized_sidecar_toolsets:
+                enabled_toolsets = normalized_sidecar_toolsets
+            else:
+                allow_sidecar_delegation = _as_bool(
+                    browser_sidecar_cfg.get(
+                        "allow_delegation",
+                        os.getenv("HERMES_BROWSER_SIDECAR_ALLOW_DELEGATION", ""),
+                    ),
+                    default=False,
+                )
+                enabled_toolsets = [
+                    "hermes-sidecar-delegating" if allow_sidecar_delegation else "hermes-sidecar"
+                ]
+
+            raw_sidecar_max_turns = browser_sidecar_cfg.get("max_turns")
+            try:
+                parsed_sidecar_max_turns = int(raw_sidecar_max_turns)
+            except (TypeError, ValueError):
+                parsed_sidecar_max_turns = 0
+            if parsed_sidecar_max_turns > 0:
+                browser_sidecar_max_iterations = parsed_sidecar_max_turns
+
+            raw_sidecar_max_tool_calls = browser_sidecar_cfg.get("max_tool_calls")
+            try:
+                parsed_sidecar_max_tool_calls = int(raw_sidecar_max_tool_calls)
+            except (TypeError, ValueError):
+                parsed_sidecar_max_tool_calls = 0
+            if parsed_sidecar_max_tool_calls > 0:
+                browser_sidecar_max_tool_calls = parsed_sidecar_max_tool_calls
+
+            logger.info(
+                "Browser sidecar policy active: toolsets=%s max_turns=%s max_tool_calls=%s",
+                enabled_toolsets,
+                browser_sidecar_max_iterations if browser_sidecar_max_iterations is not None else "default",
+                browser_sidecar_max_tool_calls if browser_sidecar_max_tool_calls is not None else "default",
+            )
+        _progress_cfg = user_config.get("display", {}) if isinstance(user_config.get("display"), dict) else {}
         # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
         # Falls back to env vars for backward compatibility.
         # YAML 1.1 parses bare `off` as boolean False — normalise before
@@ -4949,73 +8376,304 @@ class GatewayRunner:
             or os.getenv("HERMES_TOOL_PROGRESS_MODE")
             or "all"
         )
+        progress_style = (
+            _progress_cfg.get("tool_progress_style")
+            or os.getenv("HERMES_TOOL_PROGRESS_STYLE")
+            or "single"
+        ).strip().lower()
+        if progress_style not in {"feed", "single"}:
+            progress_style = "single"
+
+        try:
+            progress_rolling_entries = int(
+                _progress_cfg.get("tool_progress_rolling_entries")
+                or os.getenv("HERMES_TOOL_PROGRESS_ROLLING_ENTRIES", "4")
+            )
+        except Exception:
+            progress_rolling_entries = 4
+        progress_rolling_entries = max(1, min(progress_rolling_entries, 8))
+
+        try:
+            progress_embed_max_chars = int(
+                os.getenv("HERMES_TOOL_PROGRESS_EMBED_MAX_CHARS", "3800")
+            )
+        except Exception:
+            progress_embed_max_chars = 3800
+        progress_embed_max_chars = max(1200, min(progress_embed_max_chars, 3900))
+
         tool_progress_enabled = progress_mode != "off"
-        
-        # Queue for progress messages (thread-safe)
-        progress_queue = queue.Queue() if tool_progress_enabled else None
+
+        _has_messaging_adapter = bool(self.adapters.get(source.platform))
+        _bridge_sidecar = self._is_browser_bridge_source(source)
+        # Queue only when a messaging adapter consumes progress (Discord, etc.). Browser sidecar
+        # uses synchronous fan-out from _push_recent_event into _browser_bridge_progress instead.
+        progress_queue = queue.Queue() if (tool_progress_enabled and _has_messaging_adapter) else None
         last_tool = [None]  # Mutable container for tracking in closure
-        last_progress_msg = [None]  # Track last message for dedup
-        repeat_count = [0]  # How many times the same message repeated
-        
-        def progress_callback(tool_name: str, preview: str = None, args: dict = None):
-            """Callback invoked by agent when a tool is called."""
-            if not progress_queue:
+        last_terminal_progress = [None]
+        progress_state = {
+            "started_at": time.monotonic(),
+            "phase": "thinking",
+            "last_detail": "Queued request...",
+            "tool_calls": 0,
+            "updates": 0,
+            "recent_events": [],
+        }
+
+        def _summarize_result_for_status(result_text: str, is_error: bool) -> str:
+            text = (result_text or "").strip()
+            if not text:
+                return ""
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return text if is_error else ""
+
+            if isinstance(parsed, dict):
+                parts: list[str] = []
+                status = str(parsed.get("status") or "").strip()
+                details = str(parsed.get("details") or "").strip()
+                if status:
+                    parts.append(f"status={status}")
+                if details:
+                    parts.append(details)
+                if "exit_code" in parsed:
+                    parts.append(f"exit={parsed.get('exit_code')}")
+                err = parsed.get("error")
+                if err:
+                    parts.append(f"error={err}")
+                stderr = parsed.get("stderr")
+                if not err and is_error and isinstance(stderr, str) and stderr.strip():
+                    parts.append(f"stderr={stderr.strip()}")
+                if not parts and is_error:
+                    message_text = parsed.get("message")
+                    if isinstance(message_text, str) and message_text.strip():
+                        parts.append(message_text.strip())
+                return " | ".join(parts)
+            return text if is_error else ""
+
+        def _push_recent_event(detail: str) -> None:
+            text = (detail or "").strip()
+            if not text:
                 return
-            
-            # "new" mode: only report when tool changes
+            ts = datetime.now().strftime("%H:%M:%S")
+            event_line = f"`{ts}` {text}"
+            recent_events = progress_state.setdefault("recent_events", [])
+            if recent_events and recent_events[-1] == event_line:
+                return
+            recent_events.append(event_line)
+            while len(recent_events) > progress_rolling_entries:
+                recent_events.pop(0)
+            # Sidecar extension polls progress.recent_events — mirror Discord-style tool lines here.
+            if session_key and _bridge_sidecar:
+                bridge_line = f"[{ts}] {text}"
+                bridge_events = self._append_browser_bridge_progress_event(
+                    session_key,
+                    bridge_line,
+                    limit=_BROWSER_BRIDGE_PROGRESS_EVENT_CAP,
+                )
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=True,
+                    detail=text[:500] if text else "",
+                    recent_events=bridge_events,
+                )
+
+        def _emit_gateway_terminal_progress(detail: str, phase: str | None = None) -> None:
+            text = (detail or "").strip()
+            if not text:
+                return
+            rendered = text if not phase else f"[{phase}] {text}"
+            if rendered == last_terminal_progress[0]:
+                return
+            last_terminal_progress[0] = rendered
+            _write_gateway_console_progress_line(
+                f"[gateway-progress][session {session_id}] {rendered}"
+            )
+            logger.info(
+                "[gateway-progress][session %s] %s",
+                session_id,
+                rendered,
+            )
+
+        def _set_progress_state(*, phase: str | None = None, detail: str | None = None, tool_call: bool = False):
+            if phase:
+                progress_state["phase"] = phase
+            if detail:
+                progress_state["last_detail"] = detail
+                _push_recent_event(detail)
+                _emit_gateway_terminal_progress(detail, progress_state.get("phase"))
+            if tool_call:
+                progress_state["tool_calls"] += 1
+            progress_state["updates"] += 1
+            if progress_queue:
+                progress_queue.put("__tick__")
+
+        def _build_progress_message() -> str:
+            elapsed = int(max(0, time.monotonic() - progress_state["started_at"]))
+            phase = progress_state.get("phase", "thinking")
+            phase_label = {
+                "starting": "starting",
+                "thinking": "thinking",
+                "tool": "running commands",
+                "finalizing": "finalizing",
+            }.get(phase, "working")
+            phase_emoji = {
+                "starting": "🚀",
+                "thinking": "💡",
+                "tool": "🛠️",
+                "finalizing": "🧾",
+            }.get(phase, "⚙️")
+            header = f"{phase_emoji} Hermes is {phase_label}... ({elapsed}s)"
+            footer = f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
+            events = list(progress_state.get("recent_events") or [])
+            if not events:
+                fallback = (progress_state.get("last_detail") or "Working...").strip()
+                events = [f"`{datetime.now().strftime('%H:%M:%S')}` {fallback}"]
+
+            def _render(lines: list[str]) -> str:
+                body = "\n".join(f"• {line}" for line in lines)
+                return f"{header}\n{body}\n{footer}"
+
+            msg = _render(events[-progress_rolling_entries:])
+            if len(msg) <= progress_embed_max_chars:
+                return msg
+
+            lines = events[-progress_rolling_entries:]
+            while len(lines) > 1:
+                lines = lines[1:]
+                msg = _render(lines)
+                if len(msg) <= progress_embed_max_chars:
+                    return msg
+
+            lone = lines[0] if lines else ""
+            overhead = len(f"{header}\n• \n{footer}")
+            available = max(80, progress_embed_max_chars - overhead)
+            if len(lone) > available:
+                lone = lone[: max(0, available - 24)] + "... [trimmed for embed]"
+            return _render([lone])
+
+        def progress_callback(tool_name: str, preview: str = None, args: dict = None):
+            """Callback invoked by agent when tool progress changes."""
+            if not progress_queue and not _bridge_sidecar:
+                return
+
+            # Optional completion payloads from newer run_agent variants.
+            if tool_name == "_tool_result":
+                payload = args or {}
+                completed_tool = str(payload.get("tool") or preview or "tool")
+                duration = payload.get("duration_seconds")
+                is_error = bool(payload.get("is_error"))
+                status_suffix = str(payload.get("status_suffix") or "").strip()
+                result_text = str(payload.get("result") or "").strip()
+                status_emoji = "❌" if is_error else "✅"
+                duration_text = ""
+                if isinstance(duration, (int, float)):
+                    duration_text = f" in {float(duration):.2f}s"
+                detail = f"{status_emoji} {completed_tool} finished{duration_text}"
+                summary_suffix = _summarize_result_for_status(result_text, is_error)
+                if status_suffix:
+                    detail = f"{detail} {status_suffix}"
+                if summary_suffix:
+                    detail = f"{detail} | {summary_suffix}"
+                _set_progress_state(phase="tool", detail=detail, tool_call=False)
+                return
+
+            if tool_name == "_tool_waiting":
+                payload = args or {}
+                waiting_tool = str(payload.get("tool") or preview or "tool")
+                elapsed = payload.get("elapsed_seconds")
+                waiting_preview = str(payload.get("preview") or waiting_tool).strip()
+                elapsed_text = ""
+                if isinstance(elapsed, (int, float)):
+                    elapsed_text = f" ({int(max(1, round(float(elapsed))))}s)"
+                detail = f"⏳ {waiting_tool} still running{elapsed_text}"
+                if waiting_preview and waiting_preview != waiting_tool:
+                    detail = f"{detail} | {waiting_preview}"
+                _set_progress_state(phase="tool", detail=detail, tool_call=False)
+                return
+
+            # "new" mode: only report when tool changes.
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-            
-            # Build progress message with primary argument preview
+
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
-            
-            # Verbose mode: show detailed arguments
-            if progress_mode == "verbose" and args:
-                import json as _json
-                args_str = _json.dumps(args, ensure_ascii=False, default=str)
-                if len(args_str) > 200:
-                    args_str = args_str[:197] + "..."
-                msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
-                progress_queue.put(msg)
+
+            if tool_name == "_thinking":
+                _set_progress_state(phase="thinking", detail=f"💡 thinking: {preview or 'working...'}")
                 return
-            
+
+            # Verbose mode: include argument keys/preview.
+            if progress_mode == "verbose" and args:
+                try:
+                    if tool_name == "terminal":
+                        command = str(args.get("command") or "").strip()
+                        workdir = str(args.get("workdir") or "").strip()
+                        timeout = args.get("timeout")
+                        parts = [f"{emoji} terminal"]
+                        if workdir:
+                            parts.append(f"cwd={workdir}")
+                        if timeout not in (None, ""):
+                            parts.append(f"timeout={timeout}")
+                        if command:
+                            max_command_chars = max(240, min(progress_embed_max_chars - 250, 1800))
+                            if len(command) > max_command_chars:
+                                command = command[: max_command_chars - 3] + "..."
+                            parts.append(f"cmd={command}")
+                        detail = " | ".join(parts)
+                        _set_progress_state(phase="tool", detail=detail, tool_call=True)
+                        return
+                    args_str = json.dumps(args, ensure_ascii=False, default=str)
+                except Exception:
+                    args_str = str(args)
+                max_args_chars = max(240, min(progress_embed_max_chars - 250, 1200))
+                if len(args_str) > max_args_chars:
+                    args_str = args_str[: max_args_chars - 3] + "..."
+                detail = f"{emoji} {tool_name}({list(args.keys())}) {args_str}"
+                _set_progress_state(phase="tool", detail=detail, tool_call=True)
+                return
+
             if preview:
-                # Truncate preview to keep messages clean
                 if len(preview) > 80:
                     preview = preview[:77] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+                detail = f"{emoji} {tool_name}: \"{preview}\""
             else:
-                msg = f"{emoji} {tool_name}..."
-            
-            # Dedup: collapse consecutive identical progress messages.
-            # Common with execute_code where models iterate with the same
-            # code (same boilerplate imports → identical previews).
-            if msg == last_progress_msg[0]:
-                repeat_count[0] += 1
-                # Update the last line in progress_lines with a counter
-                # via a special "dedup" queue message.
-                progress_queue.put(("__dedup__", msg, repeat_count[0]))
+                detail = f"{emoji} {tool_name}..."
+            _set_progress_state(phase="tool", detail=detail, tool_call=True)
+
+        def progress_thinking_callback(text: str) -> None:
+            cleaned = str(text or "").strip()
+            if not cleaned:
                 return
-            last_progress_msg[0] = msg
-            repeat_count[0] = 0
-            
-            progress_queue.put(msg)
-        
-        # Background task to send progress messages
-        # Accumulates tool lines into a single message that gets edited.
-        #
+            progress_callback("_thinking", cleaned)
+
+        def progress_tool_gen_callback(tool_name: str) -> None:
+            cleaned = str(tool_name or "").strip()
+            if not cleaned:
+                return
+            progress_callback(cleaned)
+
+        # Background task to send progress messages.
         # Threading metadata is platform-specific:
         # - Slack DM threading needs event_message_id fallback (reply thread)
         # - Telegram uses message_thread_id only for forum topics; passing a
         #   normal DM/group message id as thread_id causes send failures
-        # - Other platforms should use explicit source.thread_id only
+        # - Discord benefits from tool_progress metadata to suppress listen controls
         if source.platform == Platform.SLACK:
             _progress_thread_id = source.thread_id or event_message_id
+            _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        elif source.platform == Platform.DISCORD:
+            _progress_thread_id = source.thread_id
+            _progress_metadata = {"tool_progress": True}
+            if _progress_thread_id:
+                _progress_metadata["thread_id"] = _progress_thread_id
         else:
             _progress_thread_id = source.thread_id
-        _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+            _progress_metadata = (
+                {"tool_progress": True, "thread_id": _progress_thread_id}
+                if _progress_thread_id else None
+            )
 
         async def send_progress_messages():
             if not progress_queue:
@@ -5025,78 +8683,129 @@ class GatewayRunner:
             if not adapter:
                 return
 
-            progress_lines = []      # Accumulated tool lines
-            progress_msg_id = None   # ID of the progress message to edit
-            can_edit = True          # False once an edit fails (platform doesn't support it)
+            def _is_retryable_progress_edit_error(error_text: str | None) -> bool:
+                """Treat transport/server issues as transient so we keep one live message."""
+                err = (error_text or "").lower()
+                permanent_markers = (
+                    "unknown message",
+                    "not found",
+                    "forbidden",
+                    "missing access",
+                    "missing permissions",
+                    "cannot edit",
+                    "error code: 10008",
+                    "error code: 50013",
+                )
+                if any(marker in err for marker in permanent_markers):
+                    return False
+                transient_markers = (
+                    "503",
+                    "502",
+                    "504",
+                    "service unavailable",
+                    "gateway timeout",
+                    "upstream connect error",
+                    "remote connection failure",
+                    "reset before headers",
+                    "timeout",
+                    "timed out",
+                    "temporarily unavailable",
+                    "connection reset",
+                    "try again",
+                    "rate limit",
+                    "429",
+                )
+                if any(marker in err for marker in transient_markers):
+                    return True
+                # Default to retryable so one flaky edit does not fan out into message spam.
+                return True
+
+            progress_msg_id = None
+            last_rendered = ""
+            last_emit_at = 0.0
 
             while True:
                 try:
-                    raw = progress_queue.get_nowait()
-                    
-                    # Handle dedup messages: update last line with repeat counter
-                    if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
-                        _, base_msg, count = raw
-                        if progress_lines:
-                            progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                        msg = progress_lines[-1] if progress_lines else base_msg
-                    else:
-                        msg = raw
-                        progress_lines.append(msg)
-
-                    if can_edit and progress_msg_id is not None:
-                        # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
-                        result = await adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=progress_msg_id,
-                            content=full_text,
-                        )
-                        if not result.success:
-                            # Platform doesn't support editing — stop trying,
-                            # send just this new line as a separate message
-                            can_edit = False
-                            await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
-                    else:
-                        if can_edit:
-                            # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
-                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
-                        else:
-                            # Editing unsupported: send just this line
-                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
-                        if result.success and result.message_id:
-                            progress_msg_id = result.message_id
-
-                    # Restore typing indicator
-                    await asyncio.sleep(0.3)
-                    await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
-
-                except queue.Empty:
-                    await asyncio.sleep(0.3)
-                except asyncio.CancelledError:
-                    # Drain remaining queued messages
-                    while not progress_queue.empty():
+                    updated = False
+                    while True:
                         try:
-                            raw = progress_queue.get_nowait()
-                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
-                                _, base_msg, count = raw
-                                if progress_lines:
-                                    progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                            else:
-                                progress_lines.append(raw)
-                        except Exception:
+                            progress_queue.get_nowait()
+                            updated = True
+                        except queue.Empty:
                             break
-                    # Final edit with all remaining tools (only if editing works)
-                    if can_edit and progress_lines and progress_msg_id:
-                        full_text = "\n".join(progress_lines)
+
+                    now = time.monotonic()
+                    heartbeat_due = (now - last_emit_at) >= 1.0
+                    should_emit = updated or (progress_style == "single" and heartbeat_due)
+                    if progress_state["updates"] <= 0 and not updated:
+                        await asyncio.sleep(0.25)
+                        continue
+                    if not should_emit:
+                        await asyncio.sleep(0.25)
+                        continue
+
+                    msg = _build_progress_message()
+                    if progress_style == "single":
+                        result = None
+                        if progress_msg_id is not None:
+                            result = await adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=progress_msg_id,
+                                content=msg,
+                            )
+                            if not result.success:
+                                if _is_retryable_progress_edit_error(result.error):
+                                    logger.warning(
+                                        "Transient progress edit failure for %s message %s; preserving single-message mode: %s",
+                                        source.platform,
+                                        progress_msg_id,
+                                        result.error,
+                                    )
+                                    last_emit_at = now
+                                    await asyncio.sleep(0.25)
+                                    continue
+                                progress_msg_id = None
+                        else:
+                            result = await adapter.send(
+                                chat_id=source.chat_id,
+                                content=msg,
+                                metadata=_progress_metadata,
+                            )
+                            if result.success and result.message_id:
+                                progress_msg_id = result.message_id
+                        if progress_msg_id is None and (result is None or not result.success):
+                            result = await adapter.send(
+                                chat_id=source.chat_id,
+                                content=msg,
+                                metadata=_progress_metadata,
+                            )
+                            if result.success and result.message_id:
+                                progress_msg_id = result.message_id
+                    else:
+                        result = await adapter.send(
+                            chat_id=source.chat_id,
+                            content=msg,
+                            metadata=_progress_metadata,
+                        )
+
+                    if result is None or result.success:
+                        last_rendered = msg
+                    last_emit_at = now
+                    await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+                    await asyncio.sleep(0.25)
+                except asyncio.CancelledError:
+                    if progress_msg_id and last_rendered:
                         try:
                             await adapter.edit_message(
                                 chat_id=source.chat_id,
                                 message_id=progress_msg_id,
-                                content=full_text,
+                                content=last_rendered,
                             )
                         except Exception:
                             pass
+                    with contextlib.suppress(Exception):
+                        if hasattr(adapter, "stop_typing"):
+                            await adapter.stop_typing(source.chat_id)
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
@@ -5106,7 +8815,6 @@ class GatewayRunner:
         agent_holder = [None]  # Mutable container for the agent instance
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
-        stream_consumer_holder = [None]  # Mutable container for stream consumer
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_event_loop()
@@ -5154,6 +8862,8 @@ class GatewayRunner:
 
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            if browser_sidecar_max_iterations is not None:
+                max_iterations = browser_sidecar_max_iterations
             
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
@@ -5241,6 +8951,9 @@ class GatewayRunner:
 
             if agent is None:
                 # Config changed or first message — create fresh agent
+                initial_tool_progress_callback = progress_callback if tool_progress_enabled else None
+                initial_thinking_callback = progress_thinking_callback if tool_progress_enabled else None
+                initial_step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -5264,20 +8977,27 @@ class GatewayRunner:
                     honcho_config=honcho_config,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    max_tool_calls_per_run=browser_sidecar_max_tool_calls,
+                    tool_progress_callback=initial_tool_progress_callback,
+                    thinking_callback=initial_thinking_callback,
+                    step_callback=initial_step_callback,
+                    status_callback=_status_callback_sync,
+                    stream_delta_callback=_stream_delta_cb,
+                    tool_gen_callback=progress_tool_gen_callback if tool_progress_enabled else None,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         _cache[session_key] = (agent, _sig)
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
-            # Per-message state — callbacks and reasoning config change every
-            # turn and must not be baked into the cached agent constructor.
+            # Per-message state — refresh callbacks and reasoning config every
+            # turn so cached agents follow the current session context.
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.thinking_callback = progress_thinking_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
-
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
                 if not _status_adapter:
@@ -5295,7 +9015,7 @@ class GatewayRunner:
                     logger.debug("background_review_callback error: %s", _e)
 
             agent.background_review_callback = _bg_review_send
-
+            agent.tool_gen_callback = progress_tool_gen_callback if tool_progress_enabled else None
             # Store agent reference for interrupt support
             agent_holder[0] = agent
             # Capture the full tool definitions for transcript logging
@@ -5367,12 +9087,18 @@ class GatewayRunner:
                             if _p:
                                 _history_media_paths.add(_p)
             
-            result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
-            result_holder[0] = result
+            tool_task_id = session_id
+            if self._is_browser_bridge_source(source):
+                # Sidecar turns use a stable prefix so tools can apply sidecar-only
+                # execution policy (for example forcing local/CDP browser mode).
+                tool_task_id = f"sidecar_{session_id}"
 
-            # Signal the stream consumer that the agent is done
-            if _stream_consumer is not None:
-                _stream_consumer.finish()
+            result = agent.run_conversation(
+                message,
+                conversation_history=agent_history,
+                task_id=tool_task_id,
+            )
+            result_holder[0] = result
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
@@ -5454,21 +9180,6 @@ class GatewayRunner:
 
             effective_session_id = getattr(agent, 'session_id', session_id) if agent else session_id
 
-            # Auto-generate session title after first exchange (non-blocking)
-            if final_response and self._session_db:
-                try:
-                    from agent.title_generator import maybe_auto_title
-                    all_msgs = result_holder[0].get("messages", []) if result_holder[0] else []
-                    maybe_auto_title(
-                        self._session_db,
-                        effective_session_id,
-                        message,
-                        final_response,
-                        all_msgs,
-                    )
-                except Exception:
-                    pass
-
             return {
                 "final_response": final_response,
                 "last_reasoning": result.get("last_reasoning"),
@@ -5486,21 +9197,11 @@ class GatewayRunner:
         # Start progress message sender if enabled
         progress_task = None
         if tool_progress_enabled:
+            _set_progress_state(
+                phase="starting",
+                detail="🚀 starting request: handing message to Hermes...",
+            )
             progress_task = asyncio.create_task(send_progress_messages())
-
-        # Start stream consumer task — polls for consumer creation since it
-        # happens inside run_sync (thread pool) after the agent is constructed.
-        stream_task = None
-
-        async def _start_stream_consumer():
-            """Wait for the stream consumer to be created, then run it."""
-            for _ in range(200):  # Up to 10s wait
-                if stream_consumer_holder[0] is not None:
-                    await stream_consumer_holder[0].run()
-                    return
-                await asyncio.sleep(0.05)
-
-        stream_task = asyncio.create_task(_start_stream_consumer())
         
         # Track this agent as running for this session (for interrupt support)
         # We do this in a callback after the agent is created
@@ -5539,7 +9240,10 @@ class GatewayRunner:
         try:
             # Run in thread pool to not block
             loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(None, run_sync)
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gateway-agent") as pool:
+                response = await loop.run_in_executor(pool, run_sync)
 
             # Track fallback model state: if the agent switched to a
             # fallback model during this run, persist it so /model shows
@@ -5592,11 +9296,11 @@ class GatewayRunner:
                 
                 # Cap recursion depth to prevent resource exhaustion when the
                 # user sends multiple messages while the agent keeps failing. (#816)
-                if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
+                if interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
                     logger.warning(
                         "Interrupt recursion depth %d reached for session %s — "
                         "queueing message instead of recursing.",
-                        _interrupt_depth, session_key,
+                        interrupt_depth, session_key,
                     )
                     # Queue the pending message for normal processing on next turn
                     adapter = self.adapters.get(source.platform)
@@ -5631,24 +9335,13 @@ class GatewayRunner:
                     source=source,
                     session_id=session_id,
                     session_key=session_key,
-                    _interrupt_depth=_interrupt_depth + 1,
+                    interrupt_depth=interrupt_depth + 1,
                 )
         finally:
             # Stop progress sender and interrupt monitor
             if progress_task:
                 progress_task.cancel()
             interrupt_monitor.cancel()
-
-            # Wait for stream consumer to finish its final edit
-            if stream_task:
-                try:
-                    await asyncio.wait_for(stream_task, timeout=5.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    stream_task.cancel()
-                    try:
-                        await stream_task
-                    except asyncio.CancelledError:
-                        pass
             
             # Clean up tracking
             tracking_task.cancel()
@@ -5662,12 +9355,6 @@ class GatewayRunner:
                         await task
                     except asyncio.CancelledError:
                         pass
-
-        # If streaming already delivered the response, mark it so the
-        # caller's send() is skipped (avoiding duplicate messages).
-        _sc = stream_consumer_holder[0]
-        if _sc and _sc.already_sent and isinstance(response, dict):
-            response["already_sent"] = True
         
         return response
 
@@ -5737,6 +9424,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    _harden_windows_console_logging()
+
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.
     # The PID file is scoped to HERMES_HOME, so future multi-profile
@@ -5798,7 +9487,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 existing_pid, hermes_home,
             )
             print(
-                f"\n❌ Gateway already running (PID {existing_pid}).\n"
+                f"\nGateway already running (PID {existing_pid}).\n"
                 f"   Use 'hermes gateway restart' to replace it,\n"
                 f"   or 'hermes gateway stop' to kill it first.\n"
                 f"   Or use 'hermes gateway run --replace' to auto-replace.\n"
@@ -5819,6 +9508,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         log_dir / 'gateway.log',
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
+        encoding="utf-8",
+        errors="replace",
     )
     from agent.redact import RedactingFormatter
     file_handler.setFormatter(RedactingFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
@@ -5830,12 +9521,31 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         log_dir / 'errors.log',
         maxBytes=2 * 1024 * 1024,
         backupCount=2,
+        encoding="utf-8",
+        errors="replace",
     )
     error_handler.setLevel(logging.WARNING)
     error_handler.setFormatter(RedactingFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
     logging.getLogger().addHandler(error_handler)
 
     runner = GatewayRunner(config)
+    detached_mode = os.getenv("HERMES_GATEWAY_DETACHED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    previous_sigint_handler = None
+
+    # Detached gateway windows should not be torn down by stray SIGINT delivery.
+    # This process is meant to be controlled via `hermes gateway stop/restart`.
+    if detached_mode:
+        try:
+            previous_sigint_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            logger.info("Detached gateway mode: ignoring SIGINT to prevent accidental shutdown.")
+        except Exception as e:
+            logger.debug("Could not install detached SIGINT ignore handler: %s", e)
     
     # Set up signal handlers
     def signal_handler():
@@ -5875,23 +9585,74 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     cron_thread.start()
     
     # Wait for shutdown
-    await runner.wait_for_shutdown()
+    try:
+        while True:
+            try:
+                await runner.wait_for_shutdown()
+                break
+            except asyncio.CancelledError:
+                running = bool(getattr(runner, "_running", False))
+                shutdown_requested = bool(getattr(runner, "_shutdown_event", None) and runner._shutdown_event.is_set())
+                active_sidecar_turns = any(
+                    not task.done()
+                    for task in getattr(runner, "_browser_bridge_tasks", {}).values()
+                )
+                recoverable_cancel = running and not shutdown_requested and (
+                    detached_mode or active_sidecar_turns
+                )
+                if recoverable_cancel:
+                    detail = "detached mode" if detached_mode else "active browser sidecar turn"
+                    logger.error(
+                        "Unexpected cancellation while gateway is running (%s); "
+                        "keeping gateway alive and resuming wait.",
+                        detail,
+                    )
+                    current = asyncio.current_task()
+                    if current and hasattr(current, "uncancel"):
+                        try:
+                            current.uncancel()
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0)
+                    continue
 
-    if runner.should_exit_with_failure:
+                logger.info("Gateway shutdown wait was cancelled; stopping gracefully.")
+                if running:
+                    try:
+                        await runner.stop()
+                    except Exception as e:
+                        logger.debug("Graceful stop after cancellation failed: %s", e)
+                break
+    finally:
+        if previous_sigint_handler is not None:
+            try:
+                signal.signal(signal.SIGINT, previous_sigint_handler)
+            except Exception:
+                pass
+
+        # Stop cron ticker cleanly
+        cron_stop.set()
+        cron_thread.join(timeout=5)
+
+        # Close MCP server connections
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+            shutdown_mcp_servers()
+        except Exception:
+            pass
+
+        # Ensure runtime status and PID are not left stale after abnormal exits.
+        try:
+            from gateway.status import remove_pid_file, write_runtime_status
+            remove_pid_file()
+            write_runtime_status(gateway_state="stopped", exit_reason=getattr(runner, "_exit_reason", None))
+        except Exception:
+            pass
+
+    if getattr(runner, "should_exit_with_failure", False):
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
-    
-    # Stop cron ticker cleanly
-    cron_stop.set()
-    cron_thread.join(timeout=5)
-
-    # Close MCP server connections
-    try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
-    except Exception:
-        pass
 
     return True
 

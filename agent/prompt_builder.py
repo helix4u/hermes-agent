@@ -150,6 +150,9 @@ MEMORY_GUIDANCE = (
     "User preferences and recurring corrections matter more than procedural task details.\n"
     "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
     "state to memory; use session_search to recall those from past transcripts. "
+    "Never let memory maintenance preempt explicit user action requests. If the user asks "
+    "you to navigate/open/click/run something now, do that first and only then handle "
+    "memory updates if still useful. "
     "If you've discovered a new way to do something, solved a problem that could be "
     "necessary later, save it as a skill with the skill tool."
 )

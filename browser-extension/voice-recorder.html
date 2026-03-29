@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hermes Voice Input</title>
+    <link rel="stylesheet" href="voice-recorder.css">
+  </head>
+  <body>
+    <main class="voice-app">
+      <p class="eyebrow">Hermes Sidecar</p>
+      <h1>Voice Input</h1>
+      <p class="subhead">Record a short voice note, then Hermes will transcribe it back into your sidecar composer.</p>
+
+      <div class="status-card">
+        <p id="voice-status" class="voice-status">Click start to request microphone access.</p>
+      </div>
+
+      <div class="actions">
+        <button id="record-button" class="record-button" type="button">Start recording</button>
+        <button id="cancel-button" class="ghost-button" type="button">Close</button>
+      </div>
+
+      <p class="hint">If Chrome asks for microphone access, choose Allow.</p>
+    </main>
+    <script src="voice-recorder.js"></script>
+  </body>
+</html>

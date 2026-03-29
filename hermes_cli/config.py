@@ -176,12 +176,33 @@ DEFAULT_CONFIG = {
         # Enabled by default for non-local backends (SSH); local is always opt-in
         # via TERMINAL_LOCAL_PERSISTENT env var.
         "persistent_shell": True,
+        # Preferred Windows shell when terminal.backend=local.
+        # "auto" now resolves to cmd.exe first, then PowerShell, then WSL.
+        "windows_shell": "auto",
     },
     
     "browser": {
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
+    },
+
+    "control_room": {
+        "date_awareness_mode": "smart",  # off | smart
+    },
+
+    "web": {
+        "backend": "",
+        "archive_fallback": {
+            "enabled": False,
+            "service": "archive.today",
+            "fallback_to_original": True,
+            "paywalled_domains": [
+                "nytimes.com",
+                "wsj.com",
+                "thedailybeast.com",
+            ],
+        },
     },
 
     # Filesystem checkpoints — automatic snapshots before destructive file ops.
@@ -293,7 +314,8 @@ DEFAULT_CONFIG = {
     
     # Text-to-speech configuration
     "tts": {
-        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "neutts" (local)
+        # Providers: edge (free), elevenlabs (premium), openai, kokoro (local), neutts (local), f5 (local)
+        "provider": "edge",
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
@@ -307,11 +329,24 @@ DEFAULT_CONFIG = {
             "voice": "alloy",
             # Voices: alloy, echo, fable, onyx, nova, shimmer
         },
+        "kokoro": {
+            "base_url": "http://localhost:8880",
+            "model": "kokoro",
+            "voice": "af_sky+af_v0+af_nicole",
+            "speed": 1.75,
+            "request_timeout_seconds": 120,
+        },
         "neutts": {
             "ref_audio": "",  # Path to reference voice audio (empty = bundled default)
             "ref_text": "",   # Path to reference voice transcript (empty = bundled default)
             "model": "neuphonic/neutts-air-q4-gguf",  # HuggingFace model repo
             "device": "cpu",  # cpu, cuda, or mps
+        },
+        "f5": {
+            "base_url": "http://localhost:8081",
+            "voice_profile": "",
+            "token_ttl_minutes": 30,
+            "request_timeout_seconds": 300,
         },
     },
     
@@ -422,7 +457,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 10,
+    "_config_version": 12,
 }
 
 # =============================================================================
@@ -436,7 +471,9 @@ ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
     4: ["VOICE_TOOLS_OPENAI_KEY", "ELEVENLABS_API_KEY"],
     5: ["WHATSAPP_ENABLED", "WHATSAPP_MODE", "WHATSAPP_ALLOWED_USERS",
         "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"],
+    9: ["F5TTS_SECRET_KEY"],
     10: ["TAVILY_API_KEY"],
+    11: [],
 }
 
 # Required environment variables with metadata for migration prompts.
@@ -716,6 +753,14 @@ OPTIONAL_ENV_VARS = {
         "prompt": "OpenAI API Key (for Whisper STT + TTS)",
         "url": "https://platform.openai.com/api-keys",
         "tools": ["voice_transcription", "openai_tts"],
+        "password": True,
+        "category": "tool",
+    },
+    "F5TTS_SECRET_KEY": {
+        "description": "Secret key used to mint JWTs for a local F5TTS-FASTAPI service (minimum 32 bytes for HS256)",
+        "prompt": "F5 TTS secret key",
+        "url": None,
+        "tools": ["f5_tts"],
         "password": True,
         "category": "tool",
     },
@@ -1688,6 +1733,7 @@ def show_config():
         ("OPENROUTER_API_KEY", "OpenRouter"),
         ("VOICE_TOOLS_OPENAI_KEY", "OpenAI (STT/TTS)"),
         ("EXA_API_KEY", "Exa"),
+        ("F5TTS_SECRET_KEY", "F5 TTS"),
         ("PARALLEL_API_KEY", "Parallel"),
         ("FIRECRAWL_API_KEY", "Firecrawl"),
         ("TAVILY_API_KEY", "Tavily"),
@@ -1847,7 +1893,9 @@ def set_config_value(key: str, value: str):
     # Check if it's an API key (goes to .env)
     api_keys = [
         'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
-        'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL', 'TAVILY_API_KEY',
+        'EXA_API_KEY',
+        'F5TTS_SECRET_KEY',
+        'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL', 'TAVILY_API_KEY',
         'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID', 'BROWSER_USE_API_KEY',
         'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
         'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',

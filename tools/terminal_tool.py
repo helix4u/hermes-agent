@@ -361,10 +361,39 @@ from tools.environments.singularity import SingularityEnvironment as _Singularit
 from tools.environments.ssh import SSHEnvironment as _SSHEnvironment
 from tools.environments.docker import DockerEnvironment as _DockerEnvironment
 from tools.environments.modal import ModalEnvironment as _ModalEnvironment
+from tools.environments.shell_utils import get_local_shell_mode, normalize_windows_shell_override
 
 
 # Tool description for LLM
-TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem persists between calls.
+def _build_terminal_tool_description() -> str:
+    windows_note = ""
+    if os.name == "nt":
+        mode = get_local_shell_mode()
+        if mode == "wsl":
+            windows_note = (
+                "Windows note: with terminal.backend=local, commands run in WSL bash. "
+                "Use Linux syntax and WSL paths (e.g. /mnt/c/Users/... or /mnt/d/...).\n\n"
+            )
+        elif mode == "powershell":
+            windows_note = (
+                "Windows note: with terminal.backend=local, commands run in PowerShell. "
+                "Use PowerShell syntax and Windows paths (e.g. C:\\Users\\... or D:\\...). "
+                "Path note: prefer Windows-style paths (e.g. C:\\Users\\...) in this mode. "
+                "Some systems also have POSIX-like tools on PATH (Git Bash, Cygwin, etc.); choose commands and path style that match the active shell.\n\n"
+                "To detect shell: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell "
+                "(prints CMD or PowerShell).\n\n"
+            )
+        else:
+            windows_note = (
+                "Windows note: with terminal.backend=local, commands run in cmd.exe. "
+                "Use cmd syntax and Windows paths (e.g. C:\\Users\\... or D:\\...). "
+                "Path note: prefer Windows-style paths (e.g. C:\\Users\\...) in this mode. "
+                "Some systems also have POSIX-like tools on PATH (Git Bash, Cygwin, etc.); choose commands and path style that match the active shell.\n\n"
+                "To detect shell: (dir 2>&1 *`|echo CMD);&<# rem #>echo PowerShell "
+                "(prints CMD or PowerShell).\n\n"
+            )
+
+    return windows_note + """Execute shell commands in the configured terminal backend. Filesystem persists between calls.
 
 Do NOT use cat/head/tail to read files — use read_file instead.
 Do NOT use grep/rg/find to search — use search_files instead.
@@ -378,9 +407,13 @@ Background: ONLY for long-running servers, watchers, or processes that never exi
 Do NOT use background for scripts, builds, or installs — foreground with a generous timeout is always better (fewer tool calls, instant results).
 Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
+Windows local backend: 'shell_mode' can override the current Windows shell for this call only (`cmd`, `powershell`, `wsl`, or `auto`).
 
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
 """
+
+
+TERMINAL_TOOL_DESCRIPTION = _build_terminal_tool_description()
 
 # Global state for environment lifecycle management
 _active_environments: Dict[str, Any] = {}
@@ -459,7 +492,18 @@ def _get_env_config() -> Dict[str, Any]:
     # else starts in the user's home (~ resolves to whatever account
     # is running inside the container/remote).
     if env_type == "local":
-        default_cwd = os.getcwd()
+        # For CLI, default to the process CWD (user's terminal).
+        # For gateway/messaging, prefer Hermes workspace for deterministic paths.
+        platform = (os.getenv("HERMES_SESSION_PLATFORM") or "").strip().lower()
+        if platform and platform not in {"local", "cli"}:
+            try:
+                hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+                workspace = hermes_home / "workspace"
+                default_cwd = str(workspace) if workspace.exists() else os.getcwd()
+            except Exception:
+                default_cwd = os.getcwd()
+        else:
+            default_cwd = os.getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
     else:
@@ -474,7 +518,13 @@ def _get_env_config() -> Dict[str, Any]:
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
         docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
-        candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
+        candidate = os.path.expanduser(docker_cwd_source)
+        # Preserve POSIX-looking host paths as entered so cross-platform config
+        # checks can distinguish them from native Windows paths. The Docker
+        # backend normalizes native mount paths later when it actually prepares
+        # the bind mount.
+        if not candidate.startswith(("/Users/", "/home/")):
+            candidate = os.path.abspath(candidate)
         if (
             any(candidate.startswith(p) for p in host_prefixes)
             or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))
@@ -844,6 +894,7 @@ def terminal_tool(
     workdir: Optional[str] = None,
     check_interval: Optional[int] = None,
     pty: bool = False,
+    shell_mode: Optional[str] = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -857,6 +908,7 @@ def terminal_tool(
         workdir: Working directory for this command (optional, uses session cwd if not set)
         check_interval: Seconds between auto-checks for background processes (gateway only, min 30)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
+        shell_mode: On Windows with the local backend, override the shell for this call (`cmd`, `powershell`, `wsl`, `auto`)
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -903,6 +955,7 @@ def terminal_tool(
         cwd = overrides.get("cwd") or config["cwd"]
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
+        shell_mode_override = normalize_windows_shell_override(shell_mode) if shell_mode else None
 
         # Start cleanup thread
         _start_cleanup_thread()
@@ -1038,6 +1091,7 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=pty,
+                        shell_mode_override=shell_mode_override,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -1108,6 +1162,8 @@ def terminal_tool(
                     execute_kwargs = {"timeout": effective_timeout}
                     if workdir:
                         execute_kwargs["cwd"] = workdir
+                    if env_type == "local" and shell_mode_override:
+                        execute_kwargs["shell_mode_override"] = shell_mode_override
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
@@ -1326,6 +1382,11 @@ TERMINAL_SCHEMA = {
                 "type": "boolean",
                 "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, or Python REPL. Only works with local and SSH backends. Default: false.",
                 "default": False
+            },
+            "shell_mode": {
+                "type": "string",
+                "description": "Windows local backend only: choose which shell to use for this command (`cmd`, `powershell`, `wsl`, or `auto`).",
+                "enum": ["auto", "cmd", "powershell", "wsl"]
             }
         },
         "required": ["command"]
@@ -1342,6 +1403,7 @@ def _handle_terminal(args, **kw):
         workdir=args.get("workdir"),
         check_interval=args.get("check_interval"),
         pty=args.get("pty", False),
+        shell_mode=args.get("shell_mode"),
     )
 
 

@@ -1,0 +1,58 @@
+{
+  "manifest_version": 3,
+  "name": "Hermes Sidecar",
+  "version": "0.2.10",
+  "description": "Chat with a dedicated local Hermes session and share the current page context.",
+  "permissions": [
+    "activeTab",
+    "offscreen",
+    "sidePanel",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "https://x.com/*",
+    "https://www.x.com/*",
+    "https://twitter.com/*",
+    "https://www.twitter.com/*",
+    "https://www.youtube.com/*",
+    "https://youtube.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/nous-16.png",
+    "32": "icons/nous-32.png",
+    "48": "icons/nous-48.png",
+    "128": "icons/nous-128.png"
+  },
+  "options_page": "options.html",
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "Open Hermes Sidecar",
+    "default_icon": {
+      "16": "icons/nous-16.png",
+      "32": "icons/nous-32.png",
+      "48": "icons/nous-48.png",
+      "128": "icons/nous-128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

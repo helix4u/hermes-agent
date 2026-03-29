@@ -133,6 +133,25 @@ class TestGatewayConfigRoundtrip:
 
 
 class TestLoadGatewayConfig:
+    def test_loads_discord_token_and_home_from_hermes_env(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".env").write_text(
+            "DISCORD_BOT_TOKEN=test-discord-token\n"
+            "DISCORD_HOME_CHANNEL=1234567890\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("DISCORD_HOME_CHANNEL", raising=False)
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.DISCORD].enabled is True
+        assert config.platforms[Platform.DISCORD].token == "test-discord-token"
+        assert config.get_home_channel(Platform.DISCORD).chat_id == "1234567890"
+
     def test_bridges_quick_commands_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

@@ -136,8 +136,11 @@ class TestRealSubagentInterrupt(unittest.TestCase):
         agent_thread = threading.Thread(target=run_delegate, daemon=True)
         agent_thread.start()
 
-        # Wait for child to start run_conversation
-        started = child_started.wait(timeout=10)
+        # Real child construction still does meaningful setup work before
+        # run_conversation starts, especially on Windows hosts. Give the
+        # startup path enough headroom so this test exercises interrupt
+        # propagation instead of spuriously failing on initialization time.
+        started = child_started.wait(timeout=30)
         if not started:
             agent_thread.join(timeout=1)
             if error_holder[0]:

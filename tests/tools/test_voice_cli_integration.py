@@ -443,7 +443,7 @@ class TestVprintForceParameter:
     def test_error_messages_use_force_in_run_agent(self):
         """Verify that critical error _vprint calls in run_agent.py
         include force=True."""
-        with open("run_agent.py", "r") as f:
+        with open("run_agent.py", "r", encoding="utf-8") as f:
             source = f.read()
 
         tree = ast.parse(source)
@@ -499,7 +499,7 @@ class TestEdgeTTSLazyImport:
         reference bare 'edge_tts' module name."""
         import ast as _ast
 
-        with open("tools/tts_tool.py") as f:
+        with open("tools/tts_tool.py", encoding="utf-8") as f:
             tree = _ast.parse(f.read())
 
         for node in _ast.walk(tree):
@@ -537,7 +537,7 @@ class TestStreamingTTSOutputStreamCleanup:
         output_stream even on exception."""
         import ast as _ast
 
-        with open("tools/tts_tool.py") as f:
+        with open("tools/tts_tool.py", encoding="utf-8") as f:
             tree = _ast.parse(f.read())
 
         for node in _ast.walk(tree):
@@ -562,7 +562,7 @@ class TestCtrlCResetsContinuousMode:
     def test_ctrl_c_handler_resets_voice_continuous(self):
         """Source check: Ctrl+C voice cancel block must set
         _voice_continuous = False."""
-        with open("cli.py") as f:
+        with open("cli.py", encoding="utf-8") as f:
             source = f.read()
 
         # Find the Ctrl+C handler's voice cancel block
@@ -607,7 +607,7 @@ class TestVoiceStatusUsesConfigKey:
 
     def test_show_voice_status_not_hardcoded(self):
         """Source check: _show_voice_status must not hardcode Ctrl+B."""
-        with open("cli.py") as f:
+        with open("cli.py", encoding="utf-8") as f:
             source = f.read()
 
         lines = source.split("\n")
@@ -625,7 +625,7 @@ class TestVoiceStatusUsesConfigKey:
 
     def test_show_voice_status_reads_config(self):
         """Source check: _show_voice_status must use load_config()."""
-        with open("cli.py") as f:
+        with open("cli.py", encoding="utf-8") as f:
             source = f.read()
 
         lines = source.split("\n")
@@ -653,7 +653,7 @@ class TestChatTTSCleanupOnException:
         text_queue, stop_event, and tts_thread."""
         import ast as _ast
 
-        with open("cli.py") as f:
+        with open("cli.py", encoding="utf-8") as f:
             tree = _ast.parse(f.read())
 
         for node in _ast.walk(tree):
@@ -686,7 +686,7 @@ class TestBrowserToolSignalHandlerRemoved:
     def test_no_signal_handler_registration(self):
         """Source check: browser_tool.py must not call signal.signal()
         for SIGINT or SIGTERM."""
-        with open("tools/browser_tool.py") as f:
+        with open("tools/browser_tool.py", encoding="utf-8") as f:
             source = f.read()
 
         lines = source.split("\n")
@@ -718,7 +718,7 @@ class TestKeyHandlerNeverBlocks:
         directly — it must wrap it in a Thread to avoid blocking the UI."""
         import ast as _ast
 
-        with open("cli.py") as f:
+        with open("cli.py", encoding="utf-8") as f:
             tree = _ast.parse(f.read())
 
         for node in _ast.walk(tree):
@@ -738,7 +738,7 @@ class TestKeyHandlerNeverBlocks:
     def test_processing_guard_in_start_path(self):
         """Source check: key handler must check _voice_processing before
         starting a new recording."""
-        with open("cli.py") as f:
+        with open("cli.py", encoding="utf-8") as f:
             source = f.read()
 
         lines = source.split("\n")
@@ -764,7 +764,7 @@ class TestKeyHandlerNeverBlocks:
     def test_processing_set_atomically_with_recording_false(self):
         """Source check: _voice_stop_and_transcribe must set _voice_processing = True
         in the same lock block where it sets _voice_recording = False."""
-        with open("cli.py") as f:
+        with open("cli.py", encoding="utf-8") as f:
             source = f.read()
 
         lines = source.split("\n")
@@ -808,6 +808,7 @@ class TestHandleVoiceCommandReal:
         cli._disable_voice_mode = MagicMock()
         cli._toggle_voice_tts = MagicMock()
         cli._show_voice_status = MagicMock()
+        cli._install_voice_dependencies = MagicMock()
         return cli
 
     @patch("cli._cprint")
@@ -833,6 +834,12 @@ class TestHandleVoiceCommandReal:
         cli = self._cli()
         cli._handle_voice_command("/voice status")
         cli._show_voice_status.assert_called_once()
+
+    @patch("cli._cprint")
+    def test_install_calls_installer(self, _cp):
+        cli = self._cli()
+        cli._handle_voice_command("/voice install")
+        cli._install_voice_dependencies.assert_called_once()
 
     @patch("cli._cprint")
     def test_toggle_off_when_enabled(self, _cp):

@@ -45,6 +45,7 @@ Usage:
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -69,6 +70,36 @@ from hermes_cli import __version__, __release_date__
 from hermes_constants import OPENROUTER_BASE_URL
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_console_encoding() -> None:
+    """Prevent Unicode output crashes in Windows cmd sessions."""
+    if os.name != "nt":
+        return
+
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            # Prefer UTF-8 for box drawing symbols and check marks in output.
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            # Fall back to replacing unsupported characters in the current code page.
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
+def _completed_output_text(result, stream_name: str = "stdout") -> str:
+    """Return subprocess output as text even for lightweight test doubles."""
+    value = getattr(result, stream_name, "")
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
 
 
 def _relative_time(ts) -> str:
@@ -2759,7 +2790,7 @@ def cmd_update(args):
             text=True,
             check=True,
         )
-        current_branch = result.stdout.strip()
+        current_branch = _completed_output_text(result).strip()
 
         # Always update against main
         branch = "main"
@@ -2790,7 +2821,8 @@ def cmd_update(args):
             text=True,
             check=True,
         )
-        commit_count = int(result.stdout.strip())
+        commit_count_text = _completed_output_text(result).strip()
+        commit_count = int(commit_count_text or "0")
 
         if commit_count == 0:
             _invalidate_update_cache()
@@ -3142,6 +3174,8 @@ def _coalesce_session_name_args(argv: list) -> list:
 
 def main():
     """Main entry point for hermes CLI."""
+    _configure_console_encoding()
+
     parser = argparse.ArgumentParser(
         prog="hermes",
         description="Hermes Agent - AI assistant with tool-calling capabilities",
@@ -3163,6 +3197,7 @@ Examples:
     hermes -s hermes-agent-dev,github-auth
     hermes -w                     Start in isolated git worktree
     hermes gateway install        Install gateway background service
+    hermes audit serve           Start the local audit viewer
     hermes sessions list          List past sessions
     hermes sessions browse        Interactive session picker
     hermes sessions rename ID T   Rename/title a session
@@ -3336,6 +3371,11 @@ For more help on a command:
     # gateway start
     gateway_start = gateway_subparsers.add_parser("start", help="Start gateway service")
     gateway_start.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_start.add_argument(
+        "--no-startup-stream",
+        action="store_true",
+        help="On Windows, do not stream initial startup logs in this terminal",
+    )
     
     # gateway stop
     gateway_stop = gateway_subparsers.add_parser("stop", help="Stop gateway service")
@@ -3344,11 +3384,22 @@ For more help on a command:
     # gateway restart
     gateway_restart = gateway_subparsers.add_parser("restart", help="Restart gateway service")
     gateway_restart.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_restart.add_argument(
+        "--no-startup-stream",
+        action="store_true",
+        help="On Windows, do not stream initial startup logs in this terminal",
+    )
     
     # gateway status
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
     gateway_status.add_argument("--deep", action="store_true", help="Deep status check")
     gateway_status.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+
+    # gateway logs
+    gateway_logs = gateway_subparsers.add_parser("logs", help="Show gateway logs")
+    gateway_logs.add_argument("-n", "--lines", type=int, default=30, help="Number of recent lines to show")
+    gateway_logs.add_argument("-f", "--follow", action="store_true", help="Follow new log output")
+    gateway_logs.add_argument("--error", action="store_true", help="Include gateway-error.log alongside gateway.log")
     
     # gateway install
     gateway_install = gateway_subparsers.add_parser("install", help="Install gateway as service")
@@ -3364,6 +3415,30 @@ For more help on a command:
     gateway_setup = gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 
     gateway_parser.set_defaults(func=cmd_gateway)
+
+    # =========================================================================
+    # audit command
+    # =========================================================================
+    audit_parser = subparsers.add_parser(
+        "audit",
+        help="Run the local audit viewer for sessions and tool/runtime logs",
+        description="Serve a localhost-only web viewer for Hermes session transcripts and audit events",
+    )
+    audit_subparsers = audit_parser.add_subparsers(dest="audit_command")
+
+    audit_serve = audit_subparsers.add_parser("serve", help="Start the audit web server")
+    audit_serve.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1)")
+    audit_serve.add_argument("--port", type=int, default=8646, help="Port to bind (default: 8646)")
+    audit_serve.add_argument("--open", action="store_true", help="Open the audit viewer in the default browser")
+
+    def cmd_audit(args):
+        if args.audit_command != "serve":
+            audit_parser.print_help()
+            return
+        from hermes_cli.audit_server import serve_audit_viewer
+        serve_audit_viewer(host=args.host, port=args.port, open_browser=bool(args.open))
+
+    audit_parser.set_defaults(func=cmd_audit)
     
     # =========================================================================
     # setup command
@@ -4323,7 +4398,13 @@ For more help on a command:
             acp_main()
         except ImportError:
             print("ACP dependencies not installed.")
-            print("Install them with:  pip install -e '.[acp]'")
+            uv_path = shutil.which("uv")
+            if uv_path:
+                print(
+                    f"Install with: {uv_path} pip install --python "
+                    f"\"{sys.executable}\" -e '.[acp]'"
+                )
+            print(f"Fallback: {sys.executable} -m pip install -e '.[acp]'")
             sys.exit(1)
 
     acp_parser.set_defaults(func=cmd_acp)

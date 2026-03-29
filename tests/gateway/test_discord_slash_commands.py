@@ -22,6 +22,7 @@ def _ensure_discord_mock():
     discord_mod.app_commands = SimpleNamespace(
         describe=lambda **kwargs: (lambda fn: fn),
         choices=lambda **kwargs: (lambda fn: fn),
+        autocomplete=lambda **kwargs: (lambda fn: fn),
         Choice=lambda **kwargs: SimpleNamespace(**kwargs),
     )
 
@@ -37,7 +38,7 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+from gateway.platforms.discord import DiscordAdapter, _extract_listen_sections  # noqa: E402
 
 
 class FakeTree:
@@ -50,6 +51,15 @@ class FakeTree:
             return fn
 
         return decorator
+
+    def add_command(self, command):
+        self.commands[command.name] = command
+
+    def get_commands(self):
+        return list(self.commands.values())
+
+    async def sync(self):
+        return self.get_commands()
 
 
 @pytest.fixture
@@ -84,6 +94,88 @@ async def test_registers_native_thread_slash_command(adapter):
 
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
     adapter._handle_thread_create_slash.assert_awaited_once_with(interaction, "Planning", "", 1440)
+
+
+def test_flatten_slash_command_names_includes_grouped_commands(adapter):
+    commands = [
+        SimpleNamespace(name="ask"),
+        SimpleNamespace(
+            name="cron",
+            commands=[
+                SimpleNamespace(name="list"),
+                SimpleNamespace(name="run"),
+            ],
+        ),
+    ]
+
+    flattened = adapter._flatten_slash_command_names(commands)
+
+    assert flattened == ["ask", "cron list", "cron run"]
+
+
+@pytest.mark.asyncio
+async def test_run_post_ready_startup_syncs_commands_and_registers_persistent_listen_view(adapter):
+    adapter._allowed_user_ids = {"friendlyname"}
+    adapter._resolve_allowed_usernames = AsyncMock()
+    adapter._client.add_view = MagicMock()
+    adapter._client.tree.commands = {
+        "ask": SimpleNamespace(name="ask"),
+        "cron": SimpleNamespace(
+            name="cron",
+            commands=[
+                SimpleNamespace(name="list"),
+                SimpleNamespace(name="run"),
+            ],
+        ),
+    }
+
+    sentinel_view = object()
+    with patch("gateway.platforms.discord.PersistentListenButtonView", return_value=sentinel_view) as view_cls:
+        await adapter._run_post_ready_startup(members=True)
+
+    adapter._resolve_allowed_usernames.assert_awaited_once()
+    view_cls.assert_called_once_with(adapter)
+    adapter._client.add_view.assert_called_once_with(sentinel_view)
+    assert adapter._listen_view_registered is True
+
+
+def test_extract_listen_sections_prefers_action_response_body_for_answer():
+    text = (
+        "<ʞᴎiʜƚ>\nInitial Reaction:\nThinky bits.\n</ʞᴎiʜƚ>\n"
+        "Action / Response:\n"
+        "This is the user-facing answer.\n"
+        "Second line."
+    )
+
+    sections = _extract_listen_sections(text)
+
+    assert sections["knight"] == "Initial Reaction:\nThinky bits."
+    assert sections["answer"] == "This is the user-facing answer.\nSecond line."
+
+
+def test_extract_listen_sections_falls_back_to_non_knight_content_without_marker():
+    text = "<ʞᴎiʜƚ>\nInner monologue\n</ʞᴎiʜƚ>\nVisible answer only."
+
+    sections = _extract_listen_sections(text)
+
+    assert sections["knight"] == "Inner monologue"
+    assert sections["answer"] == "Visible answer only."
+
+
+@pytest.mark.asyncio
+async def test_cron_job_autocomplete_returns_matching_jobs(adapter, monkeypatch):
+    jobs = [
+        {"id": "20e9d96eabcd", "name": "Run the heartbeat workflow", "state": "scheduled", "schedule_display": "every 30m", "enabled": True},
+        {"id": "98af12bb3344", "name": "Nightly cleanup", "state": "paused", "schedule_display": "every 1d", "enabled": False},
+    ]
+
+    with patch("cron.jobs.list_jobs", return_value=jobs):
+        choices = await adapter._cron_job_autocomplete(SimpleNamespace(), "heart")
+
+    assert len(choices) == 1
+    assert choices[0].value == "20e9d96eabcd"
+    assert "Run the heartbeat workflow" in choices[0].name
+    assert "20e9d96eabcd" in choices[0].name
 
 
 # ------------------------------------------------------------------

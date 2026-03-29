@@ -2,6 +2,12 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+Never push to a remote unless the user explicitly asks. Human testing is required before pushing. If the user asks to push, treat that as confirmation that the required human testing has been completed. Do not ask them to test again or treat testing as a blocker.
+
+On the design principle: we want one host-aware path layer so Windows, Linux, and macOS all work out of the box.
+
+Always update docs. At the time of writing this there is a large lack of documentation, including the readme. We also need install scripts for windows. A .bat is fine for me, a .ps1 is fine too, but we need a way to get this installable from windows as well without the need for wsl if necissary.
+
 ## Development Environment
 
 ```bash
@@ -38,7 +44,6 @@ hermes-agent/
 │   ├── tools_config.py   # `hermes tools` — enable/disable tools per platform
 │   ├── skills_hub.py     # `/skills` slash command (search, browse, install)
 │   ├── models.py         # Model catalog, provider model lists
-│   ├── model_switch.py   # Shared /model switch pipeline (CLI + gateway)
 │   └── auth.py           # Provider credential resolution
 ├── tools/                # Tool implementations (one file per tool)
 │   ├── registry.py       # Central tool registry (schemas, handlers, dispatch)
@@ -64,6 +69,13 @@ hermes-agent/
 ```
 
 **User config:** `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys)
+
+## Fast orientation docs
+
+- Repo map: `docs/repo-map.md`
+- Cross-session goals: `docs/todo.md`
+- Tool and shell registry: `docs/tool-registry.md`
+- User-visible changes: `CHANGELOG.md`
 
 ## File Dependency Chain
 
@@ -173,7 +185,6 @@ if canonical == "mycommand":
 - `args_hint` — argument placeholder shown in help (e.g. `"<prompt>"`, `"[name]"`)
 - `cli_only` — only available in the interactive CLI
 - `gateway_only` — only available in messaging platforms
-- `gateway_config_gate` — config dotpath (e.g. `"display.tool_progress_command"`); when set on a `cli_only` command, the command becomes available in the gateway if the config value is truthy. `GATEWAY_KNOWN_COMMANDS` always includes config-gated commands so the gateway can dispatch them; help/menus only show them when the gate is open.
 
 **Adding an alias** requires only adding it to the `aliases` tuple on the existing `CommandDef`. No other file changes needed — dispatch, help text, Telegram menu, Slack mapping, and autocomplete all update automatically.
 
@@ -355,6 +366,14 @@ in config.yaml (or `HERMES_BACKGROUND_NOTIFICATIONS` env var):
 - `result` — only the final completion message
 - `error` — only the final message when exit code != 0
 - `off` — no watcher messages at all
+
+---
+
+## Changelog and user-visible changes
+
+- Keep **repo root `CHANGELOG.md`** updated when behavior users see changes (CLI, gateway, browser extension, default configs). Use a short **Unreleased** section with bullets; trim on release if your process moves entries elsewhere.
+- When you ship sidecar/extension or gateway UX changes, mention **where to configure** (e.g. extension Options) and any **defaults** (URLs, limits).
+- Hermes instances with a **SOUL.md / MEMORY.md** in the user workspace: after substantive product changes, suggest a one-line memory or doc pointer so the running agent knows to skim **`CHANGELOG.md`** (or this section) for recent deltas.
 
 ---
 

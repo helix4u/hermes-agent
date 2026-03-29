@@ -1,6 +1,7 @@
 """Tests for probe_mcp_server_tools() in tools.mcp_tool."""
 
 import asyncio
+import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -158,10 +159,15 @@ class TestProbeMcpServerTools:
     def test_cleanup_called_even_on_failure(self):
         """_stop_mcp_loop is called even when probe fails."""
         config = {"github": {"command": "npx", "connect_timeout": 5}}
+        captured = {}
+
+        def fail_submit(coro, timeout=120):
+            captured["coro"] = coro
+            raise RuntimeError("boom")
 
         with patch("tools.mcp_tool._load_mcp_config", return_value=config), \
              patch("tools.mcp_tool._ensure_mcp_loop"), \
-             patch("tools.mcp_tool._run_on_mcp_loop", side_effect=RuntimeError("boom")), \
+             patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fail_submit), \
              patch("tools.mcp_tool._stop_mcp_loop") as mock_stop:
 
             from tools.mcp_tool import probe_mcp_server_tools
@@ -169,6 +175,7 @@ class TestProbeMcpServerTools:
 
         assert result == {}
         mock_stop.assert_called_once()
+        assert inspect.getcoroutinestate(captured["coro"]) == inspect.CORO_CLOSED
 
     def test_skips_disabled_servers(self):
         """Disabled servers are not probed."""

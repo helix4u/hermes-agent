@@ -52,7 +52,7 @@ def _resolve_timezone_name() -> str:
         hermes_home = get_hermes_home()
         config_path = hermes_home / "config.yaml"
         if config_path.exists():
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
             tz_cfg = cfg.get("timezone", "")
             if isinstance(tz_cfg, str) and tz_cfg.strip():
@@ -67,6 +67,8 @@ def _get_zoneinfo(name: str) -> Optional[ZoneInfo]:
     """Validate and return a ZoneInfo, or None if invalid."""
     if not name:
         return None
+    if name.upper() == "UTC":
+        return _tz.utc
     try:
         return ZoneInfo(name)
     except (KeyError, Exception) as exc:

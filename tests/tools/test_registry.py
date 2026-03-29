@@ -81,7 +81,7 @@ class TestGetDefinitions:
         assert len(defs) == 1
         assert defs[0]["function"]["name"] == "available"
 
-    def test_reuses_shared_check_fn_once_per_call(self):
+    def test_reuses_shared_check_fn_result_within_single_pass(self):
         reg = ToolRegistry()
         calls = {"count": 0}
 

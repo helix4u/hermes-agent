@@ -15,6 +15,7 @@ class DummyTelegramAdapter(BasePlatformAdapter):
         super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
         self.sent = []
         self.typing = []
+        self.stopped_typing = []
 
     async def connect(self) -> bool:
         return True
@@ -35,6 +36,10 @@ class DummyTelegramAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         self.typing.append({"chat_id": chat_id, "metadata": metadata})
+        return None
+
+    async def stop_typing(self, chat_id: str) -> None:
+        self.stopped_typing.append(chat_id)
         return None
 
     async def get_chat_info(self, chat_id: str):
@@ -133,3 +138,18 @@ class TestBasePlatformTopicSessions:
                 "metadata": {"thread_id": "17585"},
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_stops_typing_on_cleanup(self):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return "ack"
+
+        adapter.set_message_handler(handler)
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.stopped_typing == ["-1001"]

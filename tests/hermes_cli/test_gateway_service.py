@@ -109,6 +109,7 @@ class TestGatewayStopCleanup:
 
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
 
         service_calls = []
@@ -200,6 +201,7 @@ class TestGatewayServiceDetection:
 
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
         monkeypatch.setattr(
             gateway_cli,
             "get_systemd_unit_path",
@@ -222,6 +224,7 @@ class TestGatewaySystemServiceRouting:
     def test_gateway_install_passes_system_flags(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
 
         calls = []
         monkeypatch.setattr(
@@ -242,6 +245,7 @@ class TestGatewaySystemServiceRouting:
 
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
         monkeypatch.setattr(
             gateway_cli,
             "get_systemd_unit_path",
@@ -261,6 +265,7 @@ class TestGatewaySystemServiceRouting:
 
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(
             gateway_cli,
@@ -349,11 +354,12 @@ class TestGeneratedUnitUsesDetectedVenv:
         monkeypatch.setattr(gateway_cli, "get_python_path", lambda: str(dot_venv / "bin" / "python"))
 
         unit = gateway_cli.generate_systemd_unit(system=False)
+        normalized_unit = unit.replace("\\", "/")
 
         assert f"VIRTUAL_ENV={dot_venv}" in unit
-        assert f"{dot_venv}/bin" in unit
+        assert f"{dot_venv}".replace("\\", "/") + "/bin" in normalized_unit
         # Must NOT contain a hardcoded /venv/ path
-        assert "/venv/" not in unit or "/.venv/" in unit
+        assert "/venv/" not in normalized_unit or "/.venv/" in normalized_unit
 
 
 class TestGeneratedUnitIncludesLocalBin:
@@ -374,9 +380,11 @@ class TestEnsureUserSystemdEnv:
     """Tests for _ensure_user_systemd_env() D-Bus session bus auto-detection."""
 
     def test_sets_xdg_runtime_dir_when_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
         monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
         monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
-        monkeypatch.setattr(os, "getuid", lambda: 42)
+        monkeypatch.setattr(gateway_cli, "_current_uid", lambda: 42)
 
         # Patch Path.exists so /run/user/42 appears to exist.
         # Using a FakePath subclass breaks on Python 3.12+ where
@@ -384,14 +392,20 @@ class TestEnsureUserSystemdEnv:
         _orig_exists = gateway_cli.Path.exists
         monkeypatch.setattr(
             gateway_cli.Path, "exists",
-            lambda self: True if str(self) == "/run/user/42" else _orig_exists(self),
+            lambda self: (
+                True
+                if str(self).replace("\\", "/").endswith("/run/user/42")
+                else _orig_exists(self)
+            ),
         )
 
         gateway_cli._ensure_user_systemd_env()
 
-        assert os.environ.get("XDG_RUNTIME_DIR") == "/run/user/42"
+        assert os.environ.get("XDG_RUNTIME_DIR", "").replace("\\", "/") == "/run/user/42"
 
     def test_sets_dbus_address_when_bus_socket_exists(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
         runtime = tmp_path / "runtime"
         runtime.mkdir()
         bus_socket = runtime / "bus"
@@ -399,13 +413,15 @@ class TestEnsureUserSystemdEnv:
 
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
         monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
-        monkeypatch.setattr(os, "getuid", lambda: 99)
+        monkeypatch.setattr(gateway_cli, "_current_uid", lambda: 99)
 
         gateway_cli._ensure_user_systemd_env()
 
         assert os.environ["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={bus_socket}"
 
     def test_preserves_existing_env_vars(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
         monkeypatch.setenv("XDG_RUNTIME_DIR", "/custom/runtime")
         monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/custom/bus")
 
@@ -415,13 +431,15 @@ class TestEnsureUserSystemdEnv:
         assert os.environ["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/custom/bus"
 
     def test_no_dbus_when_bus_socket_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
         runtime = tmp_path / "runtime"
         runtime.mkdir()
         # no bus socket created
 
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
         monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
-        monkeypatch.setattr(os, "getuid", lambda: 99)
+        monkeypatch.setattr(gateway_cli, "_current_uid", lambda: 99)
 
         gateway_cli._ensure_user_systemd_env()
 

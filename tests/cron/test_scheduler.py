@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, run_job, SILENT_MARKER, _build_job_prompt
+from hermes_state import SessionDB
 
 
 class TestResolveOrigin:
@@ -215,6 +216,98 @@ class TestDeliverResultWrapping:
         send_mock.assert_called_once()
         assert send_mock.call_args.kwargs["thread_id"] == "17585"
 
+    def test_delivery_attempt_and_success_are_logged(self, caplog):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.token = "***"
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        job = {
+            "id": "test-job",
+            "deliver": "origin",
+            "origin": {
+                "platform": "discord",
+                "chat_id": "123456789012345678",
+            },
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.mirror.mirror_to_session"):
+            with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+                _deliver_result(job, "hello from cron")
+
+        messages = [record.message for record in caplog.records]
+        assert any("attempting delivery to discord:123456789012345678" in msg for msg in messages)
+        assert any("delivered to discord:123456789012345678" in msg for msg in messages)
+
+    def test_delivery_error_logs_target_label(self, caplog):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.token = "***"
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        job = {
+            "id": "test-job",
+            "deliver": "origin",
+            "origin": {
+                "platform": "discord",
+                "chat_id": "123456789012345678",
+            },
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new=AsyncMock(return_value={"error": "Discord API error (403): Missing Access"}),
+             ):
+            with caplog.at_level(logging.ERROR, logger="cron.scheduler"):
+                _deliver_result(job, "hello from cron")
+
+        messages = [record.message for record in caplog.records]
+        assert any(
+            "delivery error to discord:123456789012345678: Discord API error (403): Missing Access" in msg
+            for msg in messages
+        )
+
+    def test_delivery_writes_audit_events(self, tmp_path):
+        from gateway.config import Platform
+        from hermes_state import AuditEventStore
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="cron")
+        audit_store = AuditEventStore(db)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.token = "***"
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        job = {
+            "id": "test-job",
+            "deliver": "origin",
+            "origin": {"platform": "discord", "chat_id": "123456789012345678"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.mirror.mirror_to_session"):
+            _deliver_result(job, "hello from cron", session_id="sess-1", audit_store=audit_store)
+
+        events = db.get_events("sess-1")
+        assert len(events) == 2
+        assert events[0]["kind"] == "delivery"
+        assert events[0]["status"] == "running"
+        assert events[1]["status"] == "ok"
+        db.close()
+
 
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
@@ -296,10 +389,55 @@ class TestRunJobSessionPersistence:
 
         assert success is True
         assert error is None
-        # final_response should be empty for delivery logic to skip
         assert final_response == ""
-        # But the output log should show the placeholder
         assert "(No response generated)" in output
+
+    def test_run_job_forwards_progress_callbacks_and_overrides(self, tmp_path):
+        job = {
+            "id": "test-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+        tool_progress_callback = MagicMock()
+        thinking_callback = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(
+                job,
+                tool_progress_callback=tool_progress_callback,
+                thinking_callback=thinking_callback,
+                platform="discord",
+                session_id="sess-manual-1",
+            )
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["tool_progress_callback"] is tool_progress_callback
+        assert kwargs["thinking_callback"] is thinking_callback
+        assert kwargs["platform"] == "discord"
+        assert kwargs["session_id"] == "sess-manual-1"
+        fake_db.close.assert_called_once()
 
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {
@@ -460,6 +598,7 @@ class TestRunJobPerJobOverrides:
         runtime_mock.assert_called_once_with(
             requested="custom",
             explicit_base_url="http://127.0.0.1:4000/v1",
+            allow_device_auth=False,
         )
         assert mock_agent_cls.call_args.kwargs["model"] == "perplexity/sonar-pro"
         fake_db.close.assert_called_once()

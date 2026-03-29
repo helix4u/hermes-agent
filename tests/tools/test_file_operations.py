@@ -1,9 +1,10 @@
 """Tests for tools/file_operations.py — deny list, result dataclasses, helpers."""
 
-import os
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
+import os
+
+import pytest
 
 from tools.file_operations import (
     _is_write_denied,
@@ -257,6 +258,180 @@ class TestShellFileOpsHelpers:
         env = MagicMock(spec=[])  # no cwd attribute
         ops = ShellFileOperations(env)
         assert ops.cwd == "/"
+
+    def test_read_file_windows_local_backend(self, tmp_path):
+        sample = tmp_path / "sample.txt"
+        sample.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        result = ops.read_file("sample.txt", offset=2, limit=2)
+        assert result.error is None
+        assert result.total_lines == 3
+        assert "     2|beta" in result.content
+        assert "     3|gamma" in result.content
+
+    def test_search_files_windows_local_backend(self, tmp_path):
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "a.py").write_text("print('a')\n", encoding="utf-8")
+        (pkg / "b.txt").write_text("hello\n", encoding="utf-8")
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        result = ops.search("*.py", path=str(tmp_path), target="files")
+        assert result.error is None
+        assert result.total_count == 1
+        assert result.files == [str(pkg / "a.py")]
+
+    def test_search_content_windows_local_backend(self, tmp_path):
+        sample = tmp_path / "notes.txt"
+        sample.write_text("hello\nmatch me\nanother line\n", encoding="utf-8")
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        result = ops.search("match", path=str(tmp_path))
+        assert result.error is None
+        assert result.total_count == 1
+        assert result.matches[0].path == str(sample)
+        assert result.matches[0].line_number == 2
+
+    def test_search_content_windows_local_backend_skips_hidden_dirs_and_binary_files(self, tmp_path):
+        visible = tmp_path / "notes.txt"
+        visible.write_text("hello hermes_cli\n", encoding="utf-8")
+
+        hidden_dir = tmp_path / ".git"
+        hidden_dir.mkdir()
+        (hidden_dir / "index").write_text("hermes_cli\n", encoding="utf-8")
+
+        binary_file = tmp_path / "cache.bin"
+        binary_file.write_bytes(b"hermes_cli\x00\x01\x02")
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        result = ops.search("hermes_cli", path=str(tmp_path), output_mode="files_only")
+
+        assert result.error is None
+        assert result.files == [str(visible)]
+        assert result.total_count == 1
+
+    def test_search_files_windows_local_backend_skips_hidden_dirs(self, tmp_path):
+        visible_dir = tmp_path / "pkg"
+        visible_dir.mkdir()
+        visible_file = visible_dir / "a.py"
+        visible_file.write_text("print('a')\n", encoding="utf-8")
+
+        hidden_dir = tmp_path / ".git"
+        hidden_dir.mkdir()
+        (hidden_dir / "hidden.py").write_text("print('hidden')\n", encoding="utf-8")
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        result = ops.search("*.py", path=str(tmp_path), target="files")
+
+        assert result.error is None
+        assert result.files == [str(visible_file)]
+        assert result.total_count == 1
+
+    def test_search_files_windows_local_backend_times_out_with_warning(self, tmp_path, monkeypatch):
+        visible_dir = tmp_path / "pkg"
+        visible_dir.mkdir()
+        (visible_dir / "a.py").write_text("print('a')\n", encoding="utf-8")
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        monkeypatch.setattr("tools.file_operations._WINDOWS_NATIVE_SEARCH_TIMEOUT_SECONDS", 0.0)
+
+        result = ops.search("*.py", path=str(tmp_path), target="files")
+
+        assert result.error is None
+        assert result.truncated is True
+        assert result.warning is not None
+        assert "timed out" in result.warning
+
+    def test_search_content_windows_local_backend_times_out_with_warning(self, tmp_path, monkeypatch):
+        sample = tmp_path / "notes.txt"
+        sample.write_text(("match me\n" * 200), encoding="utf-8")
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        monkeypatch.setattr("tools.file_operations._WINDOWS_NATIVE_SEARCH_TIMEOUT_SECONDS", 0.0)
+
+        result = ops.search("match", path=str(tmp_path))
+
+        assert result.error is None
+        assert result.truncated is True
+        assert result.warning is not None
+        assert "timed out" in result.warning
+
+    def test_write_file_windows_local_backend(self, tmp_path):
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        result = ops.write_file("nested/tool_diag.txt", "alpha\nbeta\ngamma\n")
+
+        written = tmp_path / "nested" / "tool_diag.txt"
+        quoted = tmp_path / "nested" / "'tool_diag.txt'"
+        assert result.error is None
+        assert written.exists()
+        assert not quoted.exists()
+        assert written.read_text(encoding="utf-8") == "alpha\nbeta\ngamma\n"
+
+    def test_patch_replace_windows_local_backend(self, tmp_path):
+        sample = tmp_path / "tool_diag.txt"
+        sample.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+        env.execute.return_value = {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(env)
+        ops._is_windows_local_backend = lambda: True
+
+        result = ops.patch_replace("tool_diag.txt", "beta", "beta_patched")
+
+        assert result.error is None
+        assert result.success is True
+        assert "beta_patched" in sample.read_text(encoding="utf-8")
 
 
 class TestSearchPathValidation:

@@ -124,9 +124,7 @@ class TestUtilities:
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("DISPLAY", raising=False)
-        # Mock os.name and uname for non-macOS, non-Windows
-        monkeypatch.setattr(os, "name", "posix")
-        monkeypatch.setattr(os, "uname", lambda: type("", (), {"sysname": "Linux"})())
+        monkeypatch.setattr("tools.mcp_oauth.platform.system", lambda: "Linux")
         assert _can_open_browser() is False
 
 

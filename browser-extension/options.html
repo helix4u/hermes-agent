@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hermes Sidecar Options</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="icons/nous-32.png">
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main class="app">
+      <header class="hero">
+        <p class="eyebrow">Hermes Agent</p>
+        <h1>Sidecar settings</h1>
+        <p class="subhead">Configure bridge, defaults, and polished extension theming here. Chat stays clean in the side panel.</p>
+      </header>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Bridge</h2>
+            <p class="section-copy">How this extension reaches your local Hermes gateway.</p>
+          </div>
+          <div class="section-head-actions">
+            <button id="health-button" class="ghost-button" type="button">Check bridge</button>
+            <p id="bridge-status-text" class="bridge-status-text">Not checked yet.</p>
+          </div>
+        </div>
+        <label class="field">
+          <span class="field-label">Bridge URL</span>
+          <input id="bridge-url" type="url" spellcheck="false">
+        </label>
+        <label class="field">
+          <span class="field-label">Bridge token</span>
+          <input id="bridge-token" type="password" spellcheck="false" placeholder="Paste ~/.hermes/browser_bridge_token">
+        </label>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Local services</h2>
+            <p class="section-copy">
+              Hermes gateway can host a wiki (<code>/wiki-host</code>), but the built-in <strong>Control room</strong> is now the first-class place for logs, audit trails, prompts, tool timing, and live operator follow-up.
+            </p>
+          </div>
+        </div>
+        <div class="field-actions-row">
+          <button id="open-control-room-button" class="ghost-button" type="button">Open control room</button>
+        </div>
+        <label class="field">
+          <span class="field-label">Wiki URL</span>
+          <input id="wiki-base-url" type="url" spellcheck="false" placeholder="http://127.0.0.1:8000/knowledge_wiki.html">
+        </label>
+        <button id="open-wiki-button" class="ghost-button" type="button">Open wiki in new tab</button>
+        <p id="local-services-feedback" class="section-copy local-services-feedback" role="status" aria-live="polite"></p>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Provider and model</h2>
+            <p class="section-copy">Pick the runtime inference provider and model, then optionally save provider credentials or a provider-specific base URL.</p>
+          </div>
+        </div>
+        <div class="two-column-grid">
+          <label class="field">
+            <span class="field-label">Provider</span>
+            <select id="runtime-provider-select"></select>
+          </label>
+          <label class="field">
+            <span class="field-label">Model</span>
+            <select id="runtime-model-select"></select>
+          </label>
+        </div>
+        <label class="field">
+          <span class="field-label">Custom model override</span>
+          <input id="runtime-model-input" type="text" spellcheck="false" placeholder="Leave blank to use the selected catalog model">
+          <p class="field-help">Use this when your provider exposes a model that is not in the curated list yet.</p>
+        </label>
+        <div class="two-column-grid">
+          <label class="field">
+            <span class="field-label">Model base URL</span>
+            <input id="runtime-base-url" type="url" spellcheck="false" placeholder="Optional OpenAI-compatible endpoint override">
+          </label>
+          <label class="field">
+            <span class="field-label">API mode</span>
+            <select id="runtime-api-mode">
+              <option value="">Default</option>
+              <option value="chat_completions">Chat Completions</option>
+              <option value="responses">Responses</option>
+              <option value="codex_responses">Codex Responses</option>
+              <option value="anthropic_messages">Anthropic Messages</option>
+            </select>
+          </label>
+        </div>
+        <div class="editor-block">
+          <div class="editor-head">
+            <div>
+              <h3>Provider credential helper</h3>
+              <p id="provider-auth-status" class="section-copy">Loading provider auth state...</p>
+            </div>
+          </div>
+          <label class="field">
+            <span class="field-label">API key</span>
+            <input id="provider-api-key-input" type="password" spellcheck="false" placeholder="Paste a key to save it into ~/.hermes/.env">
+          </label>
+          <label class="field">
+            <span class="field-label">Provider env base URL</span>
+            <input id="provider-env-base-url-input" type="url" spellcheck="false" placeholder="Optional provider-specific endpoint override">
+          </label>
+          <p id="provider-env-hint" class="field-help"></p>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Voice stack</h2>
+            <p class="section-copy">Configure TTS, STT, and microphone defaults for the sidecar and the control room.</p>
+          </div>
+        </div>
+        <div class="two-column-grid">
+          <label class="field">
+            <span class="field-label">TTS provider</span>
+            <select id="tts-provider-select">
+              <option value="edge">edge</option>
+              <option value="elevenlabs">elevenlabs</option>
+              <option value="openai">openai</option>
+              <option value="kokoro">kokoro</option>
+              <option value="neutts">neutts</option>
+              <option value="f5">f5</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">Edge voice</span>
+            <input id="tts-edge-voice" type="text" spellcheck="false" placeholder="en-US-AriaNeural">
+          </label>
+        </div>
+        <div class="two-column-grid">
+          <label class="field">
+            <span class="field-label">OpenAI TTS model</span>
+            <input id="tts-openai-model" type="text" spellcheck="false" placeholder="gpt-4o-mini-tts">
+          </label>
+          <label class="field">
+            <span class="field-label">OpenAI voice</span>
+            <input id="tts-openai-voice" type="text" spellcheck="false" placeholder="alloy">
+          </label>
+        </div>
+        <div class="two-column-grid">
+          <label class="field">
+            <span class="field-label">Kokoro base URL</span>
+            <input id="tts-kokoro-base-url" type="url" spellcheck="false" placeholder="http://localhost:8880">
+          </label>
+          <label class="field">
+            <span class="field-label">Kokoro voice</span>
+            <input id="tts-kokoro-voice" type="text" spellcheck="false" placeholder="af_sky+af_v0+af_nicole">
+          </label>
+        </div>
+        <div class="two-column-grid">
+          <label class="field">
+            <span class="field-label">STT provider</span>
+            <select id="stt-provider-select">
+              <option value="local">local</option>
+              <option value="groq">groq</option>
+              <option value="openai">openai</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">Local STT model</span>
+            <input id="stt-local-model" type="text" spellcheck="false" placeholder="base">
+          </label>
+        </div>
+        <div class="two-column-grid">
+          <label class="field">
+            <span class="field-label">OpenAI STT model</span>
+            <input id="stt-openai-model" type="text" spellcheck="false" placeholder="whisper-1">
+          </label>
+          <label class="checkbox-row align-end">
+            <input id="stt-enabled" type="checkbox">
+            <span>Enable speech-to-text</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Runtime controls</h2>
+            <p class="section-copy">Set terminal behavior, delegation defaults, and web backend/archive fallbacks.</p>
+          </div>
+        </div>
+        <div class="two-column-grid">
+          <label class="field">
+            <span class="field-label">Terminal backend</span>
+            <select id="terminal-backend-select">
+              <option value="local">local</option>
+              <option value="docker">docker</option>
+              <option value="ssh">ssh</option>
+              <option value="modal">modal</option>
+              <option value="daytona">daytona</option>
+              <option value="singularity">singularity</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">Terminal timeout (seconds)</span>
+            <input id="terminal-timeout-input" type="text" inputmode="numeric" spellcheck="false" placeholder="180">
+          </label>
+        </div>
+        <div class="two-column-grid">
+          <label class="field">
+            <span class="field-label">Windows shell preference</span>
+            <select id="terminal-windows-shell-select">
+              <option value="auto">auto (cmd, then PowerShell, then WSL)</option>
+              <option value="cmd">cmd.exe</option>
+              <option value="powershell">PowerShell</option>
+              <option value="wsl">WSL</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">Terminal cwd</span>
+            <input id="terminal-cwd-input" type="text" spellcheck="false" placeholder=".">
+          </label>
+        </div>
+        <div class="two-column-grid">
+          <label class="field">
+            <span class="field-label">Web backend</span>
+            <select id="web-backend-select">
+              <option value="">auto</option>
+              <option value="firecrawl">firecrawl</option>
+              <option value="parallel">parallel</option>
+              <option value="tavily">tavily</option>
+            </select>
+          </label>
+        </div>
+        <label class="checkbox-row">
+          <input id="terminal-persistent-shell" type="checkbox">
+          <span>Keep terminal persistent shell enabled</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="terminal-docker-mount-cwd" type="checkbox">
+          <span>Allow Docker backend to mount the host cwd into `/workspace`</span>
+        </label>
+        <div class="editor-block">
+          <div class="editor-head">
+            <div>
+              <h3>Archive fallback</h3>
+              <p class="section-copy">For configured paywalled domains, Hermes can try an archive snapshot first before falling back to the original URL.</p>
+            </div>
+          </div>
+          <label class="checkbox-row">
+            <input id="archive-fallback-enabled" type="checkbox">
+            <span>Enable archive fallback</span>
+          </label>
+          <div class="two-column-grid">
+            <label class="field">
+              <span class="field-label">Archive service</span>
+              <select id="archive-service-select">
+                <option value="archive.today">archive.today</option>
+                <option value="archive.is">archive.is</option>
+                <option value="archive.ph">archive.ph</option>
+                <option value="web.archive.org">web.archive.org</option>
+              </select>
+            </label>
+            <label class="checkbox-row align-end">
+              <input id="archive-fallback-to-original" type="checkbox">
+              <span>Fall back to original URL when archive fetch fails</span>
+            </label>
+          </div>
+          <label class="field">
+            <span class="field-label">Paywalled domains</span>
+            <textarea id="archive-paywalled-domains" rows="3" spellcheck="false" placeholder="nytimes.com, wsj.com, thedailybeast.com"></textarea>
+          </label>
+        </div>
+        <div class="editor-block">
+          <div class="editor-head">
+            <div>
+              <h3>Delegation</h3>
+              <p class="section-copy">Run child agents on a different provider/model if you want cheaper or faster branch work.</p>
+            </div>
+          </div>
+          <div class="two-column-grid">
+            <label class="field">
+              <span class="field-label">Delegation provider</span>
+              <input id="delegation-provider-input" type="text" spellcheck="false" placeholder="openrouter">
+            </label>
+            <label class="field">
+              <span class="field-label">Delegation model</span>
+              <input id="delegation-model-input" type="text" spellcheck="false" placeholder="google/gemini-3-flash-preview">
+            </label>
+          </div>
+          <label class="field">
+            <span class="field-label">Delegation base URL</span>
+            <input id="delegation-base-url-input" type="url" spellcheck="false" placeholder="Optional direct endpoint override">
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Activity log (side panel)</h2>
+            <p class="section-copy">Collapsible gateway progress (tool + thinking lines). Same stream as Discord-style updates.</p>
+          </div>
+        </div>
+        <label class="field">
+          <span class="field-label">Log level</span>
+          <select id="sidecar-activity-log-level">
+            <option value="minimal">Minimal (last 8 lines)</option>
+            <option value="normal">Normal (last 40 lines)</option>
+            <option value="verbose">Verbose (full buffer)</option>
+          </select>
+        </label>
+        <label class="checkbox-row">
+          <input id="activity-log-panel-open" type="checkbox">
+          <span>Start with Activity log expanded</span>
+        </label>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Defaults</h2>
+            <p class="section-copy">Default checkboxes for new turns in the sidecar.</p>
+          </div>
+        </div>
+        <label class="checkbox-row">
+          <input id="share-page-by-default" type="checkbox">
+          <span>Use the current page by default</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="include-transcript" type="checkbox">
+          <span>Include YouTube transcript by default</span>
+        </label>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Voice input</h2>
+            <p class="section-copy">Grant microphone access once here so the sidecar can record without opening a recorder popup each time.</p>
+          </div>
+        </div>
+        <button id="enable-microphone-button" class="ghost-button" type="button">Enable microphone</button>
+        <p id="microphone-status-text" class="section-copy">Not enabled yet.</p>
+        <label class="field">
+          <span class="field-label">Audio input device</span>
+          <select id="audio-input-device-select">
+            <option value="">System default microphone</option>
+          </select>
+        </label>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Appearance</h2>
+            <p class="section-copy">Choose from monochrome, sepia, restored classics, and retro-gamer palettes for the popup, sidecar, and options page.</p>
+          </div>
+        </div>
+        <label class="field">
+          <span class="field-label">Theme</span>
+          <select id="theme-select"></select>
+        </label>
+        <p id="theme-description" class="theme-note">Loading theme library...</p>
+        <div class="editor-block">
+          <div class="editor-head">
+            <div>
+              <h3>Custom themes</h3>
+              <p class="section-copy">Add named themes and tune their light or dark primary and secondary colors.</p>
+            </div>
+            <button id="add-theme-button" class="ghost-button" type="button">Add theme</button>
+          </div>
+          <div id="custom-theme-list" class="prompt-list"></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Sidecar tools</h2>
+            <p class="section-copy">Choose which helper controls show up in the side panel, and edit the reusable prompts they send.</p>
+          </div>
+        </div>
+        <label class="checkbox-row">
+          <input id="show-quick-prompts" type="checkbox">
+          <span>Show quick prompt buttons in the sidecar</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="show-challenge-mode" type="checkbox">
+          <span>Show the challenge mode toggle in the sidecar</span>
+        </label>
+
+        <div class="editor-block">
+          <div class="editor-head">
+            <div>
+              <h3>Challenge mode</h3>
+              <p class="section-copy">Rename the toggle and control the instruction Hermes appends when it is on.</p>
+            </div>
+          </div>
+          <label class="field">
+            <span class="field-label">Button name</span>
+            <input id="challenge-mode-label" type="text" maxlength="60" spellcheck="false">
+          </label>
+          <label class="field">
+            <span class="field-label">Instruction prompt</span>
+            <textarea id="challenge-mode-prompt" rows="4" spellcheck="true"></textarea>
+          </label>
+        </div>
+
+        <div class="editor-block">
+          <div class="editor-head">
+            <div>
+              <h3>Quick prompts</h3>
+              <p class="section-copy">Add, rename, remove, and reorder the prompt buttons that can send instantly from the sidecar.</p>
+            </div>
+            <button id="add-quick-prompt-button" class="ghost-button" type="button">Add prompt</button>
+          </div>
+          <div id="quick-prompt-list" class="prompt-list"></div>
+        </div>
+      </section>
+
+      <section class="card actions-card">
+        <button id="save-settings-button" class="primary-button" type="button">Save settings</button>
+        <p id="status-text" class="status-text">Waiting for input.</p>
+      </section>
+    </main>
+    <script src="theme.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

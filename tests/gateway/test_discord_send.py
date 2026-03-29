@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import sys
@@ -52,8 +53,15 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
     sent_msg = SimpleNamespace(id=1234)
     send_calls = []
 
-    async def fake_send(*, content, reference=None):
-        send_calls.append({"content": content, "reference": reference})
+    async def fake_send(*, content=None, embed=None, reference=None, view=None):
+        send_calls.append(
+            {
+                "content": content,
+                "embed": embed,
+                "reference": reference,
+                "view": view,
+            }
+        )
         if len(send_calls) == 1:
             raise RuntimeError(
                 "400 Bad Request (error code: 50035): Invalid Form Body\n"
@@ -78,3 +86,38 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
     assert channel.send.await_count == 2
     assert send_calls[0]["reference"] is ref_msg
     assert send_calls[1]["reference"] is None
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_persistent_typing_tasks():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        http=SimpleNamespace(request=AsyncMock(return_value=None)),
+        close=AsyncMock(return_value=None),
+    )
+
+    await adapter.send_typing("555")
+    await asyncio.sleep(0)
+
+    assert "555" in adapter._typing_tasks
+
+    await adapter.disconnect()
+
+    assert adapter._typing_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_stop_typing_cancels_persistent_typing_task():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(
+        http=SimpleNamespace(request=AsyncMock(return_value=None)),
+    )
+
+    await adapter.send_typing("555")
+    await asyncio.sleep(0)
+
+    assert "555" in adapter._typing_tasks
+
+    await adapter.stop_typing("555")
+
+    assert "555" not in adapter._typing_tasks

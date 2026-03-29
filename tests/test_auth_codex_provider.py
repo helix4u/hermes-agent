@@ -12,6 +12,7 @@ from hermes_cli.auth import (
     AuthError,
     DEFAULT_CODEX_BASE_URL,
     PROVIDER_REGISTRY,
+    _codex_device_code_login,
     _read_codex_tokens,
     _save_codex_tokens,
     _import_codex_cli_tokens,
@@ -139,6 +140,7 @@ def test_save_codex_tokens_roundtrip(tmp_path, monkeypatch):
 
     assert data["tokens"]["access_token"] == "at123"
     assert data["tokens"]["refresh_token"] == "rt456"
+    assert data["session_origin"] == "hermes_device_auth"
 
 
 def test_import_codex_cli_tokens(tmp_path, monkeypatch):
@@ -158,6 +160,27 @@ def test_import_codex_cli_tokens(tmp_path, monkeypatch):
 def test_import_codex_cli_tokens_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent"))
     assert _import_codex_cli_tokens() is None
+
+
+def test_resolve_codex_runtime_credentials_does_not_auto_migrate_shared_codex_auth(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    codex_home = tmp_path / "codex-cli"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {"access_token": "cli-at", "refresh_token": "cli-rt"},
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+
+    assert exc.value.code == "codex_auth_missing"
+    auth_store = json.loads((hermes_home / "auth.json").read_text())
+    assert auth_store.get("providers", {}).get("openai-codex") is None
 
 
 def test_codex_tokens_not_written_to_shared_file(tmp_path, monkeypatch):
@@ -190,3 +213,151 @@ def test_resolve_returns_hermes_auth_store_source(tmp_path, monkeypatch):
     assert creds["source"] == "hermes-auth-store"
     assert creds["provider"] == "openai-codex"
     assert creds["base_url"] == DEFAULT_CODEX_BASE_URL
+
+
+def test_resolve_codex_runtime_credentials_does_not_import_shared_codex_auth_on_runtime_refresh_failure(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="access-stale", refresh_token="refresh-stale")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _fake_refresh(tokens, timeout_seconds):
+        raise AuthError(
+            "Codex token refresh failed with status 401.",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: {"access_token": "cli-access", "refresh_token": "cli-refresh"},
+    )
+
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials(
+            force_refresh=True,
+            refresh_if_expiring=False,
+            allow_device_auth=False,
+        )
+
+    assert exc.value.code == "invalid_grant"
+    stored = _read_codex_tokens()
+    assert stored["tokens"]["access_token"] == "access-stale"
+    assert stored["tokens"]["refresh_token"] == "refresh-stale"
+
+
+def test_resolve_codex_runtime_credentials_recovers_with_device_auth_when_interactive(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="access-stale", refresh_token="refresh-stale")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _fake_refresh(tokens, timeout_seconds):
+        raise AuthError(
+            "Codex token refresh failed with status 401.",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    monkeypatch.setattr("hermes_cli.auth._codex_can_prompt_for_reauth", lambda: True)
+    monkeypatch.setattr(
+        "hermes_cli.auth._codex_device_code_login",
+        lambda: {
+            "tokens": {"access_token": "device-access", "refresh_token": "device-refresh"},
+            "last_refresh": "2026-03-18T00:00:00Z",
+        },
+    )
+
+    resolved = resolve_codex_runtime_credentials(force_refresh=True, refresh_if_expiring=False)
+
+    assert resolved["api_key"] == "device-access"
+    stored = _read_codex_tokens()
+    assert stored["tokens"]["access_token"] == "device-access"
+    assert stored["tokens"]["refresh_token"] == "device-refresh"
+    assert stored["session_origin"] == "hermes_device_auth"
+
+
+def test_resolve_codex_runtime_credentials_allows_device_auth_when_forced(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="access-stale", refresh_token="refresh-stale")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _fake_refresh(tokens, timeout_seconds):
+        raise AuthError(
+            "Codex token refresh failed with status 401.",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    # Simulate a non-TTY environment, but force-enable device auth.
+    monkeypatch.setattr("hermes_cli.auth._codex_can_prompt_for_reauth", lambda: False)
+    monkeypatch.setattr(
+        "hermes_cli.auth._codex_device_code_login",
+        lambda: {
+            "tokens": {"access_token": "device-access", "refresh_token": "device-refresh"},
+            "last_refresh": "2026-03-18T00:00:00Z",
+        },
+    )
+
+    resolved = resolve_codex_runtime_credentials(
+        force_refresh=True,
+        refresh_if_expiring=False,
+        allow_device_auth=True,
+    )
+
+    assert resolved["api_key"] == "device-access"
+    stored = _read_codex_tokens()
+    assert stored["tokens"]["access_token"] == "device-access"
+    assert stored["tokens"]["refresh_token"] == "device-refresh"
+    assert stored["session_origin"] == "hermes_device_auth"
+
+
+def test_codex_device_code_login_retries_fresh_flow_after_consumed_code(monkeypatch):
+    attempts = {"count": 0}
+
+    def _fake_once():
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise AuthError(
+                "Codex token exchange failed: authorization code already used.",
+                provider="openai-codex",
+                code="invalid_grant",
+                relogin_required=True,
+            )
+        return {
+            "tokens": {"access_token": "device-access", "refresh_token": "device-refresh"},
+            "last_refresh": "2026-03-18T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth._codex_device_code_login_once", _fake_once)
+
+    creds = _codex_device_code_login()
+
+    assert attempts["count"] == 2
+    assert creds["tokens"]["access_token"] == "device-access"
+
+
+def test_codex_device_code_login_does_not_retry_non_retryable_error(monkeypatch):
+    attempts = {"count": 0}
+
+    def _fake_once():
+        attempts["count"] += 1
+        raise AuthError(
+            "Device code request returned status 500.",
+            provider="openai-codex",
+            code="device_code_request_error",
+        )
+
+    monkeypatch.setattr("hermes_cli.auth._codex_device_code_login_once", _fake_once)
+
+    with pytest.raises(AuthError) as exc:
+        _codex_device_code_login()
+
+    assert exc.value.code == "device_code_request_error"
+    assert attempts["count"] == 1

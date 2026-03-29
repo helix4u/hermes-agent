@@ -42,8 +42,12 @@ import os
 import re
 import asyncio
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
 import httpx
-from firecrawl import Firecrawl
+try:
+    from firecrawl import Firecrawl
+except ImportError:  # pragma: no cover - exercised in lean test envs
+    Firecrawl = None
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 from tools.debug_helpers import DebugSession
 from tools.url_safety import is_safe_url
@@ -65,6 +69,71 @@ def _load_web_config() -> dict:
         return load_config().get("web", {})
     except (ImportError, Exception):
         return {}
+
+
+def _load_archive_fallback_config() -> dict:
+    web_cfg = _load_web_config()
+    archive_cfg = web_cfg.get("archive_fallback", {})
+    return archive_cfg if isinstance(archive_cfg, dict) else {}
+
+
+def _normalize_archive_domains(value: Any) -> List[str]:
+    if isinstance(value, str):
+        domains = [part.strip().lower() for part in value.split(",")]
+    elif isinstance(value, list):
+        domains = [str(part).strip().lower() for part in value]
+    else:
+        domains = []
+    return [domain for domain in domains if domain]
+
+
+def _url_matches_paywalled_domain(url: str, domains: List[str]) -> bool:
+    try:
+        hostname = (urlparse(url).hostname or "").strip().lower()
+    except Exception:
+        hostname = ""
+    if not hostname:
+        return False
+    return any(hostname == domain or hostname.endswith(f".{domain}") for domain in domains)
+
+
+def _build_archive_url(url: str, service: str) -> str:
+    normalized_service = str(service or "archive.today").strip().lower()
+    if normalized_service in {"none", "off", "disabled"}:
+        return ""
+    if normalized_service == "archive.is":
+        return f"https://archive.is/newest/{url}"
+    if normalized_service == "archive.ph":
+        return f"https://archive.ph/newest/{url}"
+    if normalized_service == "web.archive.org":
+        return f"https://web.archive.org/web/{url}"
+    return f"https://archive.today/newest/{url}"
+
+
+def _archive_attempt_urls(url: str) -> List[str]:
+    normalized_url = str(url or "").strip()
+    if not normalized_url:
+        return []
+
+    archive_cfg = _load_archive_fallback_config()
+    enabled = bool(archive_cfg.get("enabled"))
+    domains = _normalize_archive_domains(archive_cfg.get("paywalled_domains"))
+    if not enabled or not domains or not _url_matches_paywalled_domain(normalized_url, domains):
+        return [normalized_url]
+
+    archive_url = _build_archive_url(normalized_url, str(archive_cfg.get("service") or "archive.today"))
+    fallback_to_original = archive_cfg.get("fallback_to_original", True) is not False
+    candidates: List[str] = []
+    if archive_url:
+        candidates.append(archive_url)
+    if fallback_to_original or not candidates:
+        candidates.append(normalized_url)
+
+    deduped: List[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in deduped:
+            deduped.append(candidate)
+    return deduped or [normalized_url]
 
 def _get_backend() -> str:
     """Determine which web backend to use.
@@ -106,6 +175,11 @@ def _get_firecrawl_client():
     """
     global _firecrawl_client
     if _firecrawl_client is None:
+        if Firecrawl is None:
+            raise ValueError(
+                "Firecrawl Python package is not installed. "
+                "Install the firecrawl client or switch web.backend to a different provider."
+            )
         api_key = os.getenv("FIRECRAWL_API_KEY")
         api_url = os.getenv("FIRECRAWL_API_URL")
         if not api_key and not api_url:
@@ -1024,101 +1098,98 @@ async def web_extract_tool(
                         results.append({"url": url, "error": "Interrupted", "title": ""})
                         continue
 
-                    # Website policy check — block before fetching
-                    blocked = check_website_access(url)
-                    if blocked:
-                        logger.info("Blocked web_extract for %s by rule %s", blocked["host"], blocked["rule"])
-                        results.append({
-                            "url": url, "title": "", "content": "",
-                            "error": blocked["message"],
-                            "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
-                        })
-                        continue
-
-                    try:
-                        logger.info("Scraping: %s", url)
-                        scrape_result = _get_firecrawl_client().scrape(
-                            url=url,
-                            formats=formats
-                        )
-
-                        # Process the result - properly handle object serialization
-                        metadata = {}
-                        title = ""
-                        content_markdown = None
-                        content_html = None
-
-                        # Extract data from the scrape result
-                        if hasattr(scrape_result, 'model_dump'):
-                            # Pydantic model - use model_dump to get dict
-                            result_dict = scrape_result.model_dump()
-                            content_markdown = result_dict.get('markdown')
-                            content_html = result_dict.get('html')
-                            metadata = result_dict.get('metadata', {})
-                        elif hasattr(scrape_result, '__dict__'):
-                            # Regular object with attributes
-                            content_markdown = getattr(scrape_result, 'markdown', None)
-                            content_html = getattr(scrape_result, 'html', None)
-
-                            # Handle metadata - convert to dict if it's an object
-                            metadata_obj = getattr(scrape_result, 'metadata', {})
-                            if hasattr(metadata_obj, 'model_dump'):
-                                metadata = metadata_obj.model_dump()
-                            elif hasattr(metadata_obj, '__dict__'):
-                                metadata = metadata_obj.__dict__
-                            elif isinstance(metadata_obj, dict):
-                                metadata = metadata_obj
-                            else:
-                                metadata = {}
-                        elif isinstance(scrape_result, dict):
-                            # Already a dictionary
-                            content_markdown = scrape_result.get('markdown')
-                            content_html = scrape_result.get('html')
-                            metadata = scrape_result.get('metadata', {})
-
-                        # Ensure metadata is a dict (not an object)
-                        if not isinstance(metadata, dict):
-                            if hasattr(metadata, 'model_dump'):
-                                metadata = metadata.model_dump()
-                            elif hasattr(metadata, '__dict__'):
-                                metadata = metadata.__dict__
-                            else:
-                                metadata = {}
-
-                        # Get title from metadata
-                        title = metadata.get("title", "")
-
-                        # Re-check final URL after redirect
-                        final_url = metadata.get("sourceURL", url)
-                        final_blocked = check_website_access(final_url)
-                        if final_blocked:
-                            logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
-                            results.append({
-                                "url": final_url, "title": title, "content": "", "raw_content": "",
-                                "error": final_blocked["message"],
-                                "blocked_by_policy": {"host": final_blocked["host"], "rule": final_blocked["rule"], "source": final_blocked["source"]},
-                            })
+                    attempt_urls = _archive_attempt_urls(url)
+                    final_error = ""
+                    for attempt_url in attempt_urls:
+                        blocked = check_website_access(attempt_url)
+                        if blocked:
+                            logger.info("Blocked web_extract for %s by rule %s", blocked["host"], blocked["rule"])
+                            final_error = blocked["message"]
                             continue
 
-                        # Choose content based on requested format
-                        chosen_content = content_markdown if (format == "markdown" or (format is None and content_markdown)) else content_html or content_markdown or ""
+                        try:
+                            logger.info("Scraping: %s", attempt_url)
+                            scrape_result = _get_firecrawl_client().scrape(
+                                url=attempt_url,
+                                formats=formats
+                            )
 
-                        results.append({
-                            "url": final_url,
-                            "title": title,
-                            "content": chosen_content,
-                            "raw_content": chosen_content,
-                            "metadata": metadata  # Now guaranteed to be a dict
-                        })
+                            metadata = {}
+                            title = ""
+                            content_markdown = None
+                            content_html = None
 
-                    except Exception as scrape_err:
-                        logger.debug("Scrape failed for %s: %s", url, scrape_err)
+                            if hasattr(scrape_result, 'model_dump'):
+                                result_dict = scrape_result.model_dump()
+                                content_markdown = result_dict.get('markdown')
+                                content_html = result_dict.get('html')
+                                metadata = result_dict.get('metadata', {})
+                            elif hasattr(scrape_result, '__dict__'):
+                                content_markdown = getattr(scrape_result, 'markdown', None)
+                                content_html = getattr(scrape_result, 'html', None)
+                                metadata_obj = getattr(scrape_result, 'metadata', {})
+                                if hasattr(metadata_obj, 'model_dump'):
+                                    metadata = metadata_obj.model_dump()
+                                elif hasattr(metadata_obj, '__dict__'):
+                                    metadata = metadata_obj.__dict__
+                                elif isinstance(metadata_obj, dict):
+                                    metadata = metadata_obj
+                                else:
+                                    metadata = {}
+                            elif isinstance(scrape_result, dict):
+                                content_markdown = scrape_result.get('markdown')
+                                content_html = scrape_result.get('html')
+                                metadata = scrape_result.get('metadata', {})
+
+                            if not isinstance(metadata, dict):
+                                if hasattr(metadata, 'model_dump'):
+                                    metadata = metadata.model_dump()
+                                elif hasattr(metadata, '__dict__'):
+                                    metadata = metadata.__dict__
+                                else:
+                                    metadata = {}
+
+                            title = metadata.get("title", "")
+                            final_url = metadata.get("sourceURL", attempt_url)
+                            final_blocked = check_website_access(final_url)
+                            if final_blocked:
+                                logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
+                                final_error = final_blocked["message"]
+                                continue
+
+                            chosen_content = content_markdown if (format == "markdown" or (format is None and content_markdown)) else content_html or content_markdown or ""
+                            used_archive = attempt_url != url
+                            if used_archive:
+                                metadata = {
+                                    **metadata,
+                                    "archive_fallback_used": True,
+                                    "archive_url": attempt_url,
+                                    "requested_url": url,
+                                }
+
+                            results.append({
+                                "url": url,
+                                "archive_url": attempt_url if used_archive else "",
+                                "source_url": final_url,
+                                "title": title,
+                                "content": chosen_content,
+                                "raw_content": chosen_content,
+                                "metadata": metadata
+                            })
+                            final_error = ""
+                            break
+
+                        except Exception as scrape_err:
+                            logger.debug("Scrape failed for %s: %s", attempt_url, scrape_err)
+                            final_error = str(scrape_err)
+
+                    if final_error:
                         results.append({
                             "url": url,
                             "title": "",
                             "content": "",
                             "raw_content": "",
-                            "error": str(scrape_err)
+                            "error": final_error
                         })
 
         # Merge any SSRF-blocked results back in
@@ -1210,6 +1281,8 @@ async def web_extract_tool(
         trimmed_results = [
             {
                 "url": r.get("url", ""),
+                **({"archive_url": r.get("archive_url", "")} if r.get("archive_url") else {}),
+                **({"source_url": r.get("source_url", "")} if r.get("source_url") else {}),
                 "title": r.get("title", ""),
                 "content": r.get("content", ""),
                 "error": r.get("error"),

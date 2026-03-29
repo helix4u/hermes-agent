@@ -1,0 +1,78 @@
+name: honcho-local
+
+services:
+  api:
+    image: honcho-local:latest
+    build:
+      context: ${HONCHO_SOURCE_DIR:-./honcho-src}
+      dockerfile: Dockerfile
+    working_dir: /app
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_CONNECTION_URI: postgresql+psycopg://${HONCHO_DB_USER:-postgres}:${HONCHO_DB_PASSWORD:-postgres}@database:5432/${HONCHO_DB_NAME:-postgres}
+      CACHE_URL: redis://redis:6379/0?suppress=true
+    env_file:
+      - .env
+    ports:
+      - "${HONCHO_HTTP_PORT:-8000}:8000"
+    restart: unless-stopped
+
+  deriver:
+    image: honcho-local:latest
+    build:
+      context: ${HONCHO_SOURCE_DIR:-./honcho-src}
+      dockerfile: Dockerfile
+    working_dir: /app
+    entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_CONNECTION_URI: postgresql+psycopg://${HONCHO_DB_USER:-postgres}:${HONCHO_DB_PASSWORD:-postgres}@database:5432/${HONCHO_DB_NAME:-postgres}
+      CACHE_URL: redis://redis:6379/0?suppress=true
+      METRICS_ENABLED: "true"
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  database:
+    image: pgvector/pgvector:pg15
+    command: ["postgres", "-c", "max_connections=800"]
+    environment:
+      POSTGRES_DB: ${HONCHO_DB_NAME:-postgres}
+      POSTGRES_USER: ${HONCHO_DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${HONCHO_DB_PASSWORD:-postgres}
+      POSTGRES_HOST_AUTH_METHOD: trust
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - honcho-pgdata:/var/lib/postgresql/data/
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${HONCHO_DB_USER:-postgres} -d ${HONCHO_DB_NAME:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.2
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - honcho-redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  honcho-pgdata:
+  honcho-redisdata:

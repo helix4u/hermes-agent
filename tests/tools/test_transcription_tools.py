@@ -100,12 +100,34 @@ class TestGetProviderFallbackPriority:
             from tools.transcription_tools import _get_provider
             assert _get_provider({}) == "groq"
 
-    def test_explicit_openai_no_key_returns_none(self, monkeypatch):
-        """Explicit openai with no key returns none — no cross-provider fallback."""
+    def test_local_fallback_to_groq_only(self, monkeypatch):
+        """When only groq key available, falls back to groq."""
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._has_local_command", return_value=False):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "local"}) == "groq"
+
+    def test_openai_fallback_to_groq(self, monkeypatch):
+        """When openai key missing but groq available, falls back to groq."""
         monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._has_local_command", return_value=False):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "openai"}) == "groq"
+
+    def test_openai_nothing_available(self, monkeypatch):
+        """When no openai key and no local, returns none."""
+        monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
-             patch("tools.transcription_tools._HAS_OPENAI", True):
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._has_local_command", return_value=False):
             from tools.transcription_tools import _get_provider
             assert _get_provider({"provider": "openai"}) == "none"
 
@@ -133,17 +155,19 @@ class TestExplicitProviderRespected:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-real-key-here")
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
-             patch("tools.transcription_tools._HAS_OPENAI", True):
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._has_local_command", return_value=False):
             from tools.transcription_tools import _get_provider
-            result = _get_provider({"provider": "local"})
+            result = _get_provider({"provider": "local", "strict_provider": True})
             assert result == "none", f"Expected 'none' but got {result!r}"
 
     def test_explicit_local_no_fallback_to_groq(self, monkeypatch):
         monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
-             patch("tools.transcription_tools._HAS_OPENAI", True):
+             patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._has_local_command", return_value=False):
             from tools.transcription_tools import _get_provider
-            result = _get_provider({"provider": "local"})
+            result = _get_provider({"provider": "local", "strict_provider": True})
             assert result == "none"
 
     def test_explicit_local_uses_local_command_fallback(self, monkeypatch):
@@ -163,7 +187,7 @@ class TestExplicitProviderRespected:
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
              patch("tools.transcription_tools._HAS_OPENAI", True):
             from tools.transcription_tools import _get_provider
-            result = _get_provider({"provider": "groq"})
+            result = _get_provider({"provider": "groq", "strict_provider": True})
             assert result == "none"
 
     def test_explicit_openai_no_fallback_to_groq(self, monkeypatch):
@@ -173,7 +197,7 @@ class TestExplicitProviderRespected:
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
              patch("tools.transcription_tools._HAS_OPENAI", True):
             from tools.transcription_tools import _get_provider
-            result = _get_provider({"provider": "openai"})
+            result = _get_provider({"provider": "openai", "strict_provider": True})
             assert result == "none"
 
     def test_auto_detect_still_falls_back_to_cloud(self, monkeypatch):

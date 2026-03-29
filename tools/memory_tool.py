@@ -23,7 +23,6 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
-import fcntl
 import json
 import logging
 import os
@@ -34,12 +33,31 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
 
+from hermes_cli.config import get_hermes_home
+
 logger = logging.getLogger(__name__)
+
+try:
+    import fcntl
+except Exception:
+    fcntl = None
+
+try:
+    import msvcrt
+except Exception:
+    msvcrt = None
 
 # Where memory files live
 MEMORY_DIR = get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
+_DYNAMIC_SHELL_CONTEXT_PATTERNS = (
+    "This terminal session runs in WSL on the user's Windows machine",
+    "Current command context is mixed: terminal commands run in WSL/Linux",
+    "hermes's working directory resolves as `/cygdrive/",
+    "hermes is using a Bash/Cygwin-style layer with Windows interop",
+    "hermes will use cmd-safe commands and Windows paths for execution unless explicitly told otherwise.",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +135,14 @@ class MemoryStore:
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
 
+        prompt_memory_entries = [
+            entry for entry in self.memory_entries
+            if not self._is_dynamic_shell_context_entry(entry)
+        ]
+
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
-            "memory": self._render_block("memory", self.memory_entries),
+            "memory": self._render_block("memory", prompt_memory_entries),
             "user": self._render_block("user", self.user_entries),
         }
 
@@ -133,12 +156,30 @@ class MemoryStore:
         """
         lock_path = path.with_suffix(path.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = open(lock_path, "w")
+        if fcntl is None and msvcrt is None:
+            yield
+            return
+
+        if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+            lock_path.write_text(" ", encoding="utf-8")
+
+        fd = open(lock_path, "r+" if msvcrt else "w")
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            else:
+                fd.seek(0)
+                msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                try:
+                    fd.seek(0)
+                    msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
             fd.close()
 
     @staticmethod
@@ -155,6 +196,13 @@ class MemoryStore:
         fresh = self._read_file(self._path_for(target))
         fresh = list(dict.fromkeys(fresh))  # deduplicate
         self._set_entries(target, fresh)
+
+    @staticmethod
+    def _is_dynamic_shell_context_entry(entry: str) -> bool:
+        text = (entry or "").strip()
+        if not text:
+            return False
+        return any(pattern in text for pattern in _DYNAMIC_SHELL_CONTEXT_PATTERNS)
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
@@ -542,7 +590,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

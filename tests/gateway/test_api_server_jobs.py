@@ -18,7 +18,18 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter, cors_middleware
+from gateway.platforms.api_server import APIServerAdapter, API_SERVER_ADAPTER_KEY, cors_middleware
+
+
+@pytest.fixture(autouse=True)
+def _clear_api_server_env(monkeypatch):
+    for key in (
+        "API_SERVER_HOST",
+        "API_SERVER_PORT",
+        "API_SERVER_KEY",
+        "API_SERVER_CORS_ORIGINS",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +60,7 @@ def _make_adapter(api_key: str = "") -> APIServerAdapter:
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app with jobs routes registered."""
     app = web.Application(middlewares=[cors_middleware])
-    app["api_server_adapter"] = adapter
+    app[API_SERVER_ADAPTER_KEY] = adapter
     # Register only job routes (plus health for sanity)
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/api/jobs", adapter._handle_list_jobs)

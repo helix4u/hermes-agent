@@ -492,16 +492,24 @@ class TestPlayBeep:
 # ============================================================================
 
 class TestSilenceDetection:
-    def test_silence_callback_fires_after_speech_then_silence(self, mock_sd):
+    @staticmethod
+    def _install_fake_monotonic(monkeypatch, voice_mode, start=100.0):
+        clock = {"now": start}
+        monkeypatch.setattr(voice_mode.time, "monotonic", lambda: clock["now"])
+        return clock
+
+    def test_silence_callback_fires_after_speech_then_silence(self, mock_sd, monkeypatch):
         np = pytest.importorskip("numpy")
         import threading
 
         mock_stream = MagicMock()
         mock_sd.InputStream.return_value = mock_stream
 
-        from tools.voice_mode import AudioRecorder, SAMPLE_RATE
+        import tools.voice_mode as voice_mode
 
-        recorder = AudioRecorder()
+        clock = self._install_fake_monotonic(monkeypatch, voice_mode)
+
+        recorder = voice_mode.AudioRecorder()
         # Use very short durations for testing
         recorder._silence_duration = 0.05
         recorder._min_speech_duration = 0.05
@@ -521,7 +529,7 @@ class TestSilenceDetection:
         # Simulate sustained speech (multiple loud chunks to exceed min_speech_duration)
         loud_frame = np.full((1600, 1), 5000, dtype="int16")
         callback(loud_frame, 1600, None, None)
-        time.sleep(0.06)
+        clock["now"] += 0.06
         callback(loud_frame, 1600, None, None)
         assert recorder._has_spoken is True
 
@@ -530,7 +538,7 @@ class TestSilenceDetection:
         callback(silent_frame, 1600, None, None)
 
         # Wait a bit past the silence duration, then send another silent frame
-        time.sleep(0.06)
+        clock["now"] += 0.06
         callback(silent_frame, 1600, None, None)
 
         # The callback should have been fired
@@ -538,16 +546,18 @@ class TestSilenceDetection:
 
         recorder.cancel()
 
-    def test_silence_without_speech_does_not_fire(self, mock_sd):
+    def test_silence_without_speech_does_not_fire(self, mock_sd, monkeypatch):
         np = pytest.importorskip("numpy")
         import threading
 
         mock_stream = MagicMock()
         mock_sd.InputStream.return_value = mock_stream
 
-        from tools.voice_mode import AudioRecorder
+        import tools.voice_mode as voice_mode
 
-        recorder = AudioRecorder()
+        clock = self._install_fake_monotonic(monkeypatch, voice_mode)
+
+        recorder = voice_mode.AudioRecorder()
         recorder._silence_duration = 0.02
 
         fired = threading.Event()
@@ -561,13 +571,13 @@ class TestSilenceDetection:
         silent_frame = np.zeros((1600, 1), dtype="int16")
         for _ in range(5):
             callback(silent_frame, 1600, None, None)
-            time.sleep(0.01)
+            clock["now"] += 0.01
 
         assert fired.wait(timeout=0.2) is False
 
         recorder.cancel()
 
-    def test_micro_pause_tolerance_during_speech(self, mock_sd):
+    def test_micro_pause_tolerance_during_speech(self, mock_sd, monkeypatch):
         """Brief dips below threshold during speech should NOT reset speech tracking."""
         np = pytest.importorskip("numpy")
         import threading
@@ -575,9 +585,11 @@ class TestSilenceDetection:
         mock_stream = MagicMock()
         mock_sd.InputStream.return_value = mock_stream
 
-        from tools.voice_mode import AudioRecorder
+        import tools.voice_mode as voice_mode
 
-        recorder = AudioRecorder()
+        clock = self._install_fake_monotonic(monkeypatch, voice_mode)
+
+        recorder = voice_mode.AudioRecorder()
         recorder._silence_duration = 0.05
         recorder._min_speech_duration = 0.15
         recorder._max_dip_tolerance = 0.1
@@ -594,14 +606,14 @@ class TestSilenceDetection:
 
         # Speech chunk 1
         callback(loud_frame, 1600, None, None)
-        time.sleep(0.05)
+        clock["now"] += 0.05
         # Brief micro-pause (dip < max_dip_tolerance)
         callback(quiet_frame, 1600, None, None)
-        time.sleep(0.05)
+        clock["now"] += 0.05
         # Speech resumes -- speech_start should NOT have been reset
         callback(loud_frame, 1600, None, None)
         assert recorder._speech_start > 0, "Speech start should be preserved across brief dips"
-        time.sleep(0.06)
+        clock["now"] += 0.06
         # Another speech chunk to exceed min_speech_duration
         callback(loud_frame, 1600, None, None)
         assert recorder._has_spoken is True, "Speech should be confirmed after tolerating micro-pause"
@@ -829,16 +841,18 @@ class TestAudioLevelIndicator:
 class TestConfigurableSilenceParams:
     """Verify that silence detection params can be configured."""
 
-    def test_custom_threshold_and_duration(self, mock_sd):
+    def test_custom_threshold_and_duration(self, mock_sd, monkeypatch):
         np = pytest.importorskip("numpy")
 
         mock_stream = MagicMock()
         mock_sd.InputStream.return_value = mock_stream
 
-        from tools.voice_mode import AudioRecorder
+        import tools.voice_mode as voice_mode
         import threading
 
-        recorder = AudioRecorder()
+        clock = TestSilenceDetection._install_fake_monotonic(monkeypatch, voice_mode)
+
+        recorder = voice_mode.AudioRecorder()
         recorder._silence_threshold = 5000
         recorder._silence_duration = 0.05
         recorder._min_speech_duration = 0.05
@@ -853,7 +867,7 @@ class TestConfigurableSilenceParams:
         moderate = np.full((1600, 1), 1000, dtype="int16")
         for _ in range(5):
             callback(moderate, 1600, None, None)
-            time.sleep(0.02)
+            clock["now"] += 0.02
 
         assert recorder._has_spoken is False
         assert fired.wait(timeout=0.2) is False
@@ -861,7 +875,7 @@ class TestConfigurableSilenceParams:
         # Now send really loud audio (above 5000 threshold)
         very_loud = np.full((1600, 1), 8000, dtype="int16")
         callback(very_loud, 1600, None, None)
-        time.sleep(0.06)
+        clock["now"] += 0.06
         callback(very_loud, 1600, None, None)
         assert recorder._has_spoken is True
 

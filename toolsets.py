@@ -66,6 +66,24 @@ _HERMES_CORE_TOOLS = [
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
 
+_HERMES_BROWSER_TOOLS = [
+    "browser_navigate", "browser_snapshot", "browser_click",
+    "browser_type", "browser_scroll", "browser_back",
+    "browser_press", "browser_close", "browser_get_images",
+    "browser_vision",
+]
+
+_HERMES_SIDECAR_TOOLS = [
+    tool
+    for tool in _HERMES_CORE_TOOLS
+    if tool != "delegate_task"
+]
+
+_HERMES_SIDECAR_DELEGATING_TOOLS = [
+    *_HERMES_SIDECAR_TOOLS,
+    "delegate_task",
+]
+
 
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
@@ -288,6 +306,18 @@ TOOLSETS = {
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",
         "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-sidecar": {
+        "description": "Browser sidecar toolset - Hermes core tools with browser automation, without delegated subagents",
+        "tools": _HERMES_SIDECAR_TOOLS,
+        "includes": []
+    },
+
+    "hermes-sidecar-delegating": {
+        "description": "Browser sidecar toolset with delegated subagents enabled",
+        "tools": _HERMES_SIDECAR_DELEGATING_TOOLS,
         "includes": []
     },
     

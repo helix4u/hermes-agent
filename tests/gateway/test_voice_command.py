@@ -840,8 +840,9 @@ class TestVoiceChannelCommands:
         mock_adapter.handle_message = AsyncMock()
         runner.adapters[Platform.DISCORD] = mock_adapter
         await runner._handle_voice_channel_input(111, 42, "Test transcript")
-        mock_channel.send.assert_called_once()
-        msg = mock_channel.send.call_args[0][0]
+        mock_adapter.send.assert_awaited_once()
+        kwargs = mock_adapter.send.call_args.kwargs
+        msg = kwargs["content"]
         assert "Test transcript" in msg
         assert "42" in msg  # user_id in mention
 

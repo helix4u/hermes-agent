@@ -141,3 +141,15 @@ class TestToolsetConsistency:
         # All platform toolsets should be identical
         for ts in tool_sets[1:]:
             assert ts == tool_sets[0]
+
+    def test_sidecar_toolset_includes_browser_tools(self):
+        """Browser sidecar sessions should be able to use browser automation."""
+        sidecar_tools = set(TOOLSETS["hermes-sidecar"]["tools"])
+        assert "browser_navigate" in sidecar_tools
+        assert "browser_snapshot" in sidecar_tools
+        assert "browser_click" in sidecar_tools
+
+    def test_sidecar_toolset_still_blocks_delegate_task(self):
+        """Non-delegating sidecar preset should not expose delegate_task."""
+        sidecar_tools = set(TOOLSETS["hermes-sidecar"]["tools"])
+        assert "delegate_task" not in sidecar_tools

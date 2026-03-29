@@ -38,7 +38,8 @@ class BaseEnvironment(ABC):
     @abstractmethod
     def execute(self, command: str, cwd: str = "", *,
                 timeout: int | None = None,
-                stdin_data: str | None = None) -> dict:
+                stdin_data: str | None = None,
+                shell_mode_override: str | None = None) -> dict:
         """Execute a command, return {"output": str, "returncode": int}."""
         ...
 

@@ -7,6 +7,7 @@ Used by AIAgent._execute_tool_calls for CLI feedback.
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -94,6 +95,86 @@ def _oneline(text: str) -> str:
     return " ".join(text.split())
 
 
+def _strip_matching_quotes(text: str) -> str:
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        return text[1:-1]
+    return text
+
+
+def _normalize_terminal_preview(command: str, max_len: int) -> str | None:
+    preview = _oneline(str(command or ""))
+    if not preview:
+        return None
+
+    if re.search(r"(?i)\b(?:pwsh|powershell)(?:\.exe)?\b", preview):
+        if re.search(r"(?i)\s-(?:encodedcommand|enc)\b", preview):
+            return "PowerShell helper"
+
+        ps_match = re.search(
+            r"(?is)\b(?:pwsh|powershell)(?:\.exe)?\b.*?\s-Command\s+(.+)$",
+            preview,
+        )
+        if ps_match:
+            preview = _strip_matching_quotes(ps_match.group(1).strip())
+            set_location = re.match(
+                r"(?is)^Set-Location\s+-LiteralPath\s+'(?:[^']|'')*'\s*;\s*(.+)$",
+                preview,
+            )
+            if set_location:
+                preview = set_location.group(1).strip()
+
+    cmd_match = re.search(
+        r"(?is)\bcmd(?:\.exe)?\b(?:\s+/[a-z]+)*\s+/c\s+(.+)$",
+        preview,
+    )
+    if cmd_match:
+        preview = _strip_matching_quotes(cmd_match.group(1).strip())
+
+    if len(preview) > max_len:
+        preview = preview[: max_len - 3] + "..."
+    return preview
+
+
+def _shorten_search_path(path: str, max_len: int = 18) -> str:
+    """Shorten a search root so previews still show the search scope."""
+    cleaned = _oneline(str(path or ".")).strip()
+    if not cleaned or cleaned == ".":
+        return "."
+    normalized = cleaned.replace("\\", "/")
+    if len(normalized) <= max_len:
+        return normalized
+
+    parts = [part for part in re.split(r"[\\/]+", normalized) if part]
+    if not parts:
+        return normalized[-max_len:]
+    tail = parts[-1]
+    head = parts[-2] if len(parts) > 1 else ""
+    compact = f".../{head}/{tail}" if head else f".../{tail}"
+    if len(compact) <= max_len:
+        return compact
+    return compact[-max_len:]
+
+
+def _format_search_preview(args: dict, max_len: int) -> str | None:
+    """Render search intent with enough scope to distinguish mode/path."""
+    pattern = _oneline(str(args.get("pattern", "") or "")).strip()
+    if not pattern:
+        return None
+
+    target = str(args.get("target") or "").strip().lower()
+    mode = {
+        "files": "files",
+        "content": "content",
+        "find": "files",
+        "grep": "content",
+    }.get(target, "auto")
+    path = _shorten_search_path(args.get("path", "."))
+    preview = f"{mode} {pattern} @ {path}"
+    if len(preview) > max_len:
+        preview = preview[: max_len - 3] + "..."
+    return preview
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str | None:
     """Build a short preview of a tool call's primary argument for display."""
     if not args:
@@ -157,6 +238,12 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str | N
         if len(msg) > 20:
             msg = msg[:17] + "..."
         return f"to {target}: \"{msg}\""
+
+    if tool_name == "terminal":
+        return _normalize_terminal_preview(args.get("command", ""), max_len)
+
+    if tool_name == "search_files":
+        return _format_search_preview(args, max_len)
 
     if tool_name.startswith("rl_"):
         rl_previews = {
@@ -528,9 +615,15 @@ def get_cute_tool_message(
         return _wrap(f"┊ 🔧 patch     {_path(args.get('path', ''))}  {dur}")
     if tool_name == "search_files":
         pattern = _trunc(args.get("pattern", ""), 35)
-        target = args.get("target", "content")
-        verb = "find" if target == "files" else "grep"
-        return _wrap(f"┊ 🔎 {verb:9} {pattern}  {dur}")
+        target = args.get("target")
+        if target == "files":
+            verb = "find"
+        elif target == "content":
+            verb = "grep"
+        else:
+            verb = "scan"
+        scope = _trunc(_path(args.get("path", ".")), 18)
+        return _wrap(f"┊ 🔎 {verb:9} {pattern} @ {scope}  {dur}")
     if tool_name == "browser_navigate":
         url = args.get("url", "")
         domain = url.replace("https://", "").replace("http://", "").split("/")[0]

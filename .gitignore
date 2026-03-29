@@ -47,14 +47,36 @@ cli-config.yaml
 
 # Skills Hub state (lives in ~/.hermes/skills/.hub/ at runtime, but just in case)
 skills/.hub/
+skills/media/plex-dj-playlists/local/
 ignored/
 .worktrees/
 environments/benchmarks/evals/
+*.mp3
+*.ogg
+agents/memories/
+agents/memory.md
+agents/worldview.md
+audio_cache/
+cache/
+output/
+cron/output/
+cron/jobs.json
+cron/.tick.lock
+hermes-agent/
+memories/
+upstream/
 
 # Release script temp files
 .release_notes.md
+<<<<<<< Updated upstream
 mini-swe-agent/
 
 # Nix
 .direnv/
 result
+=======
+
+# Local Honcho self-hosted reference
+docker/honcho/.env
+docker/honcho/honcho-src/
+>>>>>>> Stashed changes

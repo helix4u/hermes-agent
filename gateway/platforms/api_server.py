@@ -47,6 +47,11 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 
+if AIOHTTP_AVAILABLE:
+    API_SERVER_ADAPTER_KEY = web.AppKey("api_server_adapter", object)
+else:  # pragma: no cover - aiohttp unavailable fallback
+    API_SERVER_ADAPTER_KEY = "api_server_adapter"
+
 
 def check_api_server_requirements() -> bool:
     """Check if API server dependencies are available."""
@@ -174,7 +179,7 @@ if AIOHTTP_AVAILABLE:
     @web.middleware
     async def cors_middleware(request, handler):
         """Add CORS headers for explicitly allowed origins; handle OPTIONS preflight."""
-        adapter = request.app.get("api_server_adapter")
+        adapter = request.app.get(API_SERVER_ADAPTER_KEY)
         origin = request.headers.get("Origin", "")
         cors_headers = None
         if adapter is not None:
@@ -1243,7 +1248,7 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws)
-            self._app["api_server_adapter"] = self
+            self._app[API_SERVER_ADAPTER_KEY] = self
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)

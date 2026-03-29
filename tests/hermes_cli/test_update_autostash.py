@@ -324,6 +324,14 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
 
 
+def _expected_update_git_cmd(*args):
+    cmd = ["git"]
+    if hermes_main.sys.platform == "win32":
+        cmd += ["-c", "windows.appendAtomically=false"]
+    cmd.extend(args)
+    return cmd
+
+
 def test_cmd_update_tries_extras_first_then_falls_back(monkeypatch, tmp_path):
     """When .[all] fails, update should fall back to . instead of aborting."""
     _setup_update_mocks(monkeypatch, tmp_path)
@@ -333,13 +341,15 @@ def test_cmd_update_tries_extras_first_then_falls_back(monkeypatch, tmp_path):
 
     def fake_run(cmd, **kwargs):
         recorded.append(cmd)
-        if cmd == ["git", "fetch", "origin"]:
+        if cmd == _expected_update_git_cmd("fetch", "origin"):
             return SimpleNamespace(stdout="", stderr="", returncode=0)
-        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+        if cmd == _expected_update_git_cmd("rev-parse", "--abbrev-ref", "HEAD"):
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
-        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+        if cmd == _expected_update_git_cmd("rev-parse", "--verify", "origin/main"):
+            return SimpleNamespace(stdout="origin/main\n", stderr="", returncode=0)
+        if cmd == _expected_update_git_cmd("rev-list", "HEAD..origin/main", "--count"):
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
-        if cmd == ["git", "pull", "origin", "main"]:
+        if cmd == _expected_update_git_cmd("pull", "--ff-only", "origin", "main"):
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         # .[all] fails
         if ".[all]" in cmd:
@@ -368,13 +378,15 @@ def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
 
     def fake_run(cmd, **kwargs):
         recorded.append(cmd)
-        if cmd == ["git", "fetch", "origin"]:
+        if cmd == _expected_update_git_cmd("fetch", "origin"):
             return SimpleNamespace(stdout="", stderr="", returncode=0)
-        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+        if cmd == _expected_update_git_cmd("rev-parse", "--abbrev-ref", "HEAD"):
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
-        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+        if cmd == _expected_update_git_cmd("rev-parse", "--verify", "origin/main"):
+            return SimpleNamespace(stdout="origin/main\n", stderr="", returncode=0)
+        if cmd == _expected_update_git_cmd("rev-list", "HEAD..origin/main", "--count"):
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
-        if cmd == ["git", "pull", "origin", "main"]:
+        if cmd == _expected_update_git_cmd("pull", "--ff-only", "origin", "main"):
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         return SimpleNamespace(returncode=0)
 

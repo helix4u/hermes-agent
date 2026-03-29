@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 _tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 
+def _is_windows_local_backend() -> bool:
+    return os.name == "nt" and os.getenv("TERMINAL_ENV", "local").lower() == "local"
+
+
 def _run_tool_in_thread(tool_name: str, arguments: Dict[str, Any], task_id: str) -> str:
     """
     Run a tool call in a thread pool executor so backends that use asyncio.run()
@@ -176,6 +180,13 @@ class ToolContext:
             return {"exit_code": -1, "output": f"Local file not found: {local_path}"}
 
         raw = local.read_bytes()
+
+        if _is_windows_local_backend():
+            target = _Path(remote_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+            return {"exit_code": 0, "output": f"Uploaded {len(raw)} bytes"}
+
         b64 = base64.b64encode(raw).decode("ascii")
 
         # Ensure parent directory exists in the sandbox
@@ -248,6 +259,16 @@ class ToolContext:
         """
         import base64
         from pathlib import Path as _Path
+
+        if _is_windows_local_backend():
+            remote = _Path(remote_path)
+            if not remote.exists() or not remote.is_file():
+                return {"success": False, "error": f"Remote file not found: {remote_path}"}
+            raw = remote.read_bytes()
+            local = _Path(local_path)
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_bytes(raw)
+            return {"success": True, "bytes": len(raw)}
 
         # Base64-encode the file inside the sandbox and capture output
         result = self.terminal(

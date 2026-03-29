@@ -81,6 +81,16 @@ def _mock_aiohttp(status=200, json_data=None, json_side_effect=None):
     return MagicMock(return_value=_AsyncCM(mock_session))
 
 
+def _consume_scheduled_coroutine(coro):
+    """Stand in for create_task in tests without leaking the coroutine."""
+    try:
+        return MagicMock()
+    finally:
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+
+
 def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
     """Return a dict of common patches needed to reach the health-check loop."""
     patches = {
@@ -95,7 +105,10 @@ def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
         patch("subprocess.Popen", return_value=mock_proc),
         patch("builtins.open", return_value=mock_fh),
         patch("gateway.platforms.whatsapp.asyncio.sleep", new_callable=AsyncMock),
-        patch("gateway.platforms.whatsapp.asyncio.create_task"),
+        patch(
+            "gateway.platforms.whatsapp.asyncio.create_task",
+            side_effect=_consume_scheduled_coroutine,
+        ),
     ]
     if mock_client_cls is not None:
         base.append(patch("aiohttp.ClientSession", mock_client_cls))

@@ -3,10 +3,35 @@
 Run with: python -m pytest tests/test_interrupt.py -v
 """
 
+import os
 import queue
 import threading
 import time
 import pytest
+
+
+def _supports_bash_sigterm_escalation() -> bool:
+    import shutil
+
+    if not shutil.which("bash"):
+        return False
+    if os.name != "nt":
+        return True
+
+    from tools.environments.shell_utils import get_local_shell_mode
+
+    return get_local_shell_mode() == "wsl"
+
+
+@pytest.fixture(autouse=True)
+def _reset_interrupt_flag():
+    from tools.interrupt import set_interrupt
+
+    set_interrupt(False)
+    try:
+        yield
+    finally:
+        set_interrupt(False)
 
 
 # ---------------------------------------------------------------------------
@@ -165,16 +190,16 @@ class TestSIGKILLEscalation:
     """Test that SIGTERM-resistant processes get SIGKILL'd."""
 
     @pytest.mark.skipif(
-        not __import__("shutil").which("bash"),
-        reason="Requires bash"
+        not _supports_bash_sigterm_escalation(),
+        reason="Requires bash-compatible local shell execution"
     )
-    def test_sigterm_trap_killed_within_2s(self):
+    def test_sigterm_trap_killed_within_2s(self, tmp_path):
         """A process that traps SIGTERM should be SIGKILL'd after 1s grace."""
         from tools.interrupt import set_interrupt
         from tools.environments.local import LocalEnvironment
 
         set_interrupt(False)
-        env = LocalEnvironment(cwd="/tmp", timeout=30)
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
 
         # Start execution in a thread, interrupt after 0.5s
         result_holder = {"value": None}

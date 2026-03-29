@@ -5,8 +5,9 @@ STT dispatch via tools.transcription_tools, and TTS playback via
 sounddevice or system audio players.
 
 Dependencies (optional):
-    pip install sounddevice numpy
-    or: pip install hermes-agent[voice]
+    Use `/voice install` in Hermes CLI (recommended), or install manually:
+      uv pip install --python "<runtime-python>" sounddevice numpy
+      python -m pip install sounddevice numpy
 """
 
 import logging
@@ -15,6 +16,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -81,7 +83,7 @@ def detect_audio_environment() -> dict:
         except Exception:
             warnings.append("Audio subsystem error (PortAudio cannot query devices)")
     except ImportError:
-        warnings.append("Audio libraries not installed (pip install sounddevice numpy)")
+        warnings.append("Audio libraries not installed (run /voice install or pip install sounddevice numpy)")
     except OSError:
         warnings.append(
             "PortAudio system library not found -- install it first:\n"
@@ -367,10 +369,21 @@ class AudioRecorder:
         try:
             _import_audio()
         except (ImportError, OSError) as e:
+            uv_path = shutil.which("uv")
+            install_uv = (
+                f"{uv_path} pip install --python \"{sys.executable}\" sounddevice numpy"
+                if uv_path
+                else None
+            )
+            install_pip = f"{sys.executable} -m pip install sounddevice numpy"
+            install_hint = (
+                "Run /voice install from Hermes CLI.\n"
+                + (f"Manual: {install_uv}\n" if install_uv else "")
+                + f"Fallback: {install_pip}"
+            )
             raise RuntimeError(
                 "Voice mode requires sounddevice and numpy.\n"
-                "Install with: pip install sounddevice numpy\n"
-                "Or: pip install hermes-agent[voice]"
+                f"{install_hint}"
             ) from e
 
         with self._lock:
@@ -730,7 +743,7 @@ def check_voice_requirements() -> Dict[str, Any]:
     if has_audio:
         details_parts.append("Audio capture: OK")
     else:
-        details_parts.append("Audio capture: MISSING (pip install sounddevice numpy)")
+        details_parts.append("Audio capture: MISSING (run /voice install)")
 
     if not stt_enabled:
         details_parts.append("STT provider: DISABLED in config (stt.enabled: false)")
@@ -742,7 +755,7 @@ def check_voice_requirements() -> Dict[str, Any]:
         details_parts.append("STT provider: OK (OpenAI)")
     else:
         details_parts.append(
-            "STT provider: MISSING (pip install faster-whisper, "
+            "STT provider: MISSING (install faster-whisper in Hermes runtime, "
             "or set GROQ_API_KEY / VOICE_TOOLS_OPENAI_KEY)"
         )
 

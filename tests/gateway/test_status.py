@@ -42,48 +42,47 @@ class TestGatewayPidState:
 
         assert status.get_running_pid() == os.getpid()
 
-    def test_get_running_pid_accepts_script_style_gateway_cmdline(self, tmp_path, monkeypatch):
+    def test_get_running_pid_accepts_gateway_run_argv_shape(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         pid_path = tmp_path / "gateway.pid"
         pid_path.write_text(json.dumps({
             "pid": os.getpid(),
             "kind": "hermes-gateway",
-            "argv": ["/venv/bin/python", "/repo/hermes_cli/main.py", "gateway", "run", "--replace"],
+            "argv": [
+                r"C:\Users\btgil\.local\bin\hermes.exe",
+                "gateway",
+                "run",
+            ],
             "start_time": 123,
         }))
 
         monkeypatch.setattr(status.os, "kill", lambda pid, sig: None)
         monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
-        monkeypatch.setattr(
-            status,
-            "_read_process_cmdline",
-            lambda pid: "/venv/bin/python /repo/hermes_cli/main.py gateway run --replace",
-        )
+        monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: None)
 
         assert status.get_running_pid() == os.getpid()
 
-
-class TestGatewayRuntimeStatus:
-    def test_write_runtime_status_overwrites_stale_pid_on_restart(self, tmp_path, monkeypatch):
-        """Regression: setdefault() preserved stale PID from previous process (#1631)."""
+    def test_get_running_pid_falls_back_to_runtime_status_when_pid_file_missing(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-        # Simulate a previous gateway run that left a state file with a stale PID
-        state_path = tmp_path / "gateway_state.json"
-        state_path.write_text(json.dumps({
-            "pid": 99999,
-            "start_time": 1000.0,
+        runtime_path = tmp_path / "gateway_state.json"
+        runtime_path.write_text(json.dumps({
+            "pid": os.getpid(),
             "kind": "hermes-gateway",
-            "platforms": {},
-            "updated_at": "2025-01-01T00:00:00Z",
+            "gateway_state": "running",
+            "start_time": 123,
         }))
 
-        status.write_runtime_status(gateway_state="running")
+        monkeypatch.setattr(status.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
+        monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: None)
 
-        payload = status.read_runtime_status()
-        assert payload["pid"] == os.getpid(), "PID should be overwritten, not preserved via setdefault"
-        assert payload["start_time"] != 1000.0, "start_time should be overwritten on restart"
+        assert status.get_running_pid() == os.getpid()
+        repaired = json.loads((tmp_path / "gateway.pid").read_text())
+        assert repaired["pid"] == os.getpid()
+        assert repaired["kind"] == "hermes-gateway"
 
+
+class TestGatewayRuntimeStatus:
     def test_write_runtime_status_records_platform_failure(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
@@ -102,6 +101,22 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["telegram"]["state"] == "fatal"
         assert payload["platforms"]["telegram"]["error_code"] == "telegram_polling_conflict"
         assert payload["platforms"]["telegram"]["error_message"] == "another poller is active"
+
+    def test_write_runtime_status_backfills_argv_for_legacy_records(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        runtime_path = tmp_path / "gateway_state.json"
+        runtime_path.write_text(json.dumps({
+            "pid": 111,
+            "kind": "hermes-gateway",
+            "gateway_state": "running",
+        }))
+        monkeypatch.setattr(status.sys, "argv", ["python", "-m", "hermes_cli.main", "gateway", "run"])
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
+
+        status.write_runtime_status(gateway_state="running")
+
+        payload = status.read_runtime_status()
+        assert payload["argv"] == ["python", "-m", "hermes_cli.main", "gateway", "run"]
 
 
 class TestScopedLocks:

@@ -110,7 +110,7 @@ class ToolRegistry:
                     except Exception:
                         check_results[entry.check_fn] = False
                         if not quiet:
-                            logger.debug("Tool %s check raised; skipping", name)
+                            logger.debug("Tool %s check raised; marking unavailable", name)
                 if not check_results[entry.check_fn]:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)

@@ -27,8 +27,36 @@ from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_project_root_precedence() -> None:
+    """Put this project root first on sys.path to avoid cwd shadowing.
+
+    On Windows, launching `hermes` from `C:\\Users\\...\\.hermes` can expose an
+    unrelated sibling `tools/` package ahead of the editable repo modules,
+    causing imports like `from tools.browser_tool import ...` to resolve to the
+    wrong code. Force this file's directory to index 0 before local imports.
+    """
+    project_root = Path(__file__).resolve().parent
+    target = os.path.normcase(os.path.normpath(str(project_root)))
+    cleaned = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        try:
+            norm = os.path.normcase(os.path.normpath(entry))
+        except Exception:
+            norm = entry
+        if norm == target:
+            continue
+        cleaned.append(entry)
+    sys.path[:] = [str(project_root), *cleaned]
+
+
+_ensure_project_root_precedence()
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -57,12 +85,7 @@ except (ImportError, AttributeError):
 import threading
 import queue
 
-from agent.usage_pricing import (
-    CanonicalUsage,
-    estimate_usage_cost,
-    format_duration_compact,
-    format_token_count_compact,
-)
+from agent.usage_pricing import estimate_cost_usd, format_duration_compact, format_token_count_compact, has_known_pricing
 from hermes_cli.banner import _format_context_length
 
 _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
@@ -170,12 +193,6 @@ def load_cli_config() -> Dict[str, Any]:
             "threshold": 0.50,    # Compress at 50% of model's context limit
             "summary_model": "",  # Model for summaries (empty = use main model)
         },
-        "smart_model_routing": {
-            "enabled": False,
-            "max_simple_chars": 160,
-            "max_simple_words": 28,
-            "cheap_model": {},
-        },
         "agent": {
             "max_turns": 90,  # Default max tool-calling iterations (shared with subagents)
             "verbose": False,
@@ -206,7 +223,7 @@ def load_cli_config() -> Dict[str, Any]:
             "show_reasoning": False,
             "streaming": True,
             "busy_input_mode": "interrupt",
-
+            "show_cost": False,
             "skin": "default",
         },
         "clarify": {
@@ -336,7 +353,6 @@ def load_cli_config() -> Dict[str, Any]:
         "timeout": "TERMINAL_TIMEOUT",
         "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
         "docker_image": "TERMINAL_DOCKER_IMAGE",
-        "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
         "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "modal_image": "TERMINAL_MODAL_IMAGE",
         "daytona_image": "TERMINAL_DAYTONA_IMAGE",
@@ -378,16 +394,37 @@ def load_cli_config() -> Dict[str, Any]:
     browser_config = defaults.get("browser", {})
     browser_env_mappings = {
         "inactivity_timeout": "BROWSER_INACTIVITY_TIMEOUT",
+        "cdp_url": "BROWSER_CDP_URL",
+        "cdp_browser": "BROWSER_CDP_BROWSER",
+        "cdp_port": "BROWSER_CDP_PORT",
+        "cdp_user_data_dir": "BROWSER_CDP_USER_DATA_DIR",
     }
     
     for config_key, env_var in browser_env_mappings.items():
         if config_key in browser_config:
-            os.environ[env_var] = str(browser_config[config_key])
+            value = browser_config[config_key]
+            if isinstance(value, str):
+                if value.strip():
+                    os.environ[env_var] = value.strip()
+            elif value is not None:
+                os.environ[env_var] = str(value)
+    
+    # Apply compression config to environment variables
+    compression_config = defaults.get("compression", {})
+    compression_env_mappings = {
+        "enabled": "CONTEXT_COMPRESSION_ENABLED",
+        "threshold": "CONTEXT_COMPRESSION_THRESHOLD",
+        "summary_model": "CONTEXT_COMPRESSION_MODEL",
+        "summary_provider": "CONTEXT_COMPRESSION_PROVIDER",
+    }
+    
+    for config_key, env_var in compression_env_mappings.items():
+        if config_key in compression_config:
+            os.environ[env_var] = str(compression_config[config_key])
     
     # Apply auxiliary model/direct-endpoint overrides to environment variables.
     # Vision and web_extract each have their own provider/model/base_url/api_key tuple.
-    # Compression config is read directly from config.yaml by run_agent.py and
-    # auxiliary_client.py — no env var bridging needed.
+    # (Compression is handled in the compression section above.)
     # Only set env vars for non-empty / non-default values so auto-detection
     # still works.
     auxiliary_config = defaults.get("auxiliary", {})
@@ -498,16 +535,16 @@ def _run_cleanup():
     _cleanup_done = True
     try:
         _cleanup_all_terminals()
-    except Exception:
+    except BaseException:
         pass
     try:
         _cleanup_all_browsers()
-    except Exception:
+    except BaseException:
         pass
     try:
         from tools.mcp_tool import shutdown_mcp_servers
         shutdown_mcp_servers()
-    except Exception:
+    except BaseException:
         pass
     # Close cached auxiliary LLM clients (sync + async) so that
     # AsyncHttpxClientWrapper.__del__ doesn't fire on a closed event loop
@@ -808,7 +845,17 @@ def _cprint(text: str):
     StdoutProxy.  Routing through print_formatted_text(ANSI(...)) lets
     prompt_toolkit parse the escapes and render real colors.
     """
-    _pt_print(_PT_ANSI(text))
+    try:
+        _pt_print(_PT_ANSI(text))
+    except Exception as exc:
+        try:
+            from prompt_toolkit.output.win32 import NoConsoleScreenBufferError
+        except Exception:
+            NoConsoleScreenBufferError = ()  # type: ignore[assignment]
+        if NoConsoleScreenBufferError and isinstance(exc, NoConsoleScreenBufferError):
+            print(text)
+            return
+        raise
 
 
 class ChatConsole:
@@ -823,10 +870,15 @@ class ChatConsole:
     def __init__(self):
         from io import StringIO
         self._buffer = StringIO()
+        try:
+            from hermes_cli.colors import _ansi_supported as _hermes_ansi_supported
+        except Exception:
+            _hermes_ansi_supported = lambda: True
+        ansi_ok = bool(_hermes_ansi_supported())
         self._inner = Console(
             file=self._buffer,
-            force_terminal=True,
-            color_system="truecolor",
+            force_terminal=ansi_ok,
+            color_system="truecolor" if ansi_ok else None,
             highlight=False,
         )
 
@@ -999,8 +1051,6 @@ def save_config_value(key_path: str, value: any) -> bool:
         return False
 
 
-
-
 # ============================================================================
 # HermesCLI Class
 # ============================================================================
@@ -1061,10 +1111,12 @@ class HermesCLI:
         self.busy_input_mode = "queue" if str(_bim).strip().lower() == "queue" else "interrupt"
 
         self.verbose = verbose if verbose is not None else (self.tool_progress_mode == "verbose")
-        
-        # streaming: stream tokens to the terminal as they arrive (display.streaming in config.yaml)
+        # streaming: render response deltas live in the TUI
         self.streaming_enabled = CLI_CONFIG["display"].get("streaming", False)
-
+        # show_cost: display $ cost in the status bar (off by default)
+        self.show_cost = CLI_CONFIG["display"].get("show_cost", False)
+        # The prompt_toolkit layout reads this on the very first redraw.
+        self._status_bar_visible = True
         # Streaming display state
         self._stream_buf = ""        # Partial line buffer for line-buffered rendering
         self._stream_started = False  # True once first delta arrives
@@ -1092,9 +1144,6 @@ class HermesCLI:
         # Track whether model was explicitly chosen by the user or fell back
         # to the global default.  Provider-specific normalisation may override
         # the default silently but should warn when overriding an explicit choice.
-        # A config model that matches the global fallback is NOT considered an
-        # explicit choice — the user just never changed it.  But a config model
-        # like "gpt-5.3-codex" IS explicit and must be preserved.
         self._model_is_default = not model and (
             not _config_model or _config_model == _FALLBACK_MODEL
         )
@@ -1242,6 +1291,9 @@ class HermesCLI:
         self._secret_state = None
         self._secret_deadline = 0
         self._spinner_text: str = ""  # thinking spinner text for TUI
+        self._active_tool_status: dict[str, list[str]] = {}
+        self._active_tool_count = 0
+        self._last_tool_status: str = ""
         self._command_running = False
         self._command_status = ""
         self._attached_images: list[Path] = []
@@ -1259,9 +1311,6 @@ class HermesCLI:
         self._voice_continuous = False
         self._voice_tts_done = threading.Event()
         self._voice_tts_done.set()
-
-        # Status bar visibility (toggled via /statusbar)
-        self._status_bar_visible = True
 
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
@@ -1294,8 +1343,6 @@ class HermesCLI:
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         model_name = self.model or "unknown"
         model_short = model_name.split("/")[-1] if "/" in model_name else model_name
-        if model_short.endswith(".gguf"):
-            model_short = model_short[:-5]
         if len(model_short) > 26:
             model_short = f"{model_short[:23]}..."
 
@@ -1307,14 +1354,12 @@ class HermesCLI:
             "context_tokens": 0,
             "context_length": None,
             "context_percent": None,
-            "session_input_tokens": 0,
-            "session_output_tokens": 0,
-            "session_cache_read_tokens": 0,
-            "session_cache_write_tokens": 0,
             "session_prompt_tokens": 0,
             "session_completion_tokens": 0,
             "session_total_tokens": 0,
             "session_api_calls": 0,
+            "session_cost": 0.0,
+            "pricing_known": has_known_pricing(model_name),
             "compressions": 0,
         }
 
@@ -1322,14 +1367,15 @@ class HermesCLI:
         if not agent:
             return snapshot
 
-        snapshot["session_input_tokens"] = getattr(agent, "session_input_tokens", 0) or 0
-        snapshot["session_output_tokens"] = getattr(agent, "session_output_tokens", 0) or 0
-        snapshot["session_cache_read_tokens"] = getattr(agent, "session_cache_read_tokens", 0) or 0
-        snapshot["session_cache_write_tokens"] = getattr(agent, "session_cache_write_tokens", 0) or 0
         snapshot["session_prompt_tokens"] = getattr(agent, "session_prompt_tokens", 0) or 0
         snapshot["session_completion_tokens"] = getattr(agent, "session_completion_tokens", 0) or 0
         snapshot["session_total_tokens"] = getattr(agent, "session_total_tokens", 0) or 0
         snapshot["session_api_calls"] = getattr(agent, "session_api_calls", 0) or 0
+        snapshot["session_cost"] = estimate_cost_usd(
+            model_name,
+            snapshot["session_prompt_tokens"],
+            snapshot["session_completion_tokens"],
+        )
 
         compressor = getattr(agent, "context_compressor", None)
         if compressor:
@@ -1355,11 +1401,19 @@ class HermesCLI:
             percent = snapshot["context_percent"]
             percent_label = f"{percent}%" if percent is not None else "--"
             duration_label = snapshot["duration"]
+            show_cost = getattr(self, "show_cost", False)
+
+            if show_cost:
+                cost_label = f"${snapshot['session_cost']:.2f}" if snapshot["pricing_known"] else "cost n/a"
+            else:
+                cost_label = None
 
             if width < 52:
                 return f"⚕ {snapshot['model_short']} · {duration_label}"
             if width < 76:
                 parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                if cost_label:
+                    parts.append(cost_label)
                 parts.append(duration_label)
                 return " · ".join(parts)
 
@@ -1371,14 +1425,14 @@ class HermesCLI:
                 context_label = "ctx --"
 
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            if cost_label:
+                parts.append(cost_label)
             parts.append(duration_label)
             return " │ ".join(parts)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
 
     def _get_status_bar_fragments(self):
-        if not self._status_bar_visible:
-            return []
         try:
             snapshot = self._get_status_bar_snapshot()
             # Use prompt_toolkit's own terminal width when running inside the
@@ -1392,6 +1446,12 @@ class HermesCLI:
             except Exception:
                 width = shutil.get_terminal_size((80, 24)).columns
             duration_label = snapshot["duration"]
+            show_cost = getattr(self, "show_cost", False)
+
+            if show_cost:
+                cost_label = f"${snapshot['session_cost']:.2f}" if snapshot["pricing_known"] else "cost n/a"
+            else:
+                cost_label = None
 
             if width < 52:
                 return [
@@ -1411,6 +1471,11 @@ class HermesCLI:
                     ("class:status-bar-dim", " · "),
                     (self._status_bar_context_style(percent), percent_label),
                 ]
+                if cost_label:
+                    frags.extend([
+                        ("class:status-bar-dim", " · "),
+                        ("class:status-bar-dim", cost_label),
+                    ])
                 frags.extend([
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
@@ -1436,6 +1501,11 @@ class HermesCLI:
                 ("class:status-bar-dim", " "),
                 (bar_style, percent_label),
             ]
+            if cost_label:
+                frags.extend([
+                    ("class:status-bar-dim", " │ "),
+                    ("class:status-bar-dim", cost_label),
+                ])
             frags.extend([
                 ("class:status-bar-dim", " │ "),
                 ("class:status-bar-dim", duration_label),
@@ -1446,34 +1516,26 @@ class HermesCLI:
             return [("class:status-bar", f" {self._build_status_bar_text()} ")]
 
     def _normalize_model_for_provider(self, resolved_provider: str) -> bool:
-        """Normalize provider-specific model IDs and routing."""
-        current_model = (self.model or "").strip()
-        changed = False
+        """Strip provider prefixes and swap the default model for Codex.
 
-        if resolved_provider == "copilot":
-            try:
-                from hermes_cli.models import copilot_model_api_mode, normalize_copilot_model_id
+        When the resolved provider is ``openai-codex``:
 
-                canonical = normalize_copilot_model_id(current_model, api_key=self.api_key)
-                if canonical and canonical != current_model:
-                    if not self._model_is_default:
-                        self.console.print(
-                            f"[yellow]⚠️  Normalized Copilot model '{current_model}' to '{canonical}'.[/]"
-                        )
-                    self.model = canonical
-                    current_model = canonical
-                    changed = True
+        1. Strip any ``provider/`` prefix (the Codex Responses API only
+           accepts bare model slugs like ``gpt-5.4``, not ``openai/gpt-5.4``).
+        2. If the active model is still the *untouched default* (user never
+           explicitly chose a model), replace it with a Codex-compatible
+           default so the first session doesn't immediately error.
 
-                resolved_mode = copilot_model_api_mode(current_model, api_key=self.api_key)
-                if resolved_mode != self.api_mode:
-                    self.api_mode = resolved_mode
-                    changed = True
-            except Exception:
-                pass
-            return changed
+        If the user explicitly chose a model — *any* model — we trust them
+        and let the API be the judge.  No allowlists, no slug checks.
 
+        Returns True when the active model was changed.
+        """
         if resolved_provider != "openai-codex":
             return False
+
+        current_model = (self.model or "").strip()
+        changed = False
 
         # 1. Strip provider prefix ("openai/gpt-5.4" → "gpt-5.4")
         if "/" in current_model:
@@ -1511,10 +1573,29 @@ class HermesCLI:
         """Called by agent when thinking starts/stops. Updates TUI spinner."""
         if not text:
             self._flush_reasoning_preview(force=True)
-        self._spinner_text = text or ""
+        if text:
+            self._spinner_text = text
+        elif self._active_tool_status:
+            self._refresh_tool_spinner_text()
+        else:
+            self._spinner_text = ""
         self._invalidate()
 
-    # ── Streaming display ────────────────────────────────────────────────
+    def _refresh_tool_spinner_text(self) -> None:
+        """Render live concurrent-tool status into the TUI spinner line."""
+        if self._active_tool_status:
+            previews: list[str] = []
+            for labels in self._active_tool_status.values():
+                previews.extend(labels)
+            count = self._active_tool_count or len(previews)
+            shown = ", ".join(previews[:2])
+            if count > 2:
+                shown += ", ..."
+            noun = "tool" if count == 1 else "tools"
+            self._spinner_text = f"running {count} {noun}: {shown}"
+        elif self._last_tool_status:
+            self._spinner_text = self._last_tool_status
+        self._invalidate()
 
     def _current_reasoning_callback(self):
         """Return the active reasoning display callback for the current mode."""
@@ -1829,6 +1910,14 @@ class HermesCLI:
         self._reasoning_buf = ""
         self._reasoning_preview_buf = ""
 
+    def _reset_tool_status(self) -> None:
+        """Clear per-turn tool status so stale concurrent banners don't linger."""
+        self._active_tool_status.clear()
+        self._active_tool_count = 0
+        self._last_tool_status = ""
+        self._spinner_text = ""
+        self._invalidate()
+
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
         cmd_lower = command.lower().strip()
@@ -1886,10 +1975,13 @@ class HermesCLI:
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                allow_device_auth=True,
             )
         except Exception as exc:
+            from hermes_cli.colors import strip_ansi
+
             message = format_runtime_provider_error(exc)
-            self.console.print(f"[bold red]{message}[/]")
+            _cprint(f"\033[1;31m{strip_ansi(message)}{_RST}")
             return False
 
         api_key = runtime.get("api_key")
@@ -1913,10 +2005,10 @@ class HermesCLI:
                     base_url, _source,
                 )
             else:
-                self.console.print("[bold red]Provider resolver returned an empty API key.[/]")
+                _cprint(f"\033[1;31mProvider resolver returned an empty API key.{_RST}")
                 return False
         if not isinstance(base_url, str) or not base_url:
-            self.console.print("[bold red]Provider resolver returned an empty base URL.[/]")
+            _cprint(f"\033[1;31mProvider resolver returned an empty base URL.{_RST}")
             return False
 
         credentials_changed = api_key != self.api_key or base_url != self.base_url
@@ -2080,7 +2172,6 @@ class HermesCLI:
                 runtime.get("command"),
                 tuple(runtime.get("args") or ()),
             )
-
             if self._pending_title and self._session_db:
                 try:
                     self._session_db.set_session_title(self.session_id, self._pending_title)
@@ -2091,7 +2182,9 @@ class HermesCLI:
                     self._pending_title = None
             return True
         except Exception as e:
-            self.console.print(f"[bold red]Failed to initialize agent: {e}[/]")
+            from hermes_cli.colors import strip_ansi
+
+            _cprint(f"\033[1;31mFailed to initialize agent: {strip_ansi(str(e))}{_RST}")
             return False
     
     def show_banner(self):
@@ -2696,69 +2789,7 @@ class HermesCLI:
         
         print(f"  Total: {len(tools)} tools  ヽ(^o^)ノ")
         print()
-
-    def _handle_tools_command(self, cmd: str):
-        """Handle /tools [list|disable|enable] slash commands.
-
-        /tools (no args) shows the tool list.
-        /tools list shows enabled/disabled status per toolset.
-        /tools disable/enable saves the change to config and resets
-        the session so the new tool set takes effect cleanly (no
-        prompt-cache breakage mid-conversation).
-        """
-        import shlex
-        from argparse import Namespace
-        from hermes_cli.tools_config import tools_disable_enable_command
-
-        try:
-            parts = shlex.split(cmd)
-        except ValueError:
-            parts = cmd.split()
-
-        subcommand = parts[1] if len(parts) > 1 else ""
-        if subcommand not in ("list", "disable", "enable"):
-            self.show_tools()
-            return
-
-        if subcommand == "list":
-            tools_disable_enable_command(
-                Namespace(tools_action="list", platform="cli"))
-            return
-
-        names = parts[2:]
-        if not names:
-            print(f"(._.) Usage: /tools {subcommand} <name> [name ...]")
-            print(f"  Built-in toolset:  /tools {subcommand} web")
-            print(f"  MCP tool:          /tools {subcommand} github:create_issue")
-            return
-
-        # Confirm session reset before applying
-        verb = "Disable" if subcommand == "disable" else "Enable"
-        label = ", ".join(names)
-        _cprint(f"{_GOLD}{verb} {label}?{_RST}")
-        _cprint(f"{_DIM}This will save to config and reset your session so the "
-                f"change takes effect cleanly.{_RST}")
-        try:
-            answer = input("  Continue? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            _cprint(f"{_DIM}Cancelled.{_RST}")
-            return
-
-        if answer not in ("y", "yes"):
-            _cprint(f"{_DIM}Cancelled.{_RST}")
-            return
-
-        tools_disable_enable_command(
-            Namespace(tools_action=subcommand, names=names, platform="cli"))
-
-        # Reset session so the new tool config is picked up from a clean state
-        from hermes_cli.tools_config import _get_platform_tools
-        from hermes_cli.config import load_config
-        self.enabled_toolsets = _get_platform_tools(load_config(), "cli")
-        self.new_session()
-        _cprint(f"{_DIM}Session reset. New tool configuration is active.{_RST}")
-
+    
     def show_toolsets(self):
         """Display available toolsets with kawaii ASCII art."""
         all_toolsets = get_all_toolsets()
@@ -3536,7 +3567,7 @@ class HermesCLI:
                 print(f"  Next run: {result['job'].get('next_run_at')}")
             elif action == "run":
                 print(f"(^_^)b Triggered job: {result['job']['name']} ({job_id})")
-                print("  It will run on the next scheduler tick.")
+                print("  Hermes checks cron jobs about once a minute, so this should run within about 60 seconds.")
             else:
                 removed = result.get("removed_job", {})
                 print(f"(^_^)b Removed job: {removed.get('name', job_id)} ({job_id})")
@@ -3594,7 +3625,7 @@ class HermesCLI:
             print("  To start the gateway:")
             print("    python cli.py --gateway")
             print()
-            print("  Configuration file: ~/.hermes/config.yaml")
+            print("  Configuration file: ~/.hermes/gateway.json")
             print()
             
         except Exception as e:
@@ -3604,7 +3635,7 @@ class HermesCLI:
             print("    1. Set environment variables:")
             print("       TELEGRAM_BOT_TOKEN=your_token")
             print("       DISCORD_BOT_TOKEN=your_token")
-            print("    2. Or configure settings in ~/.hermes/config.yaml")
+            print("    2. Or create ~/.hermes/gateway.json")
             print()
     
     def process_command(self, command: str) -> bool:
@@ -3620,25 +3651,20 @@ class HermesCLI:
         # Lowercase only for dispatch matching; preserve original case for arguments
         cmd_lower = command.lower().strip()
         cmd_original = command.strip()
-
-        # Resolve aliases via central registry so adding an alias is a one-line
-        # change in hermes_cli/commands.py instead of touching every dispatch site.
-        from hermes_cli.commands import resolve_command as _resolve_cmd
-        _base_word = cmd_lower.split()[0].lstrip("/")
-        _cmd_def = _resolve_cmd(_base_word)
-        canonical = _cmd_def.name if _cmd_def else _base_word
+        base_cmd = cmd_lower.split()[0] if cmd_lower else ""
+        canonical = base_cmd.lstrip("/")
         
-        if canonical in ("quit", "exit", "q"):
+        if cmd_lower in ("/quit", "/exit", "/q"):
             return False
-        elif canonical == "help":
+        elif cmd_lower == "/help":
             self.show_help()
-        elif canonical == "tools":
+        elif cmd_lower.startswith("/tools"):
             self._handle_tools_command(cmd_original)
-        elif canonical == "toolsets":
+        elif cmd_lower == "/toolsets":
             self.show_toolsets()
-        elif canonical == "config":
+        elif cmd_lower == "/config":
             self.show_config()
-        elif canonical == "clear":
+        elif cmd_lower == "/clear":
             self.new_session(silent=True)
             # Clear terminal screen.  Inside the TUI, Rich's console.clear()
             # goes through patch_stdout's StdoutProxy which swallows the
@@ -3679,9 +3705,9 @@ class HermesCLI:
             else:
                 self.show_banner()
                 print("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
-        elif canonical == "history":
+        elif cmd_lower == "/history":
             self.show_history()
-        elif canonical == "title":
+        elif cmd_lower.startswith("/title"):
             parts = cmd_original.split(maxsplit=1)
             if len(parts) > 1:
                 raw_title = parts[1].strip()
@@ -3741,70 +3767,150 @@ class HermesCLI:
                 else:
                     _cprint("  Usage: /title <your session title>")
             else:
-                # Show current title and session ID if no argument given
+                # Show current title if no argument given
                 if self._session_db:
-                    _cprint(f"  Session ID: {self.session_id}")
                     session = self._session_db.get_session(self.session_id)
                     if session and session.get("title"):
-                        _cprint(f"  Title: {session['title']}")
+                        _cprint(f"  Session title: {session['title']}")
                     elif self._pending_title:
-                        _cprint(f"  Title (pending): {self._pending_title}")
+                        _cprint(f"  Session title (pending): {self._pending_title}")
                     else:
                         _cprint("  No title set. Usage: /title <your session title>")
                 else:
                     _cprint("  Session database not available.")
-        elif canonical == "new":
+        elif cmd_lower in ("/reset", "/new"):
             self.new_session()
+        elif cmd_lower.startswith("/model"):
+            # Use original case so model names like "Anthropic/Claude-Opus-4" are preserved
+            parts = cmd_original.split(maxsplit=1)
+            if len(parts) > 1:
+                from hermes_cli.model_switch import switch_model, switch_to_custom_provider
+
+                raw_input = parts[1].strip()
+
+                # Handle bare "/model custom" — switch to custom provider
+                # and auto-detect the model from the endpoint.
+                if raw_input.strip().lower() == "custom":
+                    result = switch_to_custom_provider()
+                    if result.success:
+                        self.model = result.model
+                        self.requested_provider = "custom"
+                        self.provider = "custom"
+                        self.api_key = result.api_key
+                        self.base_url = result.base_url
+                        self.agent = None
+                        save_config_value("model.default", result.model)
+                        save_config_value("model.provider", "custom")
+                        save_config_value("model.base_url", result.base_url)
+                        print(f"(^_^)b Model changed to: {result.model} [provider: Custom]")
+                        print(f"  Endpoint: {result.base_url}")
+                        print(f"  Status: connected (model auto-detected)")
+                    else:
+                        print(f"(>_<) {result.error_message}")
+                    return True
+
+                # Core model-switching pipeline (shared with gateway)
+                current_provider = self.provider or self.requested_provider or "openrouter"
+                result = switch_model(
+                    raw_input,
+                    current_provider,
+                    current_base_url=self.base_url or "",
+                    current_api_key=self.api_key or "",
+                )
+
+                if not result.success:
+                    print(f"(>_<) {result.error_message}")
+                    if "Did you mean" not in result.error_message:
+                        print(f"  Model unchanged: {self.model}")
+                        if "credentials" not in result.error_message.lower():
+                            print("  Tip: Use /model to see available models, /provider to see providers")
+                else:
+                    self.model = result.new_model
+                    self.agent = None  # Force re-init
+
+                    if result.provider_changed:
+                        self.requested_provider = result.target_provider
+                        self.provider = result.target_provider
+                        self.api_key = result.api_key
+                        self.base_url = result.base_url
+
+                    provider_note = f" [provider: {result.provider_label}]" if result.provider_changed else ""
+
+                    if result.persist:
+                        saved_model = save_config_value("model.default", result.new_model)
+                        if result.provider_changed:
+                            save_config_value("model.provider", result.target_provider)
+                            # Persist base_url for custom endpoints; clear
+                            # when switching away from custom (#2562 Phase 2).
+                            if result.base_url and "openrouter.ai" not in (result.base_url or ""):
+                                save_config_value("model.base_url", result.base_url)
+                            else:
+                                save_config_value("model.base_url", None)
+                        if saved_model:
+                            print(f"(^_^)b Model changed to: {result.new_model}{provider_note} (saved to config)")
+                        else:
+                            print(f"(^_^) Model changed to: {result.new_model}{provider_note} (this session only)")
+                    else:
+                        print(f"(^_^) Model changed to: {result.new_model}{provider_note} (this session only)")
+                        if result.warning_message:
+                            print(f"  Reason: {result.warning_message}")
+                        print("  Note: Model will revert on restart. Use a verified model to save to config.")
+
+                    # Show endpoint info for custom providers
+                    if result.is_custom_target:
+                        endpoint = result.base_url or self.base_url or "custom endpoint"
+                        print(f"  Endpoint: {endpoint}")
+                        if not result.provider_changed:
+                            print(f"  Tip: To switch providers, use /model provider:model")
+                            print(f"       e.g. /model openai-codex:gpt-5.2-codex")
+            else:
+                self._show_model_and_providers()
         elif canonical == "resume":
             self._handle_resume_command(cmd_original)
-        elif canonical == "provider":
+        elif cmd_lower == "/provider":
             self._show_model_and_providers()
-        elif canonical == "prompt":
+        elif cmd_lower.startswith("/prompt"):
             # Use original case so prompt text isn't lowercased
             self._handle_prompt_command(cmd_original)
-        elif canonical == "personality":
+        elif cmd_lower.startswith("/personality"):
             # Use original case (handler lowercases the personality name itself)
             self._handle_personality_command(cmd_original)
-        elif canonical == "plan":
+        elif cmd_lower == "/plan" or cmd_lower.startswith("/plan "):
             self._handle_plan_command(cmd_original)
-        elif canonical == "retry":
+        elif cmd_lower == "/retry":
             retry_msg = self.retry_last()
             if retry_msg and hasattr(self, '_pending_input'):
                 # Re-queue the message so process_loop sends it to the agent
                 self._pending_input.put(retry_msg)
-        elif canonical == "undo":
+        elif cmd_lower == "/undo":
             self.undo_last()
-        elif canonical == "save":
+        elif cmd_lower == "/save":
             self.save_conversation()
-        elif canonical == "cron":
+        elif cmd_lower.startswith("/cron"):
             self._handle_cron_command(cmd_original)
-        elif canonical == "skills":
+        elif cmd_lower.startswith("/skills"):
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)
-        elif canonical == "platforms":
+        elif cmd_lower == "/platforms" or cmd_lower == "/gateway":
             self._show_gateway_status()
-        elif canonical == "statusbar":
-            self._status_bar_visible = not self._status_bar_visible
-            state = "visible" if self._status_bar_visible else "hidden"
-            self.console.print(f"  Status bar {state}")
-        elif canonical == "verbose":
+        elif cmd_lower == "/verbose":
             self._toggle_verbose()
-        elif canonical == "reasoning":
+        elif cmd_lower.startswith("/reasoning"):
             self._handle_reasoning_command(cmd_original)
-        elif canonical == "compress":
+        elif cmd_lower == "/compress":
             self._manual_compress()
-        elif canonical == "usage":
+        elif cmd_lower == "/usage":
             self._show_usage()
-        elif canonical == "insights":
+        elif cmd_lower.startswith("/insights"):
             self._show_insights(cmd_original)
-        elif canonical == "paste":
+        elif cmd_lower == "/paste":
             self._handle_paste_command()
-        elif canonical == "reload-mcp":
+        elif cmd_lower == "/reload-mcp":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._reload_mcp()
-        elif canonical == "browser":
+        elif cmd_lower.startswith("/browser"):
             self._handle_browser_command(cmd_original)
-        elif canonical == "plugins":
+        elif cmd_lower == "/plugins":
             try:
                 from hermes_cli.plugins import get_plugin_manager
                 mgr = get_plugin_manager()
@@ -3825,11 +3931,11 @@ class HermesCLI:
                         print(f"  {status} {p['name']}{version}{detail}{error}")
             except Exception as e:
                 print(f"Plugin system error: {e}")
-        elif canonical == "rollback":
+        elif cmd_lower.startswith("/rollback"):
             self._handle_rollback_command(cmd_original)
-        elif canonical == "stop":
+        elif cmd_lower == "/stop":
             self._handle_stop_command()
-        elif canonical == "background":
+        elif cmd_lower.startswith("/background"):
             self._handle_background_command(cmd_original)
         elif canonical == "queue":
             # Extract prompt after "/queue " or "/q "
@@ -3845,7 +3951,7 @@ class HermesCLI:
                     _cprint(f"  Queued: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "skin":
             self._handle_skin_command(cmd_original)
-        elif canonical == "voice":
+        elif cmd_lower.startswith("/voice"):
             self._handle_voice_command(cmd_original)
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
@@ -3874,14 +3980,13 @@ class HermesCLI:
                     else:
                         self.console.print(f"[bold red]Quick command '{base_cmd}' has no command defined[/]")
                 elif qcmd.get("type") == "alias":
-                    target = qcmd.get("target", "").strip()
-                    if target:
-                        target = target if target.startswith("/") else f"/{target}"
-                        user_args = cmd_original[len(base_cmd):].strip()
-                        aliased_command = f"{target} {user_args}".strip()
-                        return self.process_command(aliased_command)
-                    else:
+                    target = str(qcmd.get("target") or "").strip()
+                    if not target:
                         self.console.print(f"[bold red]Quick command '{base_cmd}' has no target defined[/]")
+                    else:
+                        user_args = cmd_original[len(base_cmd):].strip()
+                        aliased_cmd = target if not user_args else f"{target} {user_args}"
+                        return self.process_command(aliased_cmd)
                 else:
                     self.console.print(f"[bold red]Quick command '{base_cmd}' has unsupported type (supported: 'exec', 'alias')[/]")
             # Check for plugin-registered slash commands
@@ -3917,40 +4022,91 @@ class HermesCLI:
                 typed_base = cmd_lower.split()[0]
                 all_known = set(COMMANDS) | set(_skill_commands)
                 matches = [c for c in all_known if c.startswith(typed_base)]
-                if len(matches) > 1:
-                    # Prefer an exact match (typed the full command name)
-                    exact = [c for c in matches if c == typed_base]
-                    if len(exact) == 1:
-                        matches = exact
-                    else:
-                        # Prefer the unique shortest match:
-                        # /qui → /quit (5) wins over /quint-pipeline (15)
-                        min_len = min(len(c) for c in matches)
-                        shortest = [c for c in matches if len(c) == min_len]
-                        if len(shortest) == 1:
-                            matches = shortest
-                if len(matches) == 1:
+                if matches:
+                    shortest_len = min(len(m) for m in matches)
+                    shortest_matches = [m for m in matches if len(m) == shortest_len]
+                else:
+                    shortest_matches = []
+                if len(matches) == 1 or len(shortest_matches) == 1:
                     # Expand the prefix to the full command name, preserving arguments.
                     # Guard against redispatching the same token to avoid infinite
                     # recursion when the expanded name still doesn't hit an exact branch
                     # (e.g. /config with extra args that are not yet handled above).
-                    full_name = matches[0]
+                    full_name = shortest_matches[0] if shortest_matches else matches[0]
                     if full_name == typed_base:
                         # Already an exact token — no expansion possible; fall through
-                        _cprint(f"\033[1;31mUnknown command: {cmd_lower}{_RST}")
-                        _cprint(f"{_DIM}{_GOLD}Type /help for available commands{_RST}")
+                        _cprint(f"[bold red]Unknown command: {cmd_lower}[/]")
+                        _cprint("[dim #B8860B]Type /help for available commands[/]")
                     else:
                         remainder = cmd_original.strip()[len(typed_base):]
                         full_cmd = full_name + remainder
                         return self.process_command(full_cmd)
                 elif len(matches) > 1:
-                    _cprint(f"{_GOLD}Ambiguous command: {cmd_lower}{_RST}")
-                    _cprint(f"{_DIM}Did you mean: {', '.join(sorted(matches))}?{_RST}")
+                    _cprint(f"[bold yellow]Ambiguous command: {cmd_lower}[/]")
+                    _cprint(f"[dim]Did you mean: {', '.join(sorted(matches))}?[/]")
                 else:
-                    _cprint(f"\033[1;31mUnknown command: {cmd_lower}{_RST}")
-                    _cprint(f"{_DIM}{_GOLD}Type /help for available commands{_RST}")
+                    _cprint(f"[bold red]Unknown command: {cmd_lower}[/]")
+                    _cprint("[dim #B8860B]Type /help for available commands[/]")
         
         return True
+
+    def _handle_tools_command(self, cmd: str):
+        """Handle /tools [list|disable|enable] slash commands."""
+        import shlex
+        from argparse import Namespace
+        from hermes_cli.tools_config import tools_disable_enable_command
+
+        try:
+            parts = shlex.split(cmd)
+        except ValueError:
+            parts = cmd.split()
+
+        subcommand = parts[1] if len(parts) > 1 else ""
+        if subcommand not in ("list", "disable", "enable"):
+            self.show_tools()
+            return
+
+        if subcommand == "list":
+            tools_disable_enable_command(
+                Namespace(tools_action="list", platform="cli")
+            )
+            return
+
+        names = parts[2:]
+        if not names:
+            print(f"(._.) Usage: /tools {subcommand} <name> [name ...]")
+            print(f"  Built-in toolset:  /tools {subcommand} web")
+            print(f"  MCP tool:          /tools {subcommand} github:create_issue")
+            return
+
+        verb = "Disable" if subcommand == "disable" else "Enable"
+        label = ", ".join(names)
+        _cprint(f"{_GOLD}{verb} {label}?{_RST}")
+        _cprint(
+            f"{_DIM}This will save to config and reset your session so the "
+            f"change takes effect cleanly.{_RST}"
+        )
+        try:
+            answer = input("  Continue? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            _cprint(f"{_DIM}Cancelled.{_RST}")
+            return
+
+        if answer not in ("y", "yes"):
+            _cprint(f"{_DIM}Cancelled.{_RST}")
+            return
+
+        tools_disable_enable_command(
+            Namespace(tools_action=subcommand, names=names, platform="cli")
+        )
+
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+
+        self.enabled_toolsets = _get_platform_tools(load_config(), "cli")
+        self.new_session()
+        _cprint(f"{_DIM}Session reset. New tool configuration is active.{_RST}")
     
     def _handle_plan_command(self, cmd: str):
         """Handle /plan [request] — load the bundled plan skill."""
@@ -3958,13 +4114,14 @@ class HermesCLI:
         user_instruction = parts[1].strip() if len(parts) > 1 else ""
 
         plan_path = build_plan_path(user_instruction)
+        plan_path_text = plan_path.as_posix()
         msg = build_skill_invocation_message(
             "/plan",
             user_instruction,
             task_id=self.session_id,
             runtime_note=(
                 "Save the markdown plan with write_file to this exact relative path "
-                f"inside the active workspace/backend cwd: {plan_path}"
+                f"inside the active workspace/backend cwd: {plan_path_text}"
             ),
         )
 
@@ -3972,7 +4129,7 @@ class HermesCLI:
             self.console.print("[bold red]Failed to load the bundled /plan skill[/]")
             return
 
-        _cprint(f"  📝 Plan mode queued via skill. Markdown plan target: {plan_path}")
+        _cprint(f"  📝 Plan mode queued via skill. Markdown plan target: {plan_path_text}")
         if hasattr(self, '_pending_input'):
             self._pending_input.put(msg)
         else:
@@ -4006,18 +4163,14 @@ class HermesCLI:
         _cprint(f"  Task ID: {task_id}")
         _cprint("  You can continue chatting — results will appear when done.\n")
 
-        turn_route = self._resolve_turn_agent_config(prompt)
-
         def run_background():
             try:
                 bg_agent = AIAgent(
-                    model=turn_route["model"],
-                    api_key=turn_route["runtime"].get("api_key"),
-                    base_url=turn_route["runtime"].get("base_url"),
-                    provider=turn_route["runtime"].get("provider"),
-                    api_mode=turn_route["runtime"].get("api_mode"),
-                    acp_command=turn_route["runtime"].get("command"),
-                    acp_args=turn_route["runtime"].get("args"),
+                    model=self.model,
+                    api_key=self.api_key,
+                    base_url=self.base_url,
+                    provider=self.provider,
+                    api_mode=self.api_mode,
                     max_iterations=self.max_turns,
                     enabled_toolsets=self.enabled_toolsets,
                     quiet_mode=True,
@@ -4118,44 +4271,261 @@ class HermesCLI:
         thread.start()
 
     @staticmethod
-    def _try_launch_chrome_debug(port: int, system: str) -> bool:
-        """Try to launch Chrome/Chromium with remote debugging enabled.
+    def _normalize_cdp_browser_name(raw: str) -> str:
+        """Normalize browser aliases used by /browser connect."""
+        normalized = (raw or "").strip().lower()
+        alias_map = {
+            "": "auto",
+            "auto": "auto",
+            "chrome": "chrome",
+            "google-chrome": "chrome",
+            "edge": "edge",
+            "msedge": "edge",
+            "microsoft-edge": "edge",
+            "brave": "brave",
+            "brave-browser": "brave",
+            "chromium": "chromium",
+            "comet": "comet",
+        }
+        return alias_map.get(normalized, normalized)
 
-        Returns True if a launch command was executed (doesn't guarantee success).
-        """
+    @staticmethod
+    def _default_cdp_port_for_browser(browser: str) -> int:
+        """Return deterministic per-browser localhost CDP defaults."""
+        mapping = {
+            "auto": 9222,
+            "chrome": 9222,
+            "edge": 9223,
+            "brave": 9224,
+            "chromium": 9225,
+            "comet": 9226,
+        }
+        return mapping.get(HermesCLI._normalize_cdp_browser_name(browser), 9222)
+
+    @staticmethod
+    def _is_likely_cdp_endpoint(raw: str) -> bool:
+        token = (raw or "").strip()
+        if not token:
+            return False
+        if token.startswith(("ws://", "wss://", "http://", "https://")):
+            return True
+        if token.isdigit():
+            return True
+        if " " in token:
+            return False
+        host, sep, port = token.rpartition(":")
+        return bool(sep and host and port.isdigit())
+
+    @staticmethod
+    def _resolve_browser_connect_target(raw_arg: str, default_port: int, default_browser: str, default_cdp_url: str):
+        """Resolve /browser connect arg into (cdp_url, browser_choice, error)."""
+        arg = (raw_arg or "").strip()
+        browser_choice = HermesCLI._normalize_cdp_browser_name(default_browser)
+        if not arg:
+            cdp_url = (default_cdp_url or "").strip() or f"ws://localhost:{default_port}"
+            return cdp_url, browser_choice, ""
+
+        if HermesCLI._is_likely_cdp_endpoint(arg):
+            endpoint = arg
+            if endpoint.isdigit():
+                endpoint = f"ws://localhost:{endpoint}"
+            elif "://" not in endpoint:
+                endpoint = f"ws://{endpoint}"
+            return endpoint, browser_choice, ""
+
+        candidate = HermesCLI._normalize_cdp_browser_name(arg)
+        supported = {"auto", "chrome", "edge", "brave", "chromium", "comet"}
+        if candidate in supported:
+            cdp_port = HermesCLI._default_cdp_port_for_browser(candidate)
+            return f"ws://localhost:{cdp_port}", candidate, ""
+
+        err = (
+            f"Unknown browser target '{arg}'. "
+            "Use one of: auto, chrome, edge, brave, chromium, comet, or pass a CDP endpoint "
+            "(example: ws://localhost:9222)."
+        )
+        return "", "", err
+
+    @staticmethod
+    def _extract_cdp_port(cdp_url: str, fallback_port: int) -> int:
+        """Extract TCP port from a CDP endpoint string."""
+        try:
+            parsed = urlparse((cdp_url or "").strip())
+            if parsed.port:
+                return int(parsed.port)
+        except Exception:
+            pass
+        try:
+            return int(str(cdp_url).rsplit(":", 1)[-1].split("/")[0])
+        except (ValueError, IndexError):
+            return fallback_port
+
+    @staticmethod
+    def _manual_browser_launch_command(system: str, browser: str, port: int, profile_dir: str) -> str:
+        """Return a one-line manual browser launch command for the current OS."""
+        choice = HermesCLI._normalize_cdp_browser_name(browser)
+        if system == "Darwin":
+            app_name_map = {
+                "chrome": "Google Chrome",
+                "edge": "Microsoft Edge",
+                "brave": "Brave Browser",
+                "chromium": "Chromium",
+                "comet": "Comet",
+            }
+            app_name = app_name_map.get(choice, "Google Chrome")
+            return (
+                f'open -a "{app_name}" --args '
+                f"--remote-debugging-port={port} --user-data-dir=\"{profile_dir}\""
+            )
+        if system == "Windows":
+            binary_map = {
+                "edge": "msedge.exe",
+                "brave": "brave.exe",
+                "chromium": "chrome.exe",
+                "comet": "comet.exe",
+            }
+            binary = binary_map.get(choice, "chrome.exe")
+            return (
+                f'"{binary}" --remote-debugging-port={port} '
+                f'--user-data-dir="{profile_dir}"'
+            )
+        binary_map = {
+            "edge": "microsoft-edge",
+            "brave": "brave-browser",
+            "chromium": "chromium",
+            "comet": "comet",
+        }
+        binary = binary_map.get(choice, "google-chrome")
+        return (
+            f"{binary} --remote-debugging-port={port} "
+            f"--user-data-dir=\"{profile_dir}\""
+        )
+
+    @staticmethod
+    def _try_launch_chrome_debug(
+        port: int,
+        system: str,
+        browser: str = "auto",
+        profile_dir: Optional[str] = None,
+    ) -> bool:
+        """Try to launch a selected Chromium-family browser with remote debugging."""
         import shutil
         import subprocess as _sp
+        import tempfile
 
-        candidates = []
+        choice = HermesCLI._normalize_cdp_browser_name(browser)
+        search_order = ("chrome", "edge", "brave", "chromium", "comet") if choice == "auto" else (choice,)
+
+        candidates: List[str] = []
         if system == "Darwin":
-            # macOS: try common app bundle locations
-            for app in (
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                "/Applications/Chromium.app/Contents/MacOS/Chromium",
-                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-            ):
-                if os.path.isfile(app):
-                    candidates.append(app)
+            app_map = {
+                "chrome": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+                "edge": ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"],
+                "brave": ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"],
+                "chromium": ["/Applications/Chromium.app/Contents/MacOS/Chromium"],
+                "comet": ["/Applications/Comet.app/Contents/MacOS/Comet"],
+            }
+            for key in search_order:
+                for app in app_map.get(key, []):
+                    if os.path.isfile(app):
+                        candidates.append(app)
+        elif system == "Windows":
+            pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+            pfx86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+            local = os.environ.get("LOCALAPPDATA", "")
+            path_map = {
+                "chrome": [
+                    os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+                    os.path.join(pfx86, "Google", "Chrome", "Application", "chrome.exe"),
+                    os.path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+                ],
+                "edge": [
+                    os.path.join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+                    os.path.join(pfx86, "Microsoft", "Edge", "Application", "msedge.exe"),
+                    os.path.join(local, "Microsoft", "Edge", "Application", "msedge.exe"),
+                ],
+                "brave": [
+                    os.path.join(pf, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                    os.path.join(pfx86, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                    os.path.join(local, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                ],
+                "chromium": [
+                    os.path.join(pf, "Chromium", "Application", "chrome.exe"),
+                    os.path.join(pfx86, "Chromium", "Application", "chrome.exe"),
+                    os.path.join(local, "Chromium", "Application", "chrome.exe"),
+                ],
+                "comet": [
+                    os.path.join(pf, "Comet", "Application", "comet.exe"),
+                    os.path.join(pfx86, "Comet", "Application", "comet.exe"),
+                    os.path.join(local, "Comet", "Application", "comet.exe"),
+                    os.path.join(local, "Perplexity", "Comet", "Application", "comet.exe"),
+                ],
+            }
+            bin_map = {
+                "chrome": ("chrome.exe", "chrome"),
+                "edge": ("msedge.exe", "msedge"),
+                "brave": ("brave.exe", "brave"),
+                "chromium": ("chromium.exe", "chromium"),
+                "comet": ("comet.exe", "comet"),
+            }
+            for key in search_order:
+                for app in path_map.get(key, []):
+                    if app and os.path.isfile(app):
+                        candidates.append(app)
+                for binary in bin_map.get(key, ()):
+                    path = shutil.which(binary)
+                    if path:
+                        candidates.append(path)
         else:
-            # Linux: try common binary names
-            for name in ("google-chrome", "google-chrome-stable", "chromium-browser",
-                         "chromium", "brave-browser", "microsoft-edge"):
-                path = shutil.which(name)
-                if path:
-                    candidates.append(path)
+            bin_map = {
+                "chrome": ("google-chrome", "google-chrome-stable"),
+                "edge": ("microsoft-edge",),
+                "brave": ("brave-browser",),
+                "chromium": ("chromium-browser", "chromium"),
+                "comet": ("comet",),
+            }
+            for key in search_order:
+                for name in bin_map.get(key, ()):
+                    path = shutil.which(name)
+                    if path:
+                        candidates.append(path)
 
-        if not candidates:
+        deduped_candidates: List[str] = []
+        seen = set()
+        for candidate in candidates:
+            normalized = os.path.normcase(os.path.normpath(candidate))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped_candidates.append(candidate)
+
+        if not deduped_candidates:
             return False
 
-        chrome = candidates[0]
+        executable = deduped_candidates[0]
+        profile = (profile_dir or "").strip()
+        if not profile:
+            profile_suffix = choice if choice != "auto" else "chrome"
+            profile = os.path.join(tempfile.gettempdir(), f"{profile_suffix}-cdp-hermes")
         try:
-            _sp.Popen(
-                [chrome, f"--remote-debugging-port={port}"],
-                stdout=_sp.DEVNULL,
-                stderr=_sp.DEVNULL,
-                start_new_session=True,  # detach from terminal
-            )
+            launch_cmd = [
+                executable,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={profile}",
+            ]
+            popen_kwargs = {
+                "stdout": _sp.DEVNULL,
+                "stderr": _sp.DEVNULL,
+            }
+            if system == "Windows":
+                flags = 0
+                flags |= getattr(_sp, "DETACHED_PROCESS", 0x00000008)
+                flags |= getattr(_sp, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                popen_kwargs["creationflags"] = flags
+            else:
+                popen_kwargs["start_new_session"] = True
+
+            _sp.Popen(launch_cmd, **popen_kwargs)
             return True
         except Exception:
             return False
@@ -4163,17 +4533,48 @@ class HermesCLI:
     def _handle_browser_command(self, cmd: str):
         """Handle /browser connect|disconnect|status — manage live Chrome CDP connection."""
         import platform as _plat
+        try:
+            from tools.browser_tool import (
+                read_shared_cdp_state as _read_shared_cdp_state,
+                persist_shared_cdp_state as _persist_shared_cdp_state,
+                clear_shared_cdp_state as _clear_shared_cdp_state,
+            )
+        except Exception:
+            _read_shared_cdp_state = lambda: {}
+            _persist_shared_cdp_state = lambda cdp_url, browser="": False
+            _clear_shared_cdp_state = lambda: None
 
         parts = cmd.strip().split(None, 1)
         sub = parts[1].lower().strip() if len(parts) > 1 else "status"
 
-        _DEFAULT_CDP = "http://localhost:9222"
-        current = os.environ.get("BROWSER_CDP_URL", "").strip()
+        default_browser = self._normalize_cdp_browser_name(os.environ.get("BROWSER_CDP_BROWSER", "auto"))
+        try:
+            default_port = int(str(os.environ.get("BROWSER_CDP_PORT", "9222")).strip())
+        except ValueError:
+            default_port = 9222
+        shared_state = _read_shared_cdp_state()
+        shared_cdp = str(shared_state.get("cdp_url") or "").strip()
+        current_env = os.environ.get("BROWSER_CDP_URL", "").strip()
+        _DEFAULT_CDP = current_env or shared_cdp or f"ws://localhost:{default_port}"
+        current = current_env or shared_cdp
 
         if sub.startswith("connect"):
-            # Optionally accept a custom CDP URL: /browser connect ws://host:port
-            connect_parts = cmd.strip().split(None, 2)  # ["/browser", "connect", "ws://..."]
-            cdp_url = connect_parts[2].strip() if len(connect_parts) > 2 else _DEFAULT_CDP
+            # /browser connect [target]
+            # target can be a browser alias (chrome/edge/brave/chromium/comet)
+            # or a CDP endpoint (ws://host:port, host:port, or just a port).
+            connect_parts = cmd.strip().split(None, 2)
+            connect_arg = connect_parts[2].strip() if len(connect_parts) > 2 else ""
+            cdp_url, browser_choice, resolve_err = self._resolve_browser_connect_target(
+                raw_arg=connect_arg,
+                default_port=default_port,
+                default_browser=default_browser,
+                default_cdp_url=_DEFAULT_CDP,
+            )
+            if resolve_err:
+                print()
+                print(f"⚠ {resolve_err}")
+                print()
+                return
 
             # Clear any existing browser sessions so the next tool call uses the new backend
             try:
@@ -4185,13 +4586,9 @@ class HermesCLI:
             print()
 
             # Extract port for connectivity checks
-            _port = 9222
-            try:
-                _port = int(cdp_url.rsplit(":", 1)[-1].split("/")[0])
-            except (ValueError, IndexError):
-                pass
+            _port = self._extract_cdp_port(cdp_url, default_port)
 
-            # Check if Chrome is already listening on the debug port
+            # Check if a CDP listener is already reachable on the target port.
             import socket
             _already_open = False
             try:
@@ -4204,11 +4601,23 @@ class HermesCLI:
                 pass
 
             if _already_open:
-                print(f"   ✓ Chrome is already listening on port {_port}")
-            elif cdp_url == _DEFAULT_CDP:
-                # Try to auto-launch Chrome with remote debugging
-                print("   Chrome isn't running with remote debugging — attempting to launch...")
-                _launched = self._try_launch_chrome_debug(_port, _plat.system())
+                print(f"   ✓ CDP endpoint is already listening on port {_port}")
+            else:
+                _parsed = urlparse(cdp_url)
+                _host = (_parsed.hostname or "").strip().lower()
+                _is_localhost = _host in ("localhost", "127.0.0.1")
+                if _is_localhost:
+                    chosen_label = browser_choice if browser_choice != "auto" else "browser"
+                    print(f"   {chosen_label} isn't running with remote debugging — attempting to launch...")
+                    _launched = self._try_launch_chrome_debug(
+                        _port,
+                        _plat.system(),
+                        browser=browser_choice,
+                        profile_dir=os.environ.get("BROWSER_CDP_USER_DATA_DIR", "").strip() or None,
+                    )
+                else:
+                    _launched = False
+
                 if _launched:
                     # Wait for the port to come up
                     import time as _time
@@ -4223,28 +4632,51 @@ class HermesCLI:
                         except (OSError, socket.timeout):
                             _time.sleep(0.5)
                     if _already_open:
-                        print(f"   ✓ Chrome launched and listening on port {_port}")
+                        print(f"   ✓ Browser launched and listening on port {_port}")
                     else:
-                        print(f"   ⚠ Chrome launched but port {_port} isn't responding yet")
-                        print("     You may need to close existing Chrome windows first and retry")
-                else:
-                    print("   ⚠ Could not auto-launch Chrome")
-                    # Show manual instructions as fallback
+                        print(f"   ⚠ Browser launched but port {_port} isn't responding yet")
+                        print("     You may need to close existing browser windows first and retry")
+                elif _is_localhost:
+                    print(f"   ⚠ Could not auto-launch selected browser")
                     sys_name = _plat.system()
-                    if sys_name == "Darwin":
-                        chrome_cmd = 'open -a "Google Chrome" --args --remote-debugging-port=9222'
-                    elif sys_name == "Windows":
-                        chrome_cmd = 'chrome.exe --remote-debugging-port=9222'
-                    else:
-                        chrome_cmd = "google-chrome --remote-debugging-port=9222"
-                    print(f"     Launch Chrome manually: {chrome_cmd}")
-            else:
-                print(f"   ⚠ Port {_port} is not reachable at {cdp_url}")
+                    profile_dir = (
+                        os.environ.get("BROWSER_CDP_USER_DATA_DIR", "").strip()
+                        or os.path.join(
+                            tempfile.gettempdir(),
+                            f"{(browser_choice if browser_choice != 'auto' else 'browser')}-cdp-hermes",
+                        )
+                    )
+                    chrome_cmd = self._manual_browser_launch_command(
+                        system=sys_name,
+                        browser=browser_choice,
+                        port=_port,
+                        profile_dir=profile_dir,
+                    )
+                    print(f"     Launch manually: {chrome_cmd}")
+                else:
+                    print(f"   ⚠ Port {_port} is not reachable at {cdp_url}")
+
+            # Do not mark connected when localhost CDP is unreachable.
+            _parsed = urlparse(cdp_url)
+            _host = (_parsed.hostname or "").strip().lower()
+            _is_local_cdp = _host in ("localhost", "127.0.0.1")
+            if _is_local_cdp and not _already_open:
+                print()
+                print("⚠ Browser not connected (CDP endpoint is unreachable).")
+                print(f"   Expected endpoint: {cdp_url}")
+                print("   Start your selected browser with remote debugging, then run /browser connect again.")
+                print()
+                return
 
             os.environ["BROWSER_CDP_URL"] = cdp_url
+            os.environ["BROWSER_CDP_BROWSER"] = browser_choice
+            persisted = _persist_shared_cdp_state(cdp_url, browser_choice)
             print()
             print("🌐 Browser connected to live Chrome via CDP")
             print(f"   Endpoint: {cdp_url}")
+            print(f"   Target: {browser_choice}")
+            if not persisted:
+                print("   ⚠ Could not persist shared runtime CDP state (sidecar may not see this connection).")
             print()
 
             # Inject context message so the model knows
@@ -4262,6 +4694,7 @@ class HermesCLI:
         elif sub == "disconnect":
             if current:
                 os.environ.pop("BROWSER_CDP_URL", None)
+                _clear_shared_cdp_state()
                 try:
                     from tools.browser_tool import cleanup_all_browsers
                     cleanup_all_browsers()
@@ -4287,12 +4720,10 @@ class HermesCLI:
             if current:
                 print("🌐 Browser: connected to live Chrome via CDP")
                 print(f"   Endpoint: {current}")
+                if not current_env and shared_cdp:
+                    print("   Source: shared runtime state")
 
-                _port = 9222
-                try:
-                    _port = int(current.rsplit(":", 1)[-1].split("/")[0])
-                except (ValueError, IndexError):
-                    pass
+                _port = self._extract_cdp_port(current, default_port)
                 try:
                     import socket
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -4302,12 +4733,15 @@ class HermesCLI:
                     print("   Status: ✓ reachable")
                 except (OSError, Exception):
                     print("   Status: ⚠ not reachable (Chrome may not be running)")
+                print(f"   Preferred target: {default_browser}")
+                print(f"   Default port: {default_port}")
             elif os.environ.get("BROWSERBASE_API_KEY"):
                 print("🌐 Browser: Browserbase (cloud)")
             else:
                 print("🌐 Browser: local headless Chromium (agent-browser)")
             print()
-            print("   /browser connect      — connect to your live Chrome")
+            print("   /browser connect [target] — connect to live CDP")
+            print("      targets: auto, chrome, edge, brave, chromium, comet, ws://host:port, port")
             print("   /browser disconnect   — revert to default")
             print()
 
@@ -4315,7 +4749,7 @@ class HermesCLI:
             print()
             print("Usage: /browser connect|disconnect|status")
             print()
-            print("   connect      Connect browser tools to your live Chrome session")
+            print("   connect      Connect browser tools to a selected browser or CDP endpoint")
             print("   disconnect   Revert to default browser backend")
             print("   status       Show current browser mode")
             print()
@@ -4503,10 +4937,6 @@ class HermesCLI:
             return
 
         agent = self.agent
-        input_tokens = getattr(agent, "session_input_tokens", 0) or 0
-        output_tokens = getattr(agent, "session_output_tokens", 0) or 0
-        cache_read_tokens = getattr(agent, "session_cache_read_tokens", 0) or 0
-        cache_write_tokens = getattr(agent, "session_cache_write_tokens", 0) or 0
         prompt = agent.session_prompt_tokens
         completion = agent.session_completion_tokens
         total = agent.session_total_tokens
@@ -4524,45 +4954,39 @@ class HermesCLI:
         compressions = compressor.compression_count
 
         msg_count = len(self.conversation_history)
-        cost_result = estimate_usage_cost(
-            agent.model,
-            CanonicalUsage(
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
-            ),
-            provider=getattr(agent, "provider", None),
-            base_url=getattr(agent, "base_url", None),
-        )
+        provider = getattr(agent, "provider", None)
+        base_url = getattr(agent, "base_url", None)
+        cost = estimate_cost_usd(agent.model, prompt, completion, provider=provider, base_url=base_url)
+        prompt_cost = estimate_cost_usd(agent.model, prompt, 0, provider=provider, base_url=base_url)
+        completion_cost = estimate_cost_usd(agent.model, 0, completion, provider=provider, base_url=base_url)
+        pricing_known = has_known_pricing(agent.model, provider=provider, base_url=base_url)
+        cost_status = getattr(agent, "session_cost_status", "estimated" if pricing_known else "unknown")
+        cost_source = getattr(agent, "session_cost_source", "catalog" if pricing_known else "none")
         elapsed = format_duration_compact((datetime.now() - self.session_start).total_seconds())
 
         print("  📊 Session Token Usage")
         print(f"  {'─' * 40}")
         print(f"  Model:                     {agent.model}")
-        print(f"  Input tokens:              {input_tokens:>10,}")
-        print(f"  Cache read tokens:         {cache_read_tokens:>10,}")
-        print(f"  Cache write tokens:        {cache_write_tokens:>10,}")
-        print(f"  Output tokens:             {output_tokens:>10,}")
-        print(f"  Prompt tokens (total):     {prompt:>10,}")
-        print(f"  Completion tokens:         {completion:>10,}")
+        print(f"  Prompt tokens (input):     {prompt:>10,}")
+        print(f"  Completion tokens (output): {completion:>9,}")
         print(f"  Total tokens:              {total:>10,}")
         print(f"  API calls:                 {calls:>10,}")
         print(f"  Session duration:          {elapsed:>10}")
-        print(f"  Cost status:              {cost_result.status:>10}")
-        print(f"  Cost source:              {cost_result.source:>10}")
-        if cost_result.amount_usd is not None:
-            prefix = "~" if cost_result.status == "estimated" else ""
-            print(f"  Total cost:              {prefix}${float(cost_result.amount_usd):>10.4f}")
-        elif cost_result.status == "included":
-            print(f"  Total cost:              {'included':>10}")
+        print(f"  Cost status:               {cost_status:>10}")
+        print(f"  Cost source:               {cost_source:>10}")
+        if pricing_known:
+            print(f"  Input cost:              ${prompt_cost:>10.4f}")
+            print(f"  Output cost:             ${completion_cost:>10.4f}")
+            print(f"  Total cost:              ${cost:>10.4f}")
         else:
+            print(f"  Input cost:              {'n/a':>10}")
+            print(f"  Output cost:             {'n/a':>10}")
             print(f"  Total cost:              {'n/a':>10}")
         print(f"  {'─' * 40}")
         print(f"  Current context:  {last_prompt:,} / {ctx_len:,} ({pct:.0f}%)")
         print(f"  Messages:         {msg_count}")
         print(f"  Compressions:     {compressions}")
-        if cost_result.status == "unknown":
+        if not pricing_known:
             print(f"  Note:             Pricing unknown for {agent.model}")
 
         if self.verbose:
@@ -4768,24 +5192,35 @@ class HermesCLI:
     # ====================================================================
 
     def _on_tool_progress(self, function_name: str, preview: str, function_args: dict):
-        """Called when a tool starts executing.
+        """Called when a tool starts/completes. Updates TUI status and voice cue."""
+        if function_name == "_tool_result":
+            tool_name = preview or function_args.get("tool", "tool")
+            labels = self._active_tool_status.get(tool_name)
+            if labels:
+                labels.pop(0)
+                self._active_tool_count = max(0, self._active_tool_count - 1)
+                if not labels:
+                    self._active_tool_status.pop(tool_name, None)
+            duration = function_args.get("duration_seconds")
+            if isinstance(duration, (int, float)):
+                self._last_tool_status = f"completed {tool_name} in {duration:.1f}s"
+            else:
+                self._last_tool_status = f"completed {tool_name}"
+            self._refresh_tool_spinner_text()
+            return
 
-        Updates the TUI spinner widget so the user can see what the agent
-        is doing during tool execution (fills the gap between thinking
-        spinner and next response).  Also plays audio cue in voice mode.
-        """
-        if not function_name.startswith("_"):
-            from agent.display import get_tool_emoji
-            emoji = get_tool_emoji(function_name)
-            label = preview or function_name
-            if len(label) > 50:
-                label = label[:47] + "..."
-            self._spinner_text = f"{emoji} {label}"
-            self._invalidate()
+        # Skip internal/thinking tools for active-tool tracking
+        if function_name.startswith("_"):
+            return
+
+        label = preview or function_name
+        labels = self._active_tool_status.setdefault(function_name, [])
+        labels.append(f"{function_name}({label})" if preview else function_name)
+        self._active_tool_count += 1
+        self._last_tool_status = ""
+        self._refresh_tool_spinner_text()
 
         if not self._voice_mode:
-            return
-        if function_name.startswith("_"):
             return
         try:
             from tools.voice_mode import play_beep
@@ -4809,15 +5244,40 @@ class HermesCLI:
 
         reqs = check_voice_requirements()
         if not reqs["audio_available"]:
+            uv_path = shutil.which("uv")
+            install_uv = (
+                f"{uv_path} pip install --python \"{sys.executable}\" sounddevice numpy"
+                if uv_path
+                else None
+            )
+            install_pip = f"{sys.executable} -m pip install sounddevice numpy"
             raise RuntimeError(
                 "Voice mode requires sounddevice and numpy.\n"
-                "Install with: pip install sounddevice numpy\n"
-                "Or: pip install hermes-agent[voice]"
+                "Run: /voice install\n"
+                + (f"Manual: {install_uv}\n" if install_uv else "")
+                + f"Fallback: {install_pip}"
             )
         if not reqs.get("stt_available", reqs.get("stt_key_set")):
+            uv_path = shutil.which("uv")
+            install_uv = (
+                f"{uv_path} pip install --python \"{sys.executable}\" faster-whisper"
+                if uv_path
+                else None
+            )
+            install_pip = f"{sys.executable} -m pip install faster-whisper"
             raise RuntimeError(
                 "Voice mode requires an STT provider for transcription.\n"
-                "Option 1: pip install faster-whisper  (free, local)\n"
+                + (
+                    f"Option 1: {install_uv}  (free, local)\n"
+                    if install_uv
+                    else f"Option 1: {install_pip}  (free, local)\n"
+                )
+                + (
+                    f"Fallback: {install_pip}\n"
+                    if install_uv
+                    else ""
+                )
+                +
                 "Option 2: Set GROQ_API_KEY (free tier)\n"
                 "Option 3: Set VOICE_TOOLS_OPENAI_KEY (paid)"
             )
@@ -5030,7 +5490,7 @@ class HermesCLI:
             self._voice_tts_done.set()
 
     def _handle_voice_command(self, command: str):
-        """Handle /voice [on|off|tts|status] command."""
+        """Handle /voice [on|off|tts|status|install] command."""
         parts = command.strip().split(maxsplit=1)
         subcommand = parts[1].lower().strip() if len(parts) > 1 else ""
 
@@ -5042,6 +5502,8 @@ class HermesCLI:
             self._toggle_voice_tts()
         elif subcommand == "status":
             self._show_voice_status()
+        elif subcommand == "install":
+            self._install_voice_dependencies()
         elif subcommand == "":
             # Toggle
             if self._voice_mode:
@@ -5050,7 +5512,7 @@ class HermesCLI:
                 self._enable_voice_mode()
         else:
             _cprint(f"Unknown voice subcommand: {subcommand}")
-            _cprint("Usage: /voice [on|off|tts|status]")
+            _cprint("Usage: /voice [on|off|tts|status|install]")
 
     def _enable_voice_mode(self):
         """Enable voice mode after checking requirements."""
@@ -5074,8 +5536,15 @@ class HermesCLI:
             for line in reqs["details"].split("\n"):
                 _cprint(f"  {_DIM}{line}{_RST}")
             if reqs["missing_packages"]:
-                _cprint(f"\n  {_BOLD}Install: pip install {' '.join(reqs['missing_packages'])}{_RST}")
-                _cprint(f"  {_DIM}Or: pip install hermes-agent[voice]{_RST}")
+                missing = " ".join(reqs["missing_packages"])
+                uv_path = shutil.which("uv")
+                _cprint(f"\n  {_BOLD}Install: /voice install{_RST}")
+                if uv_path:
+                    _cprint(
+                        f"  {_DIM}{uv_path} pip install --python "
+                        f"\"{sys.executable}\" {missing}{_RST}"
+                    )
+                _cprint(f"  {_DIM}{sys.executable} -m pip install {missing}{_RST}")
             return
 
         with self._voice_lock:
@@ -5107,6 +5576,78 @@ class HermesCLI:
         _cprint(f"  {_DIM}{_ptt_display} to start/stop recording{_RST}")
         _cprint(f"  {_DIM}/voice tts  to toggle speech output{_RST}")
         _cprint(f"  {_DIM}/voice off  to disable voice mode{_RST}")
+
+    def _install_voice_dependencies(self):
+        """Install voice-mode dependencies into the active Hermes runtime."""
+        import subprocess as _sp
+
+        py_exe = sys.executable
+        uv_path = shutil.which("uv")
+
+        _cprint(f"\n{_GOLD}Installing voice dependencies...{_RST}")
+        _cprint(f"  {_DIM}Runtime: {py_exe}{_RST}")
+
+        install_attempts = []
+        if uv_path:
+            install_attempts.append(
+                [uv_path, "pip", "install", "--python", py_exe, "sounddevice", "numpy"]
+            )
+        install_attempts.append([py_exe, "-m", "pip", "install", "sounddevice", "numpy"])
+
+        def _run_cmd(parts: list[str], timeout: int = 300) -> tuple[bool, str]:
+            try:
+                proc = _sp.run(
+                    parts,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except Exception as e:
+                return False, str(e)
+
+            combined = "\n".join(
+                p.strip() for p in (proc.stdout or "", proc.stderr or "") if p and p.strip()
+            )
+            return proc.returncode == 0, combined
+
+        last_error = ""
+        pip_missing = False
+        for cmd in install_attempts:
+            ok, output = _run_cmd(cmd)
+            if ok:
+                _cprint(f"{_GOLD}Voice dependencies installed successfully.{_RST}")
+                self._enable_voice_mode()
+                return
+
+            last_error = output or "Install command failed."
+            lowered = last_error.lower()
+            if "no module named pip" in lowered or "pip.__main__" in lowered:
+                pip_missing = True
+
+        if pip_missing:
+            _cprint(f"{_DIM}pip missing in runtime; attempting ensurepip...{_RST}")
+            ok, output = _run_cmd([py_exe, "-m", "ensurepip", "--upgrade"])
+            if ok:
+                ok2, output2 = _run_cmd(
+                    [py_exe, "-m", "pip", "install", "sounddevice", "numpy"]
+                )
+                if ok2:
+                    _cprint(f"{_GOLD}Voice dependencies installed successfully.{_RST}")
+                    self._enable_voice_mode()
+                    return
+                last_error = output2 or output or "Install failed after ensurepip."
+            else:
+                last_error = output or "ensurepip failed."
+
+        _cprint(f"{_GOLD}Voice dependency install failed.{_RST}")
+        if last_error:
+            for line in str(last_error).splitlines()[-6:]:
+                _cprint(f"  {_DIM}{line}{_RST}")
+        _cprint(f"\n  {_BOLD}Manual fallback:{_RST}")
+        if uv_path:
+            _cprint(f"  {_DIM}{uv_path} pip install --python \"{py_exe}\" sounddevice numpy{_RST}")
+        _cprint(f"  {_DIM}{py_exe} -m pip install sounddevice numpy{_RST}")
 
     def _disable_voice_mode(self):
         """Disable voice mode, cancel any active recording, and stop TTS."""
@@ -5506,16 +6047,8 @@ class HermesCLI:
         if not self._ensure_runtime_credentials():
             return None
 
-        turn_route = self._resolve_turn_agent_config(message)
-        if turn_route["signature"] != self._active_agent_route_signature:
-            self.agent = None
-
         # Initialize agent if needed
-        if not self._init_agent(
-            model_override=turn_route["model"],
-            runtime_override=turn_route["runtime"],
-            route_label=turn_route["label"],
-        ):
+        if not self._init_agent():
             return None
         
         # Pre-process images through the vision tool (Gemini Flash) so the
@@ -5562,6 +6095,7 @@ class HermesCLI:
         print(flush=True)
         
         try:
+            self._reset_tool_status()
             # Run the conversation with interrupt monitoring
             result = None
 
@@ -5571,7 +6105,6 @@ class HermesCLI:
             # across intermediate turn boundaries (tool-calling loops) — only
             # reset at the start of each user turn.
             self._reasoning_shown_this_turn = False
-
             # --- Streaming TTS setup ---
             # When ElevenLabs is the TTS provider and sounddevice is available,
             # we stream audio sentence-by-sentence as the agent generates tokens
@@ -5703,12 +6236,7 @@ class HermesCLI:
                                 pass
                             break
                     except queue.Empty:
-                        # Force prompt_toolkit to flush any pending stdout
-                        # output from the agent thread.  Without this, the
-                        # StdoutProxy buffer only flushes on renderer passes
-                        # triggered by input events — on macOS this causes
-                        # the CLI to appear frozen until the user types. (#1624)
-                        self._invalidate(min_interval=0.15)
+                        pass  # Queue empty or timeout, continue waiting
                 else:
                     # Fallback for non-interactive mode (e.g., single-query)
                     agent_thread.join(0.1)
@@ -5727,7 +6255,6 @@ class HermesCLI:
 
             # Flush any remaining streamed text and close the box
             self._flush_stream()
-
             # Signal end-of-text to TTS consumer and wait for it to finish
             if use_streaming_tts and text_queue is not None:
                 text_queue.put(None)  # sentinel
@@ -5748,25 +6275,13 @@ class HermesCLI:
             # Get the final response
             response = result.get("final_response", "") if result else ""
 
-            # Auto-generate session title after first exchange (non-blocking)
-            if response and result and not result.get("failed") and not result.get("partial"):
-                try:
-                    from agent.title_generator import maybe_auto_title
-                    maybe_auto_title(
-                        self._session_db,
-                        self.session_id,
-                        message,
-                        response,
-                        self.conversation_history,
-                    )
-                except Exception:
-                    pass
-
             # Handle failed or partial results (e.g., non-retryable errors, rate limits,
             # truncated output, invalid tool calls). Both "failed" and "partial" with
             # an empty final_response mean the agent couldn't produce a usable answer.
             if result and (result.get("failed") or result.get("partial")) and not response:
-                error_detail = result.get("error", "Unknown error")
+                from hermes_cli.colors import strip_ansi
+
+                error_detail = strip_ansi(result.get("error", "Unknown error"))
                 response = f"Error: {error_detail}"
                 # Stop continuous voice mode on persistent errors (e.g. 429 rate limit)
                 # to avoid an infinite error → record → error loop
@@ -5822,15 +6337,10 @@ class HermesCLI:
                     _resp_text = "#FFF8DC"
 
                 is_error_response = result and (result.get("failed") or result.get("partial"))
-                already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
                 if use_streaming_tts and _streaming_box_opened and not is_error_response:
                     # Text was already printed sentence-by-sentence; just close the box
                     w = shutil.get_terminal_size().columns
                     _cprint(f"\n{_GOLD}╰{'─' * (w - 2)}╯{_RST}")
-                elif already_streamed:
-                    # Response was already streamed token-by-token with box framing;
-                    # _flush_stream() already closed the box. Skip Rich Panel.
-                    pass
                 else:
                     _chat_console = ChatConsole()
                     _chat_console.print(Panel(
@@ -5878,9 +6388,13 @@ class HermesCLI:
             return response
             
         except Exception as e:
-            print(f"Error: {e}")
+            from hermes_cli.colors import strip_ansi
+
+            self._reset_tool_status()
+            print(f"Error: {strip_ansi(str(e))}")
             return None
         finally:
+            self._reset_tool_status()
             # Ensure streaming TTS resources are cleaned up even on error.
             # Normal path sends the sentinel at line ~3568; this is a safety
             # net for exception paths that skip it.  Duplicate sentinels are
@@ -6344,7 +6858,6 @@ class HermesCLI:
             else:
                 # No menu and no suggestion — start completions from scratch
                 buf.start_completion()
-
         # --- Clarify tool: arrow-key navigation for multiple-choice questions ---
 
         @kb.add('up', filter=Condition(lambda: bool(self._clarify_state) and not self._clarify_freetext))

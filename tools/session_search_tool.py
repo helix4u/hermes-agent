@@ -19,11 +19,199 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import re
+from calendar import monthrange
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Union
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
+
+_WEEKDAY_NAMES = [
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+]
+_DAY_RE = re.compile(r"\b(today|yesterday|tomorrow|tonight|this\s+(?:morning|afternoon|evening))\b", re.IGNORECASE)
+_WINDOW_RE = re.compile(
+    r"\b("
+    r"last\s+week|past\s+week|this\s+week|"
+    r"last\s+month|past\s+month|this\s+month|"
+    r"last\s+year|past\s+year|this\s+year"
+    r")\b",
+    re.IGNORECASE,
+)
+_AGO_RE = re.compile(r"\b(\d+)\s+(day|week|month|year)s?\s+ago\b", re.IGNORECASE)
+_LAST_WEEKDAY_RE = re.compile(
+    r"\blast\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+_WEEKDAY_RE = re.compile(
+    r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+
+
+def _local_now(now: Optional[datetime] = None) -> datetime:
+    candidate = now or datetime.now().astimezone()
+    if candidate.tzinfo is None:
+        return candidate.astimezone()
+    return candidate
+
+
+def _start_of_day(dt: datetime) -> datetime:
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _end_of_day(dt: datetime) -> datetime:
+    return _start_of_day(dt) + timedelta(days=1) - timedelta(microseconds=1)
+
+
+def _shift_months(dt: datetime, months: int) -> datetime:
+    total_months = dt.year * 12 + (dt.month - 1) + months
+    year = total_months // 12
+    month = total_months % 12 + 1
+    day = min(dt.day, monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _format_date_window(start: datetime, end: datetime) -> str:
+    if start.date() == end.date():
+        return start.strftime("%B %d, %Y")
+    return f"{start.strftime('%B %d, %Y')} to {end.strftime('%B %d, %Y')}"
+
+
+def _cleanup_search_query(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip(" ,.;:-")
+    return cleaned
+
+
+def _resolve_relative_date_window(
+    query: str,
+    now: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    text = str(query or "")
+    if not text.strip():
+        return None
+
+    current = _local_now(now)
+    matches: List[Dict[str, Any]] = []
+
+    def _append_match(match: re.Match, start: datetime, end: datetime) -> None:
+        matches.append(
+            {
+                "matched_text": match.group(0),
+                "match_start": match.start(),
+                "match_length": len(match.group(0)),
+                "start": start,
+                "end": end,
+            }
+        )
+
+    for match in _DAY_RE.finditer(text):
+        phrase = match.group(1).lower()
+        if phrase == "yesterday":
+            target = current - timedelta(days=1)
+        elif phrase in {"tomorrow", "tonight"}:
+            target = current + timedelta(days=1)
+        else:
+            target = current
+        _append_match(match, _start_of_day(target), _end_of_day(target))
+
+    for match in _WINDOW_RE.finditer(text):
+        phrase = match.group(1).lower()
+        if phrase in {"last week", "past week"}:
+            if phrase == "last week":
+                end_anchor = _start_of_day(current) - timedelta(microseconds=1)
+                start = _start_of_day(end_anchor - timedelta(days=6))
+                end = _end_of_day(end_anchor)
+            else:
+                start = current - timedelta(days=7)
+                end = current
+        elif phrase == "this week":
+            start = _start_of_day(current - timedelta(days=current.weekday()))
+            end = current
+        elif phrase == "last month":
+            prev = _shift_months(current, -1)
+            start = _start_of_day(prev.replace(day=1))
+            end = _end_of_day(prev.replace(day=monthrange(prev.year, prev.month)[1]))
+        elif phrase == "past month":
+            start = current - timedelta(days=30)
+            end = current
+        elif phrase == "this month":
+            start = _start_of_day(current.replace(day=1))
+            end = current
+        elif phrase == "last year":
+            year = current.year - 1
+            start = _start_of_day(current.replace(year=year, month=1, day=1))
+            end = _end_of_day(current.replace(year=year, month=12, day=31))
+        elif phrase == "past year":
+            start = current - timedelta(days=365)
+            end = current
+        else:  # this year
+            start = _start_of_day(current.replace(month=1, day=1))
+            end = current
+        _append_match(match, start, end)
+
+    for match in _AGO_RE.finditer(text):
+        amount = int(match.group(1))
+        unit = match.group(2).lower()
+        if unit == "day":
+            target = current - timedelta(days=amount)
+        elif unit == "week":
+            target = current - timedelta(weeks=amount)
+        elif unit == "month":
+            target = _shift_months(current, -amount)
+        else:
+            target = current.replace(year=current.year - amount)
+        _append_match(match, _start_of_day(target), _end_of_day(target))
+
+    for match in _LAST_WEEKDAY_RE.finditer(text):
+        weekday_name = match.group(1).lower()
+        target_idx = _WEEKDAY_NAMES.index(weekday_name)
+        days_ago = (current.weekday() - target_idx) % 7 + 7
+        target = current - timedelta(days=days_ago)
+        _append_match(match, _start_of_day(target), _end_of_day(target))
+
+    for match in _WEEKDAY_RE.finditer(text):
+        if any(
+            existing["match_start"] <= match.start() < existing["match_start"] + existing["match_length"]
+            for existing in matches
+        ):
+            continue
+        weekday_name = match.group(1).lower()
+        target_idx = _WEEKDAY_NAMES.index(weekday_name)
+        days_ago = (current.weekday() - target_idx) % 7
+        target = current - timedelta(days=days_ago)
+        _append_match(match, _start_of_day(target), _end_of_day(target))
+
+    if not matches:
+        return None
+
+    match_info = sorted(matches, key=lambda item: (item["match_start"], -item["match_length"]))[0]
+    normalized_query = (
+        text[: match_info["match_start"]]
+        + f"{match_info['matched_text']} ({_format_date_window(match_info['start'], match_info['end'])})"
+        + text[match_info["match_start"] + match_info["match_length"] :]
+    )
+    search_query = _cleanup_search_query(
+        text[: match_info["match_start"]] + " " + text[match_info["match_start"] + match_info["match_length"] :]
+    )
+    return {
+        "matched_text": match_info["matched_text"],
+        "normalized_query": normalized_query,
+        "search_query": search_query,
+        "start": match_info["start"],
+        "end": match_info["end"],
+        "start_ts": match_info["start"].timestamp(),
+        "end_ts": match_info["end"].timestamp(),
+        "label": _format_date_window(match_info["start"], match_info["end"]),
+    }
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -250,6 +438,7 @@ def session_search(
     limit: int = 3,
     db=None,
     current_session_id: str = None,
+    date_awareness: str = "smart",
 ) -> str:
     """
     Search past sessions and return focused summaries of matching conversations.
@@ -268,6 +457,27 @@ def session_search(
         return _list_recent_sessions(db, limit, current_session_id)
 
     query = query.strip()
+    normalized_date_awareness = str(date_awareness or "smart").strip().lower()
+    date_window = _resolve_relative_date_window(query) if normalized_date_awareness != "off" else None
+    effective_query = str(date_window.get("search_query") if date_window else query).strip()
+
+    def _search_payload_base() -> Dict[str, Any]:
+        return {
+            "query": query,
+            "normalized_query": date_window.get("normalized_query") if date_window else query,
+            "search_query": effective_query,
+            "date_awareness": "smart" if normalized_date_awareness != "off" else "off",
+            "date_range": (
+                {
+                    "matched_text": date_window["matched_text"],
+                    "label": date_window["label"],
+                    "start": date_window["start"].isoformat(),
+                    "end": date_window["end"].isoformat(),
+                }
+                if date_window
+                else None
+            ),
+        }
 
     try:
         # Parse role filter
@@ -275,11 +485,15 @@ def session_search(
         if role_filter and role_filter.strip():
             role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
 
-        # FTS5 search -- get matches ranked by relevance
+        # FTS5 search -- get matches ranked by relevance. When the query is
+        # purely date-based ("today", "last month"), fall back to time-
+        # filtered recall without requiring any extra keywords.
         raw_results = db.search_messages(
-            query=query,
+            query=effective_query,
             role_filter=role_list,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            since_ts=date_window.get("start_ts") if date_window else None,
+            until_ts=date_window.get("end_ts") if date_window else None,
             limit=50,  # Get more matches to find unique sessions
             offset=0,
         )
@@ -287,7 +501,7 @@ def session_search(
         if not raw_results:
             return json.dumps({
                 "success": True,
-                "query": query,
+                **_search_payload_base(),
                 "results": [],
                 "count": 0,
                 "message": "No matching sessions found.",
@@ -353,7 +567,7 @@ def session_search(
                     continue
                 session_meta = db.get_session(session_id) or {}
                 conversation_text = _format_conversation(messages)
-                conversation_text = _truncate_around_matches(conversation_text, query)
+                conversation_text = _truncate_around_matches(conversation_text, effective_query or query)
                 tasks.append((session_id, match_info, conversation_text, session_meta))
             except Exception as e:
                 logging.warning(
@@ -367,7 +581,11 @@ def session_search(
         async def _summarize_all() -> List[Union[str, Exception]]:
             """Summarize all sessions in parallel."""
             coros = [
-                _summarize_session(text, query, meta)
+                _summarize_session(
+                    text,
+                    date_window.get("normalized_query") if date_window else query,
+                    meta,
+                )
                 for _, _, text, meta in tasks
             ]
             return await asyncio.gather(*coros, return_exceptions=True)
@@ -419,7 +637,7 @@ def session_search(
 
         return json.dumps({
             "success": True,
-            "query": query,
+            **_search_payload_base(),
             "results": summaries,
             "count": len(summaries),
             "sessions_searched": len(seen_sessions),
@@ -471,6 +689,12 @@ SESSION_SEARCH_SCHEMA = {
                 "type": "string",
                 "description": "Search query — keywords, phrases, or boolean expressions to find in past sessions. Omit this parameter entirely to browse recent sessions instead (returns titles, previews, timestamps with no LLM cost).",
             },
+            "date_awareness": {
+                "type": "string",
+                "description": "Optional relative-date handling mode. Use 'smart' to expand phrases like today/yesterday into absolute date windows, or 'off' to treat them literally.",
+                "enum": ["smart", "off"],
+                "default": "smart",
+            },
             "role_filter": {
                 "type": "string",
                 "description": "Optional: only search messages from specific roles (comma-separated). E.g. 'user,assistant' to skip tool outputs.",
@@ -498,7 +722,8 @@ registry.register(
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
         db=kw.get("db"),
-        current_session_id=kw.get("current_session_id")),
+        current_session_id=kw.get("current_session_id"),
+        date_awareness=args.get("date_awareness", "smart")),
     check_fn=check_session_search_requirements,
     emoji="🔍",
 )

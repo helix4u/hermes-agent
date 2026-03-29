@@ -180,6 +180,15 @@ def show_status(args):
     codex_auth_file = codex_status.get("auth_store")
     if codex_auth_file:
         print(f"    Auth file:  {codex_auth_file}")
+    codex_origin = str(codex_status.get("session_origin") or "").strip()
+    if codex_origin:
+        origin_label = {
+            "hermes_device_auth": "Hermes-owned device login",
+            "shared_codex_import": "Imported shared Codex session",
+            "shared_codex_migration": "Migrated shared Codex session",
+            "legacy": "Legacy/unknown origin",
+        }.get(codex_origin, codex_origin)
+        print(f"    Session:    {origin_label}")
     codex_last_refresh = _format_iso_timestamp(codex_status.get("last_refresh"))
     if codex_status.get("last_refresh"):
         print(f"    Refreshed:  {codex_last_refresh}")
