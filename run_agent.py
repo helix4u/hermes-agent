@@ -2923,6 +2923,77 @@ class AIAgent:
         return getattr(tc, "id", "") or ""
 
     @staticmethod
+    def _get_tool_call_name_and_arguments(tc) -> tuple[str, Any]:
+        """Extract the tool name and raw arguments from a tool_call entry."""
+        if isinstance(tc, dict):
+            fn = tc.get("function") or {}
+            return str(fn.get("name", "") or ""), fn.get("arguments")
+
+        fn = getattr(tc, "function", None)
+        return (
+            str(getattr(fn, "name", "") or ""),
+            getattr(fn, "arguments", None),
+        )
+
+    @staticmethod
+    def _normalize_tool_call_arguments(arguments: Any) -> tuple[str, Any]:
+        """Return a stable string form of tool args plus the best parsed value."""
+        parsed = arguments
+        if isinstance(arguments, str):
+            raw = arguments.strip()
+            if not raw:
+                return "{}", {}
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return raw, raw
+
+        try:
+            normalized = json.dumps(
+                parsed,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            normalized = str(parsed)
+        return normalized, parsed
+
+    @staticmethod
+    def _summarize_tool_call_target(tool_name: str, parsed_args: Any) -> str:
+        """Build a short human-readable target for redundancy guidance."""
+        if not isinstance(parsed_args, dict):
+            return "with the same inputs"
+
+        value = None
+        if tool_name == "read_file":
+            value = parsed_args.get("path")
+        elif tool_name == "search_files":
+            value = parsed_args.get("pattern") or parsed_args.get("query")
+        elif tool_name == "web_search":
+            value = parsed_args.get("query") or parsed_args.get("q")
+        elif tool_name == "terminal":
+            value = (
+                parsed_args.get("command")
+                or parsed_args.get("cmd")
+                or parsed_args.get("input")
+            )
+        elif tool_name == "browser_extract_content":
+            value = parsed_args.get("url")
+        elif tool_name == "web_extract":
+            value = parsed_args.get("url")
+        elif tool_name == "execute_code":
+            value = parsed_args.get("language")
+
+        if value in (None, ""):
+            return "with the same inputs"
+
+        text = str(value).strip()
+        if len(text) > 72:
+            text = text[:69].rstrip() + "..."
+        return f"for `{text}`"
+
+    @staticmethod
     def _sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
@@ -3127,6 +3198,28 @@ class AIAgent:
                 "research. Prefer the local Kokoro FastAPI workflow and the built-in "
                 "`text_to_speech` provider `kokoro` over generic web_search/web_extract unless "
                 "the local service or voice discovery step fails."
+            )
+
+        youtube_markers = (
+            "youtube.com/",
+            "youtu.be/",
+            "youtube transcript",
+            "youtube subtitles",
+            "youtube captions",
+            "video transcript",
+        )
+        if any(marker in text for marker in youtube_markers):
+            return (
+                "Skill routing hint for this turn: this request strongly matches the installed "
+                "skill `yt-dlp`. FIRST load it with skill_view('yt-dlp') before other tools. "
+                "Prefer the canonical yt-dlp / transcript workflow over generic web_search or "
+                "ad-hoc terminal retries. Use the skill's canonical transcript helper script "
+                "when appropriate. For a direct YouTube URL, extract metadata and "
+                "captions/transcript first, avoid repeated fetch loops for the same URL, and "
+                "avoid piping yt-dlp output directly into python when a temp file or the "
+                "canonical helper script would work. If transcript extraction succeeds but "
+                "yt-dlp metadata is unavailable or null, stop chasing title/uploader with more "
+                "yt-dlp or web_search calls and finish from the transcript you already have."
             )
 
         return ""
@@ -6319,6 +6412,141 @@ class AIAgent:
         augmented.append({"role": "user", "content": guidance})
         return augmented
 
+    def _append_recent_tool_redundancy_guidance(
+        self,
+        api_messages: list,
+        messages: list,
+        current_turn_user_idx: int,
+    ) -> list:
+        """Warn the model when it is repeating the same tool calls this turn."""
+        if not api_messages or not self.valid_tool_names:
+            return api_messages
+
+        enabled = os.getenv("HERMES_REDUNDANT_TOOL_GUIDANCE", "1").strip().lower()
+        if enabled in {"0", "false", "no", "off"}:
+            return api_messages
+
+        turn_messages = messages[current_turn_user_idx + 1 :] if current_turn_user_idx >= 0 else messages
+        if not turn_messages:
+            return api_messages
+
+        tool_results_by_id: Dict[str, str] = {}
+        repeated_calls: Dict[tuple[str, str], Dict[str, Any]] = {}
+        repeated_read_targets: Dict[str, Dict[str, Any]] = {}
+        ytdlp_unavailable = False
+        first_seen_order = 0
+
+        for msg in turn_messages:
+            if msg.get("role") == "tool":
+                call_id = str(msg.get("tool_call_id") or "")
+                if call_id:
+                    result_text = str(msg.get("content", "") or "")
+                    tool_results_by_id[call_id] = result_text
+                    lowered_result = result_text.lower()
+                    if (
+                        "yt-dlp" in lowered_result
+                        and ("not found" in lowered_result or '"exit_code": 127' in lowered_result)
+                    ):
+                        ytdlp_unavailable = True
+                continue
+
+            if msg.get("role") != "assistant":
+                continue
+
+            for tc in msg.get("tool_calls") or []:
+                tool_name, raw_args = self._get_tool_call_name_and_arguments(tc)
+                if not tool_name:
+                    continue
+                normalized_args, parsed_args = self._normalize_tool_call_arguments(raw_args)
+                signature = (tool_name, normalized_args)
+                entry = repeated_calls.get(signature)
+                if entry is None:
+                    repeated_calls[signature] = {
+                        "count": 1,
+                        "tool_name": tool_name,
+                        "parsed_args": parsed_args,
+                        "call_ids": [self._get_tool_call_id_static(tc)],
+                        "order": first_seen_order,
+                    }
+                    first_seen_order += 1
+                else:
+                    entry["count"] += 1
+                    entry["call_ids"].append(self._get_tool_call_id_static(tc))
+
+                if tool_name == "read_file" and isinstance(parsed_args, dict):
+                    path = str(parsed_args.get("path", "") or "").strip()
+                    if path:
+                        path_entry = repeated_read_targets.get(path)
+                        if path_entry is None:
+                            repeated_read_targets[path] = {
+                                "count": 1,
+                                "order": first_seen_order,
+                            }
+                            first_seen_order += 1
+                        else:
+                            path_entry["count"] += 1
+
+        repeated_entries = [
+            entry for entry in repeated_calls.values() if int(entry.get("count", 0) or 0) > 1
+        ]
+        repeated_read_entries = [
+            (path, entry)
+            for path, entry in repeated_read_targets.items()
+            if int(entry.get("count", 0) or 0) > 2
+        ]
+        if not repeated_entries and not repeated_read_entries and not ytdlp_unavailable:
+            return api_messages
+
+        repeated_entries.sort(
+            key=lambda entry: (-int(entry.get("count", 0) or 0), int(entry.get("order", 0) or 0))
+        )
+        guidance_lines = []
+        for entry in repeated_entries[:3]:
+            tool_name = entry["tool_name"]
+            target = self._summarize_tool_call_target(tool_name, entry.get("parsed_args"))
+            last_result = ""
+            for call_id in reversed(entry.get("call_ids") or []):
+                if call_id and tool_results_by_id.get(call_id):
+                    last_result = tool_results_by_id[call_id]
+                    break
+            result_note = ""
+            if last_result:
+                is_error, _status = _detect_tool_failure(tool_name, last_result)
+                result_note = (
+                    " Latest result was an error."
+                    if is_error
+                    else " Latest result already returned usable output."
+                )
+            guidance_lines.append(
+                f"- `{tool_name}` {target} already ran {entry['count']} times this turn.{result_note}"
+            )
+
+        repeated_read_entries.sort(
+            key=lambda item: (-int(item[1].get("count", 0) or 0), int(item[1].get("order", 0) or 0))
+        )
+        for path, entry in repeated_read_entries[:2]:
+            path_display = path if len(path) <= 72 else path[:69].rstrip() + "..."
+            guidance_lines.append(
+                f"- `read_file` for `{path_display}` already sampled {entry['count']} times this turn across different offsets. Reuse the slices you already have or process the file once with a different tool instead of reading more chunks."
+            )
+
+        if ytdlp_unavailable:
+            guidance_lines.append(
+                "- `yt-dlp` is unavailable in this environment (a recent terminal call returned not found / exit 127). Do not retry direct `yt-dlp` commands this turn. If the transcript already succeeded, finish from it instead of chasing metadata."
+            )
+
+        guidance = (
+            "[System: Recent tool-use note for this turn:\n"
+            + "\n".join(guidance_lines)
+            + "\nDo not repeat the same tool call again unless the inputs changed or you are "
+              "explicitly validating a fix. Reuse the newest result you already have, summarize it, "
+              "or choose a meaningfully different tool.]"
+        )
+
+        augmented = list(api_messages)
+        augmented.append({"role": "user", "content": guidance})
+        return augmented
+
     def _get_budget_warning(self, api_call_count: int) -> Optional[str]:
         """Return a budget pressure string, or None if not yet needed.
 
@@ -6949,6 +7177,11 @@ class AIAgent:
             api_messages = self._sanitize_api_messages(api_messages)
 
             api_messages = self._append_tool_budget_guidance(api_messages, api_call_count)
+            api_messages = self._append_recent_tool_redundancy_guidance(
+                api_messages,
+                messages,
+                current_turn_user_idx,
+            )
 
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)

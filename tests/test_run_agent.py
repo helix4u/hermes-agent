@@ -955,6 +955,33 @@ class TestBuildSkillRoutingHint:
         assert "skill_view('kokoro-tts')" in hint
         assert "`text_to_speech` provider `kokoro`" in hint
 
+    def test_youtube_request_prefers_canonical_ytdlp_skill(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "skill_view", "terminal"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent.client = MagicMock()
+
+        hint = agent._build_skill_routing_hint(
+            "Summarize https://youtu.be/Nb5KbwVwC88 and pull the transcript."
+        )
+
+        assert "skill `yt-dlp`" in hint
+        assert "skill_view('yt-dlp')" in hint
+        assert "FIRST load it with skill_view('yt-dlp')" in hint
+        assert "avoid repeated fetch loops for the same URL" in hint
+        assert "stop chasing title/uploader" in hint
+
 
 class TestShellUtilsWindowsOverride:
     def test_env_override_takes_precedence_over_config(self):
@@ -2632,6 +2659,191 @@ class TestBudgetPressure:
         assert "Tool calls still usable on this response: yes" in guidance
         assert "Soft tool-call budget for this run: 0 remaining of 2 (2 used)" in guidance
         assert "Soft tool-call budget exhausted: yes" in guidance
+
+    def test_recent_tool_redundancy_guidance_flags_repeated_same_turn_reads(self, agent):
+        messages = [
+            {"role": "user", "content": "summarize this transcript"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"/tmp/transcript.txt"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "first transcript pass"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc2",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"/tmp/transcript.txt"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc2", "content": "second transcript pass"},
+        ]
+
+        augmented = agent._append_recent_tool_redundancy_guidance(
+            [{"role": "user", "content": "continue"}],
+            messages,
+            current_turn_user_idx=0,
+        )
+
+        assert len(augmented) == 2
+        guidance = augmented[-1]["content"]
+        assert "Recent tool-use note for this turn" in guidance
+        assert "`read_file` for `/tmp/transcript.txt` already ran 2 times this turn." in guidance
+        assert "Latest result already returned usable output." in guidance
+        assert "Do not repeat the same tool call again unless the inputs changed" in guidance
+
+    def test_recent_tool_redundancy_guidance_ignores_distinct_calls(self, agent):
+        messages = [
+            {"role": "user", "content": "research topic"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": '{"q":"alpha"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "alpha result"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc2",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": '{"q":"beta"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc2", "content": "beta result"},
+        ]
+
+        augmented = agent._append_recent_tool_redundancy_guidance(
+            [{"role": "user", "content": "continue"}],
+            messages,
+            current_turn_user_idx=0,
+        )
+
+        assert augmented == [{"role": "user", "content": "continue"}]
+
+    def test_recent_tool_redundancy_guidance_flags_same_file_chunk_sampling(self, agent):
+        messages = [
+            {"role": "user", "content": "summarize this long transcript"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"/tmp/transcript.txt","offset":1,"limit":120}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "chunk 1"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc2",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"/tmp/transcript.txt","offset":121,"limit":120}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc2", "content": "chunk 2"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc3",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"/tmp/transcript.txt","offset":241,"limit":120}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc3", "content": "chunk 3"},
+        ]
+
+        augmented = agent._append_recent_tool_redundancy_guidance(
+            [{"role": "user", "content": "continue"}],
+            messages,
+            current_turn_user_idx=0,
+        )
+
+        guidance = augmented[-1]["content"]
+        assert "`read_file` for `/tmp/transcript.txt` already sampled 3 times this turn across different offsets." in guidance
+        assert "process the file once with a different tool instead of reading more chunks" in guidance
+
+    def test_recent_tool_redundancy_guidance_warns_when_ytdlp_missing(self, agent):
+        messages = [
+            {"role": "user", "content": "summarize https://youtu.be/K0vIEmYA7QM"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": '{"command":"yt-dlp --get-title https://youtu.be/K0vIEmYA7QM"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "tc1",
+                "content": '{"output":"/bin/sh: 1: yt-dlp: not found","exit_code":127,"error":null}',
+            },
+        ]
+
+        augmented = agent._append_recent_tool_redundancy_guidance(
+            [{"role": "user", "content": "continue"}],
+            messages,
+            current_turn_user_idx=0,
+        )
+
+        guidance = augmented[-1]["content"]
+        assert "`yt-dlp` is unavailable in this environment" in guidance
+        assert "Do not retry direct `yt-dlp` commands this turn" in guidance
 
 
 class TestSafeWriter:

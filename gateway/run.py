@@ -8371,11 +8371,17 @@ class GatewayRunner:
         _raw_tp = user_config.get("display", {}).get("tool_progress")
         if _raw_tp is False:
             _raw_tp = "off"
-        progress_mode = (
-            _raw_tp
-            or os.getenv("HERMES_TOOL_PROGRESS_MODE")
-            or "all"
-        )
+        _progress_mode_env = os.getenv("HERMES_TOOL_PROGRESS_MODE")
+        if _raw_tp is None and not _progress_mode_env and source.platform == Platform.DISCORD:
+            # Discord is much easier to follow when progress is action-oriented
+            # rather than every repeated tool preview / thinking update.
+            progress_mode = "new"
+        else:
+            progress_mode = (
+                _raw_tp
+                or _progress_mode_env
+                or "all"
+            )
         progress_style = (
             _progress_cfg.get("tool_progress_style")
             or os.getenv("HERMES_TOOL_PROGRESS_STYLE")
@@ -8557,6 +8563,10 @@ class GatewayRunner:
             if not progress_queue and not _bridge_sidecar:
                 return
 
+            suppress_thinking_progress = (
+                source.platform == Platform.DISCORD and progress_mode != "verbose"
+            )
+
             # Optional completion payloads from newer run_agent variants.
             if tool_name == "_tool_result":
                 payload = args or {}
@@ -8601,6 +8611,8 @@ class GatewayRunner:
             emoji = get_tool_emoji(tool_name, default="⚙️")
 
             if tool_name == "_thinking":
+                if suppress_thinking_progress:
+                    return
                 _set_progress_state(phase="thinking", detail=f"💡 thinking: {preview or 'working...'}")
                 return
 

@@ -415,7 +415,7 @@ async def test_run_agent_progress_reports_waiting_heartbeat(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_discord_progress_includes_thinking_and_error_details(monkeypatch, tmp_path):
+async def test_discord_progress_suppresses_thinking_but_keeps_error_details(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -449,7 +449,7 @@ async def test_discord_progress_includes_thinking_and_error_details(monkeypatch,
 
     assert result["final_response"] == "done"
     rendered = [entry["content"] for entry in adapter.sent] + [entry["content"] for entry in adapter.edits]
-    assert any("planning next step" in content for content in rendered)
+    assert not any("planning next step" in content for content in rendered)
     assert any("terminal finished in 1.25s [exit 1]" in content for content in rendered)
     assert any("status=error" in content for content in rendered)
     assert any("stderr=fatal: not a git repository" in content for content in rendered)
@@ -495,10 +495,8 @@ async def test_gateway_terminal_logs_progress_updates(monkeypatch, tmp_path, cap
     assert result["final_response"] == "done"
     logged = "\n".join(record.getMessage() for record in caplog.records if "gateway-progress" in record.getMessage())
     console_text = "\n".join(console_lines)
-    assert "planning next step" in console_text
     assert "git status" in console_text
     assert "terminal finished in 1.25s [exit 1]" in console_text
-    assert "planning next step" in logged
     assert "git status" in logged
     assert "terminal finished in 1.25s [exit 1]" in logged
 
