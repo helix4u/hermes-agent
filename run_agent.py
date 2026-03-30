@@ -6508,34 +6508,22 @@ class AIAgent:
         status = self._get_tool_budget_status(api_call_count)
         soft_total = status["soft_tool_call_budget_total"]
         if soft_total is None:
-            soft_budget_line = "- Soft tool-call budget for this run: not configured"
-            soft_exhausted_line = "- Soft tool-call budget exhausted: no"
+            tool_calls_line = "tool calls left: unbounded"
         else:
-            soft_budget_line = (
-                "- Soft tool-call budget for this run: "
-                f"{status['soft_tool_calls_remaining']} remaining of {soft_total} "
-                f"({status['soft_tool_calls_used']} used)"
-            )
-            soft_exhausted_line = (
-                "- Soft tool-call budget exhausted: "
-                f"{'yes' if status['soft_tool_call_budget_exhausted'] else 'no'}"
+            tool_calls_line = (
+                "tool calls left: "
+                f"{status['soft_tool_calls_remaining']}/{soft_total}"
             )
 
         guidance = (
-            "[System: Tool-use runtime status for this turn:\n"
-            "- Tool calls still usable on this response: "
-            f"{'yes' if status['tool_calls_available_this_turn'] else 'no'}\n"
-            "- Follow-up API iterations remaining after tool results: "
-            f"{status['follow_up_iterations_remaining']} "
-            f"({status['hard_iteration_budget_used']}/{status['hard_iteration_budget_total']} used)\n"
-            f"{soft_budget_line}\n"
-            f"{soft_exhausted_line}\n"
-            "If tool calls are not still usable on this response, do not emit tool calls now. "
-            "Use tools deliberately, batch where possible, and avoid redundant calls.]"
+            "[System: Tool budget for this response:\n"
+            f"- tool calls usable now: {'yes' if status['tool_calls_available_this_turn'] else 'no'}\n"
+            f"- {tool_calls_line}\n"
+            "]"
         )
 
         augmented = list(api_messages)
-        augmented.append({"role": "user", "content": guidance})
+        augmented.append({"role": "system", "content": guidance})
         return augmented
 
     def _append_recent_tool_redundancy_guidance(

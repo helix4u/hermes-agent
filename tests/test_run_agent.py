@@ -2683,11 +2683,10 @@ class TestBudgetPressure:
         )
 
         assert len(augmented) == 2
+        assert augmented[-1]["role"] == "system"
         guidance = augmented[-1]["content"]
-        assert "Tool calls still usable on this response: no" in guidance
-        assert "Follow-up API iterations remaining after tool results: 0 (1/1 used)" in guidance
-        assert "do not emit tool calls now" in guidance
-        assert "Soft tool-call budget for this run: not configured" in guidance
+        assert "tool calls usable now: no" in guidance
+        assert "tool calls left: unbounded" in guidance
 
     def test_tool_budget_guidance_reports_soft_budget_exhaustion(self, agent):
         """Soft budget exhaustion should be explicit without pretending it is a hard block."""
@@ -2702,9 +2701,9 @@ class TestBudgetPressure:
         )
 
         guidance = augmented[-1]["content"]
-        assert "Tool calls still usable on this response: yes" in guidance
-        assert "Soft tool-call budget for this run: 0 remaining of 2 (2 used)" in guidance
-        assert "Soft tool-call budget exhausted: yes" in guidance
+        assert augmented[-1]["role"] == "system"
+        assert "tool calls usable now: yes" in guidance
+        assert "tool calls left: 0/2" in guidance
 
     def test_recent_tool_redundancy_guidance_flags_repeated_same_turn_reads(self, agent):
         messages = [
