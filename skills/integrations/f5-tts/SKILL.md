@@ -1,6 +1,10 @@
 ---
 name: f5-tts
 description: Use the local F5TTS-FASTAPI service for voice-cloned text-to-speech, voice discovery, and direct synthesis. Trigger when working with the user's local F5 TTS Docker service, listing available voice profiles, validating health or auth, generating speech in a specific cloned voice, or using the F5 API independently of Hermes' built-in text_to_speech provider.
+required_environment_variables:
+  - name: F5TTS_SECRET_KEY
+    prompt: Enter your F5 TTS secret key
+    required_for: Direct F5 API authentication from Hermes sandboxes
 metadata:
   hermes:
     tags: [TTS, F5, Voice Cloning, FastAPI, Audio]
@@ -9,6 +13,8 @@ metadata:
 # f5-tts
 
 Use this skill when the task is specifically about the user's local F5 TTS server or when you need to choose a voice profile directly instead of relying on Hermes' default `text_to_speech` configuration.
+
+Load this skill first when the user explicitly says `f5 tts`, `f5tts`, `f5-tts`, `use f5`, asks for F5 voice cloning, references `localhost:8081`, or mentions the F5 API endpoints.
 
 ## Core workflow
 
@@ -24,9 +30,13 @@ Use this skill when the task is specifically about the user's local F5 TTS serve
 
 - Prefer the built-in Hermes `text_to_speech` tool when the user simply wants speech output and the configured default voice is fine.
 - Prefer direct F5 API use when the user wants to inspect voices, pick a specific cloned voice, debug the local TTS service, or bypass Hermes' default provider selection.
+- If the user explicitly asks for F5, treat that as overriding the configured default TTS provider for the current turn.
+- Do not silently fall back to Kokoro, Edge, or another provider on an explicit F5 request unless the user asks you to.
 - Preserve the user's text exactly unless they asked for rewriting.
 - For long text, keep the FastAPI request body within the service limit by chunking and stitching rather than relaxing validation.
 - Do not ask the user for the secret key if `F5TTS_SECRET_KEY` is already present in the environment.
+- Do not use Kokoro voice names or mixes like `af_sky`, `af_nicole`, or `af_sky+af_v0+af_nicole` as F5 `voice_profile` values.
+- Always treat F5 `voice_profile` inventory as dynamic. Call `/api/v1/voices/list` and choose from the returned F5 profiles instead of guessing from another provider's voice list.
 
 ## Long text
 
@@ -41,6 +51,7 @@ Use this skill when the task is specifically about the user's local F5 TTS serve
 - If `/health` fails, report that the local F5 container is unavailable before trying anything else.
 - If auth fails, first check whether `F5TTS_SECRET_KEY` is already present in the environment and use it before asking the user for anything.
 - If auth still fails after using the env var, verify `F5TTS_SECRET_KEY` matches the FastAPI container `SECRET_KEY`.
+- If you see a `403 Not authenticated` on `/api/v1/voices/list`, do not conclude the secret is missing until you have retried with a fresh bearer token built from `F5TTS_SECRET_KEY`.
 - If a requested voice is missing, list available voices from `/api/v1/voices/list`.
 - If synthesis fails on long text, retry with shorter chunks instead of sending a larger single request.
 

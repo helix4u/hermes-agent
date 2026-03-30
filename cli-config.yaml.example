@@ -234,7 +234,7 @@ browser:
 
   # Optional live CDP endpoint override for browser tools.
   # When set, browser tools connect to this endpoint instead of headless local mode.
-  # Example: "ws://localhost:9222"
+  # Example: "ws://localhost:9222" on native Windows, "ws://localhost:9223" on WSL2
   # cdp_url: ""
 
   # Preferred browser target for `/browser connect` auto-launch.
@@ -242,6 +242,7 @@ browser:
   cdp_browser: "auto"
 
   # Default localhost CDP port used by `/browser connect` when no endpoint is provided.
+  # Native Windows defaults to 9222. WSL2 defaults to 9223 unless you override it here.
   cdp_port: 9222
 
   # Optional user-data-dir for CDP browser launch.

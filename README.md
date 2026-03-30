@@ -109,7 +109,7 @@ hermes
 
 On Windows, Hermes now prefers `cmd.exe`, then PowerShell, then WSL when the local terminal backend is left on auto.
 
-If you run Hermes in both native Windows and WSL at the same time, do not reuse the same localhost defaults in both places. Set different values for `HERMES_BROWSER_BRIDGE_PORT`, `API_SERVER_PORT`, and `BROWSER_CDP_PORT` so the browser bridge, API server, and live CDP browser do not collide.
+If you run Hermes in both native Windows and WSL at the same time, do not reuse the same localhost defaults in both places. Set different values for `HERMES_BROWSER_BRIDGE_PORT`, `API_SERVER_PORT`, and `BROWSER_CDP_PORT` so the browser bridge, API server, and live CDP browser do not collide. The runtime-aware CDP defaults now keep native Windows on `9222` and WSL2 on `9223`.
 
 ---
 

@@ -132,3 +132,24 @@ class TestSkillViewRegistersPassthrough:
         assert result["success"] is True
         from tools.env_passthrough import get_all_passthrough
         assert len(get_all_passthrough()) == 0
+
+
+class TestBundledF5Skill:
+    def test_f5_skill_declares_secret_for_passthrough(self):
+        from tools.skills_tool import _get_required_environment_variables, _parse_frontmatter
+
+        skill_path = (
+            Path(__file__).resolve().parents[2]
+            / "skills"
+            / "integrations"
+            / "f5-tts"
+            / "SKILL.md"
+        )
+        content = skill_path.read_text()
+        frontmatter, _ = _parse_frontmatter(content)
+
+        required = _get_required_environment_variables(frontmatter)
+
+        assert any(
+            entry["name"] == "F5TTS_SECRET_KEY" for entry in required
+        ), "Bundled f5-tts skill must declare F5TTS_SECRET_KEY for sandbox passthrough"

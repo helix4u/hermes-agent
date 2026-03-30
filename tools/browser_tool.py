@@ -63,6 +63,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
@@ -307,6 +308,64 @@ def _get_cdp_override() -> str:
     return _resolve_cdp_override(_get_raw_cdp_override())
 
 
+def _is_wsl_runtime() -> bool:
+    """Return True when Hermes is running inside WSL/WSL2."""
+    if os.name == "nt" or not sys.platform.startswith("linux"):
+        return False
+    if os.getenv("WSL_DISTRO_NAME") or os.getenv("WSL_INTEROP"):
+        return True
+    try:
+        release = os.uname().release
+    except Exception:
+        release = ""
+    return "microsoft" in str(release or "").lower()
+
+
+def _normalize_cdp_browser_name(raw: str) -> str:
+    """Normalize browser aliases used by CDP launcher/config helpers."""
+    normalized = (raw or "").strip().lower()
+    alias_map = {
+        "": "auto",
+        "auto": "auto",
+        "chrome": "chrome",
+        "google-chrome": "chrome",
+        "edge": "edge",
+        "msedge": "edge",
+        "microsoft-edge": "edge",
+        "brave": "brave",
+        "brave-browser": "brave",
+        "chromium": "chromium",
+        "comet": "comet",
+    }
+    return alias_map.get(normalized, normalized)
+
+
+def _default_cdp_port_for_browser(
+    browser: str,
+    *,
+    os_name: Optional[str] = None,
+    is_wsl: Optional[bool] = None,
+) -> int:
+    """Return runtime-aware deterministic localhost CDP defaults.
+
+    Native Windows keeps the legacy 9222 base. WSL2 shifts localhost CDP one
+    slot up to 9223 so mixed Windows/WSL setups do not collide by default.
+    Other POSIX runtimes keep 9222.
+    """
+    effective_os_name = os_name if os_name is not None else os.name
+    effective_is_wsl = _is_wsl_runtime() if is_wsl is None else bool(is_wsl)
+    base_port = 9223 if effective_is_wsl and effective_os_name != "nt" else 9222
+    offsets = {
+        "auto": 0,
+        "chrome": 0,
+        "edge": 1,
+        "brave": 2,
+        "chromium": 3,
+        "comet": 4,
+    }
+    return base_port + offsets.get(_normalize_cdp_browser_name(browser), 0)
+
+
 def _normalize_agent_browser_cdp_arg(cdp_url: str) -> str:
     """Normalize CDP argument for agent-browser CLI compatibility.
 
@@ -330,6 +389,263 @@ def _normalize_agent_browser_cdp_arg(cdp_url: str) -> str:
         return str(parsed.port)
 
     return raw
+
+
+def _extract_cdp_port(cdp_url: str, fallback_port: int) -> int:
+    """Extract TCP port from a CDP endpoint string."""
+    try:
+        parsed = urlparse((cdp_url or "").strip())
+        if parsed.port:
+            return int(parsed.port)
+    except Exception:
+        pass
+    try:
+        return int(str(cdp_url).rsplit(":", 1)[-1].split("/")[0])
+    except (ValueError, IndexError):
+        return fallback_port
+
+
+def _is_local_cdp_url(cdp_url: str) -> bool:
+    """Return True when the CDP target resolves to localhost."""
+    try:
+        parsed = urlparse((cdp_url or "").strip())
+    except Exception:
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    return host in {"localhost", "127.0.0.1"}
+
+
+def _is_cdp_endpoint_reachable(cdp_url: str, timeout: float = 1.0) -> bool:
+    """Check whether a localhost CDP TCP endpoint is currently reachable."""
+    if not _is_local_cdp_url(cdp_url):
+        return False
+    port = _extract_cdp_port(
+        cdp_url,
+        _default_cdp_port_for_browser(os.getenv("BROWSER_CDP_BROWSER", "auto")),
+    )
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _try_launch_local_cdp_browser(
+    port: int,
+    *,
+    browser: str = "auto",
+    profile_dir: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Try to launch a local Chromium-family browser with remote debugging."""
+    choice = _normalize_cdp_browser_name(browser)
+    system = "Windows" if os.name == "nt" else ("Darwin" if sys.platform == "darwin" else "Linux")
+    search_order = ("chrome", "edge", "brave", "chromium", "comet") if choice == "auto" else (choice,)
+
+    candidates: List[str] = []
+    if system == "Darwin":
+        app_map = {
+            "chrome": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+            "edge": ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"],
+            "brave": ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"],
+            "chromium": ["/Applications/Chromium.app/Contents/MacOS/Chromium"],
+            "comet": ["/Applications/Comet.app/Contents/MacOS/Comet"],
+        }
+        for key in search_order:
+            for app in app_map.get(key, []):
+                if os.path.isfile(app):
+                    candidates.append(app)
+    elif system == "Windows":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pfx86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        local = os.environ.get("LOCALAPPDATA", "")
+        path_map = {
+            "chrome": [
+                os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(pfx86, "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+            ],
+            "edge": [
+                os.path.join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+                os.path.join(pfx86, "Microsoft", "Edge", "Application", "msedge.exe"),
+                os.path.join(local, "Microsoft", "Edge", "Application", "msedge.exe"),
+            ],
+            "brave": [
+                os.path.join(pf, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                os.path.join(pfx86, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                os.path.join(local, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+            ],
+            "chromium": [
+                os.path.join(pf, "Chromium", "Application", "chrome.exe"),
+                os.path.join(pfx86, "Chromium", "Application", "chrome.exe"),
+                os.path.join(local, "Chromium", "Application", "chrome.exe"),
+            ],
+            "comet": [
+                os.path.join(pf, "Comet", "Application", "comet.exe"),
+                os.path.join(pfx86, "Comet", "Application", "comet.exe"),
+                os.path.join(local, "Comet", "Application", "comet.exe"),
+                os.path.join(local, "Perplexity", "Comet", "Application", "comet.exe"),
+            ],
+        }
+        bin_map = {
+            "chrome": ("chrome.exe", "chrome"),
+            "edge": ("msedge.exe", "msedge"),
+            "brave": ("brave.exe", "brave"),
+            "chromium": ("chromium.exe", "chromium"),
+            "comet": ("comet.exe", "comet"),
+        }
+        for key in search_order:
+            for app in path_map.get(key, []):
+                if app and os.path.isfile(app):
+                    candidates.append(app)
+            for binary in bin_map.get(key, ()):
+                path = shutil.which(binary)
+                if path:
+                    candidates.append(path)
+    else:
+        bin_map = {
+            "chrome": ("google-chrome", "google-chrome-stable"),
+            "edge": ("microsoft-edge",),
+            "brave": ("brave-browser",),
+            "chromium": ("chromium-browser", "chromium"),
+            "comet": ("comet",),
+        }
+        for key in search_order:
+            for name in bin_map.get(key, ()):
+                path = shutil.which(name)
+                if path:
+                    candidates.append(path)
+
+    deduped_candidates: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        normalized = os.path.normcase(os.path.normpath(candidate))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped_candidates.append(candidate)
+
+    if not deduped_candidates:
+        return None
+
+    executable = deduped_candidates[0]
+    chosen_profile = (profile_dir or "").strip()
+    autogenerated_profile = False
+    if not chosen_profile:
+        profile_suffix = choice if choice != "auto" else "chrome"
+        chosen_profile = os.path.join(
+            tempfile.gettempdir(),
+            f"{profile_suffix}-cdp-hermes-{uuid.uuid4().hex[:8]}",
+        )
+        autogenerated_profile = True
+
+    launch_cmd = [
+        executable,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={chosen_profile}",
+    ]
+    popen_kwargs: Dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if system == "Windows":
+        flags = 0
+        flags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        popen_kwargs["creationflags"] = flags
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        process = subprocess.Popen(launch_cmd, **popen_kwargs)
+    except Exception as exc:
+        logger.warning("Failed to launch local CDP browser with %s: %s", executable, exc)
+        return None
+
+    return {
+        "pid": process.pid,
+        "browser": choice,
+        "executable": executable,
+        "profile_dir": chosen_profile,
+        "profile_autogenerated": autogenerated_profile,
+        "port": port,
+    }
+
+
+def _terminate_spawned_cdp_browser(spawn_info: Dict[str, Any]) -> None:
+    """Best-effort cleanup for a Hermes-started localhost CDP browser."""
+    pid = int(spawn_info.get("pid") or 0)
+    if pid > 0:
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+            else:
+                try:
+                    os.killpg(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError):
+                    os.kill(pid, signal.SIGTERM)
+        except Exception as exc:
+            logger.debug("Failed to terminate spawned CDP browser pid=%s: %s", pid, exc)
+
+    if spawn_info.get("profile_autogenerated"):
+        try:
+            shutil.rmtree(str(spawn_info.get("profile_dir") or ""), ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _ensure_local_cdp_browser(
+    cdp_url: str,
+    *,
+    browser: str = "auto",
+    profile_dir: Optional[str] = None,
+) -> tuple[str, Optional[Dict[str, Any]]]:
+    """Ensure a localhost CDP target is running, auto-launching when needed."""
+    if not _is_local_cdp_url(cdp_url):
+        return cdp_url, None
+    if _is_cdp_endpoint_reachable(cdp_url):
+        return _resolve_cdp_override(cdp_url), None
+
+    port = _extract_cdp_port(
+        cdp_url,
+        _default_cdp_port_for_browser(browser),
+    )
+    spawn_info = _try_launch_local_cdp_browser(
+        port,
+        browser=browser,
+        profile_dir=profile_dir,
+    )
+    if not spawn_info:
+        return cdp_url, None
+
+    reachable = False
+    for _ in range(20):
+        if _is_cdp_endpoint_reachable(cdp_url):
+            reachable = True
+            break
+        time.sleep(0.5)
+
+    if not reachable:
+        logger.warning(
+            "Launched local CDP browser for %s on port %s, but the endpoint never became reachable",
+            browser,
+            port,
+        )
+        _terminate_spawned_cdp_browser(spawn_info)
+        return cdp_url, None
+
+    resolved = _resolve_cdp_override(cdp_url)
+    logger.info(
+        "Auto-launched local CDP browser %s on port %s for %s",
+        spawn_info.get("browser") or browser,
+        port,
+        resolved,
+    )
+    return resolved, spawn_info
 
 
 def _is_local_mode() -> bool:
@@ -912,18 +1228,25 @@ def _create_local_session(task_id: str) -> Dict[str, str]:
     }
 
 
-def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
+def _create_cdp_session(
+    task_id: str,
+    cdp_url: str,
+    *,
+    spawned_cdp_browser: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Create a session that connects to a user-supplied CDP endpoint."""
-    import uuid
     session_name = f"cdp_{uuid.uuid4().hex[:10]}"
     logger.info("Created CDP browser session %s → %s for task %s",
                 session_name, cdp_url, task_id)
-    return {
+    session_info: Dict[str, Any] = {
         "session_name": session_name,
         "bb_session_id": None,
         "cdp_url": cdp_url,
         "features": {"cdp_override": True},
     }
+    if spawned_cdp_browser:
+        session_info["spawned_cdp_browser"] = dict(spawned_cdp_browser)
+    return session_info
 
 
 def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
@@ -962,7 +1285,18 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
         default=True,
     )
     if cdp_override:
-        session_info = _create_cdp_session(task_id, cdp_override)
+        browser_choice = _normalize_cdp_browser_name(os.environ.get("BROWSER_CDP_BROWSER", "auto"))
+        launched_cdp_browser = None
+        cdp_override, launched_cdp_browser = _ensure_local_cdp_browser(
+            cdp_override,
+            browser=browser_choice,
+            profile_dir=os.environ.get("BROWSER_CDP_USER_DATA_DIR", "").strip() or None,
+        )
+        session_info = _create_cdp_session(
+            task_id,
+            cdp_override,
+            spawned_cdp_browser=launched_cdp_browser,
+        )
     elif force_local_for_sidecar and _is_sidecar_task(task_id):
         session_info = _create_local_session(task_id)
         session_info.setdefault("features", {})["sidecar_force_local"] = True
@@ -2374,7 +2708,11 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
                     except (ProcessLookupError, ValueError, PermissionError, OSError):
                         logger.debug("Could not kill daemon pid for %s (already dead or inaccessible)", session_name)
                 shutil.rmtree(socket_dir, ignore_errors=True)
-        
+
+        spawned_cdp_browser = session_info.get("spawned_cdp_browser")
+        if isinstance(spawned_cdp_browser, dict):
+            _terminate_spawned_cdp_browser(spawned_cdp_browser)
+
         logger.debug("Removed task %s from active sessions", task_id)
     else:
         logger.debug("No active session found for task_id: %s", task_id)

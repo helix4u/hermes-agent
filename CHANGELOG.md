@@ -34,6 +34,7 @@ All notable user-visible changes to this project are documented here. Agents and
 - **Activity log**: Side panel includes a collapsible **Activity log** showing gateway tool/thinking progress (parity with Discord-style `gateway-progress` lines). Buffer on the server is up to **128** lines per session (`activity_log` / `recent_events` in bridge API).
 - **Options**: Added runtime configuration sections for provider/model selection, provider credential helpers, TTS/STT defaults, terminal backend and timeout controls, Windows shell preference, web backend/archive fallback settings, and delegation overrides. The old optional log-dashboard field is gone; **Open control room** is the primary local observability entry point. Existing extension settings for activity log, microphone device, themes, and sidecar prompt controls remain.
 - **Reply section actions**: Browser-side replies now expose separate actions for tagged `ʞᴎiʜƚ` blocks versus the main answer content, instead of forcing everything through one copy/read control.
+- **Runtime voice defaults guardrail**: Saving Sidecar runtime settings no longer blanks critical TTS/STT fields with empty strings. The options page now repopulates sane voice defaults, and gateway runtime-config saves restore default voice/transcription models instead of persisting empty values that break transcription.
 
 ### Gateway
 
@@ -75,6 +76,7 @@ All notable user-visible changes to this project are documented here. Agents and
 - **Windows terminal order**: Windows local shell auto-selection now prefers `cmd.exe`, then PowerShell, then WSL, which is a better default for mainstream Windows installs.
 - **Per-command shell override**: The terminal tool now supports a Windows-only `shell_mode` override so advanced flows can deliberately mix `cmd`, PowerShell, and WSL work in one broader task.
 - **Windows/WSL localhost warning**: Gateway startup now warns when browser bridge, API server, or live CDP browser settings are still on collision-prone localhost defaults for mixed native-Windows + WSL setups, and the README now documents the split-port recommendation.
+- **Runtime-aware CDP defaults**: Live CDP browser defaults now keep native Windows on port `9222` and WSL2 on `9223`, and localhost CDP browser turns can auto-launch a debug browser and clean up Hermes-started debug browser processes at turn end.
 - **README sync**: Updated the README to document native Windows usage without WSL and call out the browser sidecar/control-room workflow.
 - **Cross-session scaffolding**: Added `docs/repo-map.md`, `docs/todo.md`, `docs/tool-registry.md`, and the new `terminal-shell-orchestration` skill so future sessions have a lighter-weight map of the repo, goals, and shell/tool nuances.
 
@@ -83,3 +85,5 @@ All notable user-visible changes to this project are documented here. Agents and
 - Added bundled skill **`wiki-upkeep`** (`skills/productivity/wiki-upkeep/SKILL.md`) for maintaining local wikis (structure, links, safe edits).
 - Added bundled skill **`terminal-shell-orchestration`** (`skills/productivity/terminal-shell-orchestration/SKILL.md`) for shell-aware Windows/POSIX execution planning and tool discovery.
 - **Kokoro skill routing**: Added a narrow per-turn routing hint so requests that clearly mention Kokoro voices, the local Kokoro FastAPI service, or Kokoro endpoints are pushed toward the existing `kokoro-tts` skill and built-in `text_to_speech` Kokoro provider before broad web research.
+- **F5 skill routing**: Added a matching per-turn routing hint for explicit F5 TTS requests so Hermes loads the `f5-tts` skill first, treats an explicit F5 request as overriding the default TTS provider for that turn, and avoids reusing Kokoro voice IDs like `af_sky` as F5 `voice_profile` names.
+- **F5 sandbox auth passthrough**: The bundled `f5-tts` skill now declares `F5TTS_SECRET_KEY` as a required environment variable so loading the skill correctly allowlists the secret for `execute_code` and `terminal` sandboxes instead of dropping direct F5 auth in child processes.

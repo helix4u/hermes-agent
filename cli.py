@@ -4418,15 +4418,9 @@ class HermesCLI:
     @staticmethod
     def _default_cdp_port_for_browser(browser: str) -> int:
         """Return deterministic per-browser localhost CDP defaults."""
-        mapping = {
-            "auto": 9222,
-            "chrome": 9222,
-            "edge": 9223,
-            "brave": 9224,
-            "chromium": 9225,
-            "comet": 9226,
-        }
-        return mapping.get(HermesCLI._normalize_cdp_browser_name(browser), 9222)
+        from tools.browser_tool import _default_cdp_port_for_browser as _shared_default_cdp_port
+
+        return _shared_default_cdp_port(browser)
 
     @staticmethod
     def _is_likely_cdp_endpoint(raw: str) -> bool:
@@ -4675,9 +4669,16 @@ class HermesCLI:
 
         default_browser = self._normalize_cdp_browser_name(os.environ.get("BROWSER_CDP_BROWSER", "auto"))
         try:
-            default_port = int(str(os.environ.get("BROWSER_CDP_PORT", "9222")).strip())
+            default_port = int(
+                str(
+                    os.environ.get(
+                        "BROWSER_CDP_PORT",
+                        str(self._default_cdp_port_for_browser(default_browser)),
+                    )
+                ).strip()
+            )
         except ValueError:
-            default_port = 9222
+            default_port = self._default_cdp_port_for_browser(default_browser)
         shared_state = _read_shared_cdp_state()
         shared_cdp = str(shared_state.get("cdp_url") or "").strip()
         current_env = os.environ.get("BROWSER_CDP_URL", "").strip()

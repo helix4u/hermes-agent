@@ -61,26 +61,26 @@ Instead of a cloud provider, you can attach Hermes browser tools to your own run
 In the CLI, use:
 
 ```
-/browser connect              # Connect to Chrome at ws://localhost:9222
+/browser connect              # Connect to Chrome at ws://localhost:9222 (Windows) or :9223 (WSL2)
 /browser connect ws://host:port  # Connect to a specific CDP endpoint
 /browser status               # Check current connection
 /browser disconnect            # Detach and return to cloud/local mode
 ```
 
-If Chrome isn't already running with remote debugging, Hermes will attempt to auto-launch it with `--remote-debugging-port=9222`.
+If Chrome isn't already running with remote debugging, Hermes will attempt to auto-launch it with the runtime default CDP port: `9222` on native Windows, `9223` on WSL2, and `9222` on other POSIX desktops.
 
 :::tip
 To start Chrome manually with CDP enabled:
 ```bash
-# Linux
-google-chrome --remote-debugging-port=9222
+# Linux / WSL2
+google-chrome --remote-debugging-port=9223  # use 9222 on non-WSL Linux if preferred
 
 # macOS
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222
 ```
 :::
 
-When connected via CDP, all browser tools (`browser_navigate`, `browser_click`, etc.) operate on your live Chrome instance instead of spinning up a cloud session.
+When connected via CDP, all browser tools (`browser_navigate`, `browser_click`, etc.) operate on your live Chrome instance instead of spinning up a cloud session. For localhost CDP turns, Hermes can auto-launch a debug browser if needed and tears down Hermes-started debug browsers during normal turn cleanup.
 
 ### Local browser mode
 

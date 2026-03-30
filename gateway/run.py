@@ -417,11 +417,18 @@ def _build_windows_wsl_localhost_collision_warning(
                 "Change `API_SERVER_PORT` in one environment."
             )
 
-    cdp_port = _parse_int_env("BROWSER_CDP_PORT", 9222)
-    if 9222 <= cdp_port <= 9226:
+    from tools.browser_tool import _default_cdp_port_for_browser as _shared_default_cdp_port
+
+    default_cdp_port = _shared_default_cdp_port(
+        "auto",
+        os_name=effective_os_name,
+        is_wsl=effective_is_wsl,
+    )
+    cdp_port = _parse_int_env("BROWSER_CDP_PORT", default_cdp_port)
+    if effective_is_wsl and effective_os_name != "nt" and cdp_port == 9222:
         warnings.append(
-            f"- Live CDP default is collision-prone at port `{cdp_port}`. "
-            "Set `BROWSER_CDP_PORT` differently, or connect with `/browser connect <port>`."
+            "- Live CDP is still using the native-Windows port `9222`. "
+            "Set `BROWSER_CDP_PORT=9223` in WSL, or connect with `/browser connect 9223`."
         )
 
     if not warnings:
@@ -433,7 +440,7 @@ def _build_windows_wsl_localhost_collision_warning(
         f"{runtime_label} shares localhost with sibling Hermes instances across Windows/WSL. "
         "If you run Hermes in both environments at once, default local ports can collide:\n"
         f"{body}\n"
-        "Suggested split: Windows keeps `8765/8642/9222`, WSL uses `8766/8643/9332`."
+        "Suggested split: Windows keeps `8765/8642/9222`, WSL uses `8766/8643/9223`."
     )
 
 
@@ -2183,6 +2190,66 @@ class GatewayRunner:
         return base
 
     @staticmethod
+    def _get_nested_config_value(data: Dict[str, Any], path: tuple[str, ...]) -> Any:
+        current: Any = data
+        for part in path:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(part)
+        return current
+
+    @staticmethod
+    def _set_nested_config_value(data: Dict[str, Any], path: tuple[str, ...], value: Any) -> None:
+        current = data
+        for part in path[:-1]:
+            next_value = current.get(part)
+            if not isinstance(next_value, dict):
+                next_value = {}
+                current[part] = next_value
+            current = next_value
+        current[path[-1]] = value
+
+    @staticmethod
+    def _normalize_runtime_config_patch(config_patch: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill runtime-config blanks with sane defaults instead of persisting empties.
+
+        The browser extension options page posts a full config subtree. When
+        some text/select inputs are empty or stale, blindly deep-merging that
+        payload can overwrite working voice/runtime defaults with empty strings,
+        which later surfaces as STT/TTS failures. Keep intentional clearable
+        fields alone, but restore defaults for the critical runtime fields that
+        should stay non-empty.
+        """
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        defaulted_string_paths: tuple[tuple[str, ...], ...] = (
+            ("tts", "provider"),
+            ("tts", "edge", "voice"),
+            ("tts", "openai", "model"),
+            ("tts", "openai", "voice"),
+            ("tts", "kokoro", "base_url"),
+            ("tts", "kokoro", "voice"),
+            ("stt", "provider"),
+            ("stt", "local", "model"),
+            ("stt", "openai", "model"),
+            ("terminal", "backend"),
+            ("terminal", "windows_shell"),
+            ("terminal", "cwd"),
+            ("web", "archive_fallback", "service"),
+            ("model", "provider"),
+        )
+
+        for path in defaulted_string_paths:
+            current = GatewayRunner._get_nested_config_value(config_patch, path)
+            if not isinstance(current, str) or current.strip():
+                continue
+            default_value = GatewayRunner._get_nested_config_value(DEFAULT_CONFIG, path)
+            if isinstance(default_value, str) and default_value.strip():
+                GatewayRunner._set_nested_config_value(config_patch, path, default_value)
+
+        return config_patch
+
+    @staticmethod
     def _safe_json_loads(value: Any) -> Any:
         if isinstance(value, (dict, list)):
             return value
@@ -2396,6 +2463,7 @@ class GatewayRunner:
         config = load_config()
         config_patch = payload.get("config_patch")
         if isinstance(config_patch, dict):
+            config_patch = self._normalize_runtime_config_patch(dict(config_patch))
             self._deep_merge_browser_bridge_config(config, config_patch)
             save_config(config)
             terminal_patch = config_patch.get("terminal")
@@ -6360,15 +6428,9 @@ class GatewayRunner:
 
     @staticmethod
     def _default_cdp_port_for_browser(browser: str) -> int:
-        mapping = {
-            "auto": 9222,
-            "chrome": 9222,
-            "edge": 9223,
-            "brave": 9224,
-            "chromium": 9225,
-            "comet": 9226,
-        }
-        return mapping.get(GatewayRunner._normalize_cdp_browser_name(browser), 9222)
+        from tools.browser_tool import _default_cdp_port_for_browser as _shared_default_cdp_port
+
+        return _shared_default_cdp_port(browser)
 
     @staticmethod
     def _is_likely_cdp_endpoint(raw: str) -> bool:
@@ -6458,9 +6520,16 @@ class GatewayRunner:
 
         default_browser = self._normalize_cdp_browser_name(os.environ.get("BROWSER_CDP_BROWSER", "auto"))
         try:
-            default_port = int(str(os.environ.get("BROWSER_CDP_PORT", "9222")).strip())
+            default_port = int(
+                str(
+                    os.environ.get(
+                        "BROWSER_CDP_PORT",
+                        str(self._default_cdp_port_for_browser(default_browser)),
+                    )
+                ).strip()
+            )
         except ValueError:
-            default_port = 9222
+            default_port = self._default_cdp_port_for_browser(default_browser)
 
         shared_state = read_shared_cdp_state() or {}
         shared_cdp = str(shared_state.get("cdp_url") or "").strip()

@@ -59,6 +59,12 @@ const delegationBaseUrlInput = document.getElementById("delegation-base-url-inpu
 
 const DEFAULT_LOCAL_STT_MODEL = "base";
 const DEFAULT_OPENAI_STT_MODEL = "whisper-1";
+const DEFAULT_TTS_PROVIDER = "edge";
+const DEFAULT_EDGE_TTS_VOICE = "en-US-AriaNeural";
+const DEFAULT_OPENAI_TTS_MODEL = "gpt-4o-mini-tts";
+const DEFAULT_OPENAI_TTS_VOICE = "alloy";
+const DEFAULT_KOKORO_BASE_URL = "http://localhost:8880";
+const DEFAULT_KOKORO_VOICE = "af_sky+af_v0+af_nicole";
 const LOCAL_STT_MODEL_OPTIONS = [
   "tiny",
   "base",
@@ -264,22 +270,22 @@ async function loadRuntimeConfig(selectedProvider = "") {
 
   const tts = config.tts || {};
   if (ttsProviderSelect) {
-    ttsProviderSelect.value = String(tts.provider || "edge").trim() || "edge";
+    ttsProviderSelect.value = String(tts.provider || DEFAULT_TTS_PROVIDER).trim() || DEFAULT_TTS_PROVIDER;
   }
   if (ttsEdgeVoiceInput) {
-    ttsEdgeVoiceInput.value = String(tts.edge?.voice || "").trim();
+    ttsEdgeVoiceInput.value = String(tts.edge?.voice || "").trim() || DEFAULT_EDGE_TTS_VOICE;
   }
   if (ttsOpenaiModelInput) {
-    ttsOpenaiModelInput.value = String(tts.openai?.model || "").trim();
+    ttsOpenaiModelInput.value = String(tts.openai?.model || "").trim() || DEFAULT_OPENAI_TTS_MODEL;
   }
   if (ttsOpenaiVoiceInput) {
-    ttsOpenaiVoiceInput.value = String(tts.openai?.voice || "").trim();
+    ttsOpenaiVoiceInput.value = String(tts.openai?.voice || "").trim() || DEFAULT_OPENAI_TTS_VOICE;
   }
   if (ttsKokoroBaseUrlInput) {
-    ttsKokoroBaseUrlInput.value = String(tts.kokoro?.base_url || "").trim();
+    ttsKokoroBaseUrlInput.value = String(tts.kokoro?.base_url || "").trim() || DEFAULT_KOKORO_BASE_URL;
   }
   if (ttsKokoroVoiceInput) {
-    ttsKokoroVoiceInput.value = String(tts.kokoro?.voice || "").trim();
+    ttsKokoroVoiceInput.value = String(tts.kokoro?.voice || "").trim() || DEFAULT_KOKORO_VOICE;
   }
 
   const stt = config.stt || {};
@@ -1003,17 +1009,17 @@ function buildRuntimeConfigPayload() {
       api_mode: String(runtimeApiModeSelect?.value || "").trim(),
     },
     tts: {
-      provider: String(ttsProviderSelect?.value || "edge").trim() || "edge",
+      provider: String(ttsProviderSelect?.value || DEFAULT_TTS_PROVIDER).trim() || DEFAULT_TTS_PROVIDER,
       edge: {
-        voice: String(ttsEdgeVoiceInput?.value || "").trim(),
+        voice: String(ttsEdgeVoiceInput?.value || "").trim() || DEFAULT_EDGE_TTS_VOICE,
       },
       openai: {
-        model: String(ttsOpenaiModelInput?.value || "").trim(),
-        voice: String(ttsOpenaiVoiceInput?.value || "").trim(),
+        model: String(ttsOpenaiModelInput?.value || "").trim() || DEFAULT_OPENAI_TTS_MODEL,
+        voice: String(ttsOpenaiVoiceInput?.value || "").trim() || DEFAULT_OPENAI_TTS_VOICE,
       },
       kokoro: {
-        base_url: String(ttsKokoroBaseUrlInput?.value || "").trim(),
-        voice: String(ttsKokoroVoiceInput?.value || "").trim(),
+        base_url: String(ttsKokoroBaseUrlInput?.value || "").trim() || DEFAULT_KOKORO_BASE_URL,
+        voice: String(ttsKokoroVoiceInput?.value || "").trim() || DEFAULT_KOKORO_VOICE,
       },
     },
     stt: {

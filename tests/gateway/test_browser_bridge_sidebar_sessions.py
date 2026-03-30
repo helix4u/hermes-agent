@@ -322,3 +322,49 @@ async def test_browser_bridge_runtime_config_get_survives_codex_status_probe(tmp
 
     assert result["ok"] is True
     assert "openai-codex" in provider_status
+
+
+@pytest.mark.asyncio
+async def test_browser_bridge_runtime_config_save_restores_runtime_voice_defaults(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+
+    result = await runner._handle_browser_bridge_session(
+        {
+            "action": "runtime_config_save",
+            "selected_provider": "openrouter",
+            "config_patch": {
+                "tts": {
+                    "provider": "",
+                    "edge": {"voice": ""},
+                    "openai": {"model": "", "voice": ""},
+                    "kokoro": {"base_url": "", "voice": ""},
+                },
+                "stt": {
+                    "provider": "",
+                    "local": {"model": ""},
+                    "openai": {"model": ""},
+                },
+                "terminal": {
+                    "backend": "",
+                    "windows_shell": "",
+                    "cwd": "",
+                },
+            },
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["config"]["tts"]["provider"] == "edge"
+    assert result["config"]["tts"]["edge"]["voice"] == "en-US-AriaNeural"
+    assert result["config"]["tts"]["openai"]["model"] == "gpt-4o-mini-tts"
+    assert result["config"]["tts"]["openai"]["voice"] == "alloy"
+    assert result["config"]["tts"]["kokoro"]["base_url"] == "http://localhost:8880"
+    assert result["config"]["tts"]["kokoro"]["voice"] == "af_sky+af_v0+af_nicole"
+    assert result["config"]["stt"]["provider"] == "local"
+    assert result["config"]["stt"]["local"]["model"] == "base"
+    assert result["config"]["stt"]["openai"]["model"] == "whisper-1"
+    assert result["config"]["terminal"]["backend"] == "local"
+    assert result["config"]["terminal"]["windows_shell"] == "auto"
+    assert result["config"]["terminal"]["cwd"] == "."

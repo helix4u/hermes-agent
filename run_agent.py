@@ -3281,6 +3281,29 @@ class AIAgent:
         if not text:
             return ""
 
+        f5_markers = (
+            "f5 tts",
+            "f5tts",
+            "f5-tts",
+            "localhost:8081",
+            "/api/v1/voices/list",
+            "/api/v1/tts/synthesize",
+            "voice_profile",
+            "f5 voice",
+            "use f5",
+        )
+        if any(marker in text for marker in f5_markers):
+            return (
+                "Skill routing hint for this turn: this request strongly matches the installed "
+                "skill `f5-tts`. FIRST load it with skill_view('f5-tts') before other tools. "
+                "Treat the explicit F5 request as overriding the default TTS provider for this "
+                "turn. Prefer the local F5 FastAPI workflow and direct F5 API auth over the "
+                "configured default `text_to_speech` provider unless the user explicitly says "
+                "the default voice is fine. Do not reuse Kokoro voice IDs like `af_sky` as F5 "
+                "`voice_profile` values; list `/api/v1/voices/list` first and use a real F5 "
+                "profile name from that response."
+            )
+
         kokoro_markers = (
             "kokoro",
             "kokoro-fastapi",

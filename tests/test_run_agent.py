@@ -974,6 +974,33 @@ class TestBuildSkillRoutingHint:
         assert "skill_view('kokoro-tts')" in hint
         assert "`text_to_speech` provider `kokoro`" in hint
 
+    def test_f5_request_prefers_f5_skill_and_disallows_kokoro_voice_ids(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "skill_view", "text_to_speech"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent.client = MagicMock()
+
+        hint = agent._build_skill_routing_hint(
+            "Use F5 TTS on localhost:8081, podcast that shit, and do not use af_sky."
+        )
+
+        assert "skill `f5-tts`" in hint
+        assert "FIRST load it with skill_view('f5-tts')" in hint
+        assert "overriding the default TTS provider" in hint
+        assert "Do not reuse Kokoro voice IDs like `af_sky`" in hint
+        assert "list `/api/v1/voices/list` first" in hint
+
     def test_youtube_request_prefers_canonical_ytdlp_skill(self):
         with (
             patch(
