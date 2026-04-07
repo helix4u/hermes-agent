@@ -12,6 +12,7 @@ from hermes_cli.auth import (
     AuthError,
     DEFAULT_CODEX_BASE_URL,
     PROVIDER_REGISTRY,
+    _refresh_codex_auth_tokens,
     _codex_device_code_login,
     _read_codex_tokens,
     _save_codex_tokens,
@@ -160,6 +161,68 @@ def test_import_codex_cli_tokens(tmp_path, monkeypatch):
 def test_import_codex_cli_tokens_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent"))
     assert _import_codex_cli_tokens() is None
+
+
+def test_import_codex_cli_tokens_skips_expired_access_token(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex-cli"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    expired = _jwt_with_exp(int(time.time()) - 60)
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {"access_token": expired, "refresh_token": "cli-rt"},
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert _import_codex_cli_tokens() is None
+
+
+def test_get_codex_auth_status_includes_api_key(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="access-visible", refresh_token="refresh")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    status = get_codex_auth_status()
+
+    assert status["logged_in"] is True
+    assert status["api_key"] == "access-visible"
+
+
+def test_refresh_codex_auth_tokens_reused_refresh_token_has_actionable_message(monkeypatch):
+    class _FakeResponse:
+        status_code = 400
+
+        @staticmethod
+        def json():
+            return {
+                "error": "refresh_token_reused",
+                "error_description": "already consumed",
+            }
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        @staticmethod
+        def post(*args, **kwargs):
+            return _FakeResponse()
+
+    monkeypatch.setattr("hermes_cli.auth.httpx.Client", _FakeClient)
+
+    with pytest.raises(AuthError) as exc:
+        _refresh_codex_auth_tokens(
+            {"access_token": "old-access", "refresh_token": "old-refresh"},
+            timeout_seconds=5,
+        )
+
+    assert exc.value.code == "refresh_token_reused"
+    assert exc.value.relogin_required is True
+    assert "Run `codex` in your terminal" in str(exc.value)
+    assert "then run `hermes auth`" in str(exc.value)
 
 
 def test_resolve_codex_runtime_credentials_does_not_auto_migrate_shared_codex_auth(tmp_path, monkeypatch):

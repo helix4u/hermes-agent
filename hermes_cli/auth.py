@@ -950,6 +950,14 @@ def _refresh_codex_auth_tokens(
             pass
         if code in {"invalid_grant", "invalid_token", "invalid_request"}:
             relogin_required = True
+        if code == "refresh_token_reused":
+            message = (
+                "Codex refresh token was already consumed by another client "
+                "(e.g. Codex CLI or VS Code extension). "
+                "Run `codex` in your terminal to generate fresh tokens, "
+                "then run `hermes auth` to re-authenticate."
+            )
+            relogin_required = True
         raise AuthError(
             message,
             provider="openai-codex",
@@ -989,7 +997,8 @@ def _refresh_codex_auth_tokens(
 def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     """Try to read tokens from ~/.codex/auth.json (Codex CLI shared file).
     
-    Returns tokens dict if valid, None otherwise. Does NOT write to the shared file.
+    Returns tokens dict if valid and not expired, None otherwise.
+    Does NOT write to the shared file.
     """
     codex_home = os.getenv("CODEX_HOME", "").strip()
     if not codex_home:
@@ -1002,7 +1011,12 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         tokens = payload.get("tokens")
         if not isinstance(tokens, dict):
             return None
-        if not tokens.get("access_token") or not tokens.get("refresh_token"):
+        access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
+        if not access_token or not refresh_token:
+            return None
+        if _codex_access_token_is_expiring(access_token, 0):
+            logger.debug("Codex CLI tokens at %s are expired; skipping import.", auth_path)
             return None
         return dict(tokens)
     except Exception:
@@ -1680,6 +1694,7 @@ def get_codex_auth_status() -> Dict[str, Any]:
             "last_refresh": creds.get("last_refresh"),
             "auth_mode": creds.get("auth_mode"),
             "source": creds.get("source"),
+            "api_key": creds.get("api_key"),
             "session_origin": creds.get("session_origin") or CODEX_SESSION_ORIGIN_LEGACY,
         }
     except AuthError as exc:
@@ -2056,8 +2071,8 @@ def _save_model_choice(model_id: str) -> None:
 def login_command(args) -> None:
     """Deprecated: use 'hermes model' or 'hermes setup' instead."""
     print("The 'hermes login' command has been removed.")
-    print("Use 'hermes model' to select a provider and model,")
-    print("or 'hermes setup' for full interactive setup.")
+    print("Use 'hermes auth' to manage credentials,")
+    print("'hermes model' to select a provider, or 'hermes setup' for full setup.")
     raise SystemExit(0)
 
 
@@ -2067,17 +2082,25 @@ def _login_openai_codex(args, pconfig: ProviderConfig) -> None:
     # Check for existing Hermes-owned credentials
     try:
         existing = resolve_codex_runtime_credentials()
-        print("Existing Codex credentials found in Hermes auth store.")
-        try:
-            reuse = input("Use existing credentials? [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            reuse = "y"
-        if reuse in ("", "y", "yes"):
-            config_path = _update_config_for_provider("openai-codex", existing.get("base_url", DEFAULT_CODEX_BASE_URL))
-            print()
-            print("Login successful!")
-            print(f"  Config updated: {config_path} (model.provider=openai-codex)")
-            return
+        resolved_key = existing.get("api_key", "")
+        if (
+            isinstance(resolved_key, str)
+            and resolved_key
+            and not _codex_access_token_is_expiring(resolved_key, 60)
+        ):
+            print("Existing Codex credentials found in Hermes auth store.")
+            try:
+                reuse = input("Use existing credentials? [Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                reuse = "y"
+            if reuse in ("", "y", "yes"):
+                config_path = _update_config_for_provider("openai-codex", existing.get("base_url", DEFAULT_CODEX_BASE_URL))
+                print()
+                print("Login successful!")
+                print(f"  Config updated: {config_path} (model.provider=openai-codex)")
+                return
+        else:
+            print("Existing Codex credentials are expired. Starting fresh login...")
     except AuthError:
         pass
 

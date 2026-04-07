@@ -3529,11 +3529,15 @@ class AIAgent:
 
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
+        import httpx as _httpx
+
         active_client = client or self._ensure_primary_openai_client(reason="codex_stream_direct")
         max_stream_retries = 1
         has_tool_calls = False
         first_delta_fired = False
+        self._codex_streamed_text_parts = []
         for attempt in range(max_stream_retries + 1):
+            collected_output_items = []
             try:
                 with active_client.responses.stream(**api_kwargs) as stream:
                     for event in stream:
@@ -3543,6 +3547,8 @@ class AIAgent:
                         # Fire callbacks on text content deltas (suppress during tool calls)
                         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
                             delta_text = getattr(event, "delta", "")
+                            if delta_text:
+                                self._codex_streamed_text_parts.append(delta_text)
                             if delta_text and not has_tool_calls:
                                 if not first_delta_fired:
                                     first_delta_fired = True
@@ -3560,7 +3566,64 @@ class AIAgent:
                             reasoning_text = getattr(event, "delta", "")
                             if reasoning_text:
                                 self._fire_reasoning_delta(reasoning_text)
-                    return stream.get_final_response()
+                        elif event_type == "response.output_item.done":
+                            done_item = getattr(event, "item", None)
+                            if done_item is not None:
+                                collected_output_items.append(done_item)
+                        elif event_type in ("response.incomplete", "response.failed"):
+                            resp_obj = getattr(event, "response", None)
+                            status = getattr(resp_obj, "status", None) if resp_obj else None
+                            incomplete_details = getattr(resp_obj, "incomplete_details", None) if resp_obj else None
+                            logger.warning(
+                                "Codex Responses stream received terminal event %s "
+                                "(status=%s, incomplete_details=%s, streamed_chars=%d). %s",
+                                event_type,
+                                status,
+                                incomplete_details,
+                                sum(len(part) for part in self._codex_streamed_text_parts),
+                                self._client_log_context(),
+                            )
+                    final_response = stream.get_final_response()
+                    output_items = getattr(final_response, "output", None)
+                    if isinstance(output_items, list) and not output_items:
+                        if collected_output_items:
+                            final_response.output = list(collected_output_items)
+                            logger.debug(
+                                "Codex stream: backfilled %d output items from stream events",
+                                len(collected_output_items),
+                            )
+                        elif self._codex_streamed_text_parts and not has_tool_calls:
+                            assembled = "".join(self._codex_streamed_text_parts)
+                            final_response.output = [
+                                SimpleNamespace(
+                                    type="message",
+                                    role="assistant",
+                                    status="completed",
+                                    content=[SimpleNamespace(type="output_text", text=assembled)],
+                                )
+                            ]
+                            logger.debug(
+                                "Codex stream: synthesized output from %d text deltas (%d chars)",
+                                len(self._codex_streamed_text_parts),
+                                len(assembled),
+                            )
+                    return final_response
+            except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                if attempt < max_stream_retries:
+                    logger.debug(
+                        "Codex Responses stream transport failed (attempt %s/%s); retrying. %s error=%s",
+                        attempt + 1,
+                        max_stream_retries + 1,
+                        self._client_log_context(),
+                        exc,
+                    )
+                    continue
+                logger.debug(
+                    "Codex Responses stream transport failed; falling back to create(stream=True). %s error=%s",
+                    self._client_log_context(),
+                    exc,
+                )
+                return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
             except RuntimeError as exc:
                 err_text = str(exc)
                 missing_completed = "response.completed" in err_text
@@ -6365,6 +6428,16 @@ class AIAgent:
                             response_invalid = True
                             error_details.append("response.output is not a list")
                         elif len(output_items) == 0:
+                            resp_status = getattr(response, "status", None)
+                            resp_incomplete = getattr(response, "incomplete_details", None)
+                            logging.warning(
+                                "Codex response.output is empty after stream backfill "
+                                "(status=%s, incomplete_details=%s, model=%s). %s",
+                                resp_status,
+                                resp_incomplete,
+                                getattr(response, "model", None),
+                                f"api_mode={self.api_mode} provider={self.provider}",
+                            )
                             response_invalid = True
                             error_details.append("response.output is empty")
                     elif self.api_mode == "anthropic_messages":
@@ -6971,11 +7044,17 @@ class AIAgent:
                         self._vprint(f"{self.log_prefix}   🌐 Endpoint: {_base}", force=True)
                         # Actionable guidance for common auth errors
                         if status_code in (401, 403) or "unauthorized" in error_msg or "forbidden" in error_msg or "permission" in error_msg:
-                            self._vprint(f"{self.log_prefix}   💡 Your API key was rejected by the provider. Check:", force=True)
-                            self._vprint(f"{self.log_prefix}      • Is the key valid? Run: hermes setup", force=True)
-                            self._vprint(f"{self.log_prefix}      • Does your account have access to {_model}?", force=True)
-                            if "openrouter" in str(_base).lower():
-                                self._vprint(f"{self.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
+                            if _provider == "openai-codex" and status_code == 401:
+                                self._vprint(f"{self.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
+                                self._vprint(f"{self.log_prefix}      refreshed by another client (Codex CLI, VS Code). To fix:", force=True)
+                                self._vprint(f"{self.log_prefix}      1. Run `codex` in your terminal to generate fresh tokens.", force=True)
+                                self._vprint(f"{self.log_prefix}      2. Then run `hermes auth` to re-authenticate.", force=True)
+                            else:
+                                self._vprint(f"{self.log_prefix}   💡 Your API key was rejected by the provider. Check:", force=True)
+                                self._vprint(f"{self.log_prefix}      • Is the key valid? Run: hermes setup", force=True)
+                                self._vprint(f"{self.log_prefix}      • Does your account have access to {_model}?", force=True)
+                                if "openrouter" in str(_base).lower():
+                                    self._vprint(f"{self.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
                         else:
                             self._vprint(f"{self.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
                         logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}")
