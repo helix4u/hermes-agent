@@ -4,11 +4,24 @@ All notable user-visible changes to this project are documented here. Agents and
 
 ## Unreleased
 
+### Memory
+
+- **Hermes-local Honcho disable**: Added a Hermes-only `honcho.enabled: false` override in `~/.hermes/config.yaml`, so shared `~/.honcho/config.json` setups can stay active for other tools without auto-enabling Honcho inside Hermes.
+
 ### Authentication
 
 - **Codex re-auth ownership**: Expired OpenAI Codex sessions no longer silently import fresh credentials from `~/.codex` during runtime refresh or status/model checks. Hermes now treats Hermes-owned re-auth as the authoritative recovery path and keeps shared Codex auth import limited to explicit import flows.
 - **Codex device auth retry**: Hermes now retries the OpenAI Codex device-code login once with a fresh code when the one-time authorization-code exchange is rejected as consumed/invalid, which avoids the common "already used" dead-end that previously forced a logout/login cycle.
 - **Codex status visibility**: `hermes status` now shows whether the current Codex session is Hermes-owned, a migrated shared session, or an explicitly imported shared session.
+- **Codex CLI import hardening**: Hermes now skips expired tokens when inspecting `~/.codex/auth.json`, refuses to report success for already-expired stored Codex sessions, and surfaces a clearer recovery path when another client has already consumed the refresh token.
+- **Codex auth UX wording**: Code paths and docs that previously pointed users at the removed `hermes login` flow now consistently direct them to `hermes auth`.
+
+### Runtime
+
+- **Context pressure wording**: Context-pressure notices now show actual context-window usage, explain the compaction threshold in plain language, and wait until the conversation is meaningfully closer to compaction before surfacing the heads-up.
+- **Codex stream recovery**: Streaming Responses API calls now recover assistant output from `response.output_item.done` events or streamed text deltas when the final SDK response arrives with an empty `output` list, which fixes otherwise-valid Codex replies being rejected as malformed.
+- **Temporal grounding without cache churn**: Hermes no longer bakes a frozen "Conversation started" timestamp into the cached system prompt. Relative-date grounding now comes from a compact per-turn runtime facts note (`today`, `yesterday`, local datetime, timezone, active working directory) attached at API-call time, and those runtime facts explicitly outrank stale dates found in memory, context files, Honcho recall, or prior transcript text.
+- **Prompt-cache-safe runtime hints**: Turn-varying shell hints and skill-routing nudges now ride on the live user message instead of being concatenated onto the system prompt, which keeps Anthropic/OpenRouter prefix caching effective across turns.
 
 ### Browser sidecar (Chrome extension)
 
@@ -50,6 +63,10 @@ All notable user-visible changes to this project are documented here. Agents and
 - **Per-command shell override**: The terminal tool now supports a Windows-only `shell_mode` override so advanced flows can deliberately mix `cmd`, PowerShell, and WSL work in one broader task.
 - **README sync**: Updated the README to describe this repo as a custom fork, document native Windows usage without WSL, and call out the browser sidecar/control-room workflow instead of upstream-only assumptions.
 - **Cross-session scaffolding**: Added `docs/repo-map.md`, `docs/todo.md`, `docs/tool-registry.md`, and the new `terminal-shell-orchestration` skill so future sessions have a lighter-weight map of the repo, goals, and shell/tool nuances.
+
+### Plugins
+
+- **Project plugin proof of concept: youtube-intake**: Added a repo-local project plugin at `.hermes/plugins/youtube-intake/` that exposes a `youtube_digest` tool for Windows-safe YouTube transcript intake. It prefers `youtube_transcript_api`, falls back to `yt-dlp` auto-subs, writes artifacts under `TMP/youtube-intake/<video_id>/`, and cleans up the stray `#data/tmp/yt` subtitle fallout seen in native Windows ad hoc runs. Enable with `HERMES_ENABLE_PROJECT_PLUGINS=1`.
 
 ### Skills
 

@@ -737,6 +737,8 @@ _DIM_ANSI = "\033[2m"
 _BAR_FILLED = "▰"
 _BAR_EMPTY = "▱"
 _BAR_WIDTH = 20
+CONTEXT_PRESSURE_INFO_PROGRESS = 0.80
+CONTEXT_PRESSURE_WARNING_PROGRESS = 0.95
 
 
 def format_context_pressure(
@@ -747,12 +749,12 @@ def format_context_pressure(
 ) -> str:
     """Build a formatted context pressure line for CLI display.
 
-    The bar and percentage show progress toward the compaction threshold,
-    NOT the raw context window.  100% = compaction fires.
+    The bar and percentage show actual context-window usage so the meter matches
+    what users naturally expect at a glance.
 
     Uses ANSI colors:
-      - cyan at ~60% to compaction = informational
-      - bold yellow at ~85% to compaction = warning
+      - cyan once context is getting meaningfully close to compaction
+      - bold yellow when compaction is imminent
 
     Args:
         compaction_progress: How close to compaction (0.0–1.0, 1.0 = fires).
@@ -760,29 +762,31 @@ def format_context_pressure(
         threshold_percent: Compaction threshold as a fraction of context window.
         compression_enabled: Whether auto-compression is active.
     """
-    pct_int = int(compaction_progress * 100)
-    filled = min(int(compaction_progress * _BAR_WIDTH), _BAR_WIDTH)
+    window_progress = min(max(compaction_progress * threshold_percent, 0.0), 1.0)
+    pct_int = int(window_progress * 100)
+    filled = min(int(window_progress * _BAR_WIDTH), _BAR_WIDTH)
     bar = _BAR_FILLED * filled + _BAR_EMPTY * (_BAR_WIDTH - filled)
 
     threshold_k = f"{threshold_tokens // 1000}k" if threshold_tokens >= 1000 else str(threshold_tokens)
     threshold_pct_int = int(threshold_percent * 100)
+    remaining_to_compaction_pct = max(int((threshold_percent - window_progress) * 100), 0)
 
     # Tier styling
-    if compaction_progress >= 0.85:
+    if compaction_progress >= CONTEXT_PRESSURE_WARNING_PROGRESS:
         color = f"{_BOLD}{_YELLOW}"
         icon = "⚠"
         if compression_enabled:
-            hint = "compaction imminent"
+            hint = f"about {remaining_to_compaction_pct}% left before compaction"
         else:
             hint = "no auto-compaction"
     else:
         color = _CYAN
         icon = "◐"
-        hint = "approaching compaction"
+        hint = f"about {remaining_to_compaction_pct}% left before compaction"
 
     return (
-        f"  {color}{icon} context {bar} {pct_int}% to compaction{_ANSI_RESET}"
-        f"  {_DIM_ANSI}{threshold_k} threshold ({threshold_pct_int}%) · {hint}{_ANSI_RESET}"
+        f"  {color}{icon} context {bar} {pct_int}% of window used{_ANSI_RESET}"
+        f"  {_DIM_ANSI}compacts at {threshold_pct_int}% ({threshold_k} tokens) · {hint}{_ANSI_RESET}"
     )
 
 
@@ -794,22 +798,30 @@ def format_context_pressure_gateway(
     """Build a plain-text context pressure notification for messaging platforms.
 
     No ANSI — just Unicode and plain text suitable for Telegram/Discord/etc.
-    The percentage shows progress toward the compaction threshold.
+    The percentage shows actual context-window usage.
     """
-    pct_int = int(compaction_progress * 100)
-    filled = min(int(compaction_progress * _BAR_WIDTH), _BAR_WIDTH)
+    window_progress = min(max(compaction_progress * threshold_percent, 0.0), 1.0)
+    pct_int = int(window_progress * 100)
+    filled = min(int(window_progress * _BAR_WIDTH), _BAR_WIDTH)
     bar = _BAR_FILLED * filled + _BAR_EMPTY * (_BAR_WIDTH - filled)
 
     threshold_pct_int = int(threshold_percent * 100)
+    remaining_to_compaction_pct = max(int((threshold_percent - window_progress) * 100), 0)
 
-    if compaction_progress >= 0.85:
+    if compaction_progress >= CONTEXT_PRESSURE_WARNING_PROGRESS:
         icon = "⚠️"
         if compression_enabled:
-            hint = f"Context compaction is imminent (threshold: {threshold_pct_int}% of window)."
+            hint = (
+                f"Auto-compaction starts at {threshold_pct_int}% of the context window. "
+                f"About {remaining_to_compaction_pct}% remains before compaction."
+            )
         else:
             hint = "Auto-compaction is disabled — context may be truncated."
     else:
         icon = "ℹ️"
-        hint = f"Compaction threshold is at {threshold_pct_int}% of context window."
+        hint = (
+            f"Auto-compaction starts at {threshold_pct_int}% of the context window. "
+            f"About {remaining_to_compaction_pct}% remains before compaction."
+        )
 
-    return f"{icon} Context: {bar} {pct_int}% to compaction\n{hint}"
+    return f"{icon} Context: {bar} {pct_int}% of window used\n{hint}"

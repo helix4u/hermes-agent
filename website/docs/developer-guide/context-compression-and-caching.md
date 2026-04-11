@@ -33,6 +33,12 @@ This is implemented in `agent/prompt_caching.py`.
 
 Prompt caching only helps when the stable prefix remains stable. That is why Hermes avoids rebuilding or mutating the core system prompt mid-session unless it has to.
 
+In practice this also means:
+
+- do not bake live clock data into the cached system prompt
+- do not concatenate turn-specific shell hints or routing nudges onto the system prompt
+- attach turn-varying runtime context to API-call-time overlays or the current-turn user message instead
+
 ## Compression trigger
 
 Hermes can compress context when conversations become large. Configuration defaults live in `config.yaml`, and the compressor also has runtime checks based on actual prompt token counts.

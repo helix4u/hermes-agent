@@ -36,7 +36,7 @@ The cached system prompt is assembled in roughly this order:
 6. frozen USER profile snapshot
 7. skills index
 8. context files (`AGENTS.md`, `.cursorrules`, `.cursor/rules/*.mdc`) — SOUL.md is **not** included here when it was already loaded as the identity in step 1
-9. timestamp / optional session ID
+9. stable session metadata (optional session ID, model, provider)
 10. platform hint
 
 When `skip_context_files` is set (e.g., subagent delegation), SOUL.md is not loaded and the hardcoded `DEFAULT_AGENT_IDENTITY` is used instead.
@@ -49,8 +49,20 @@ These are intentionally *not* persisted as part of the cached system prompt:
 - prefill messages
 - gateway-derived session context overlays
 - later-turn Honcho recall injected into the current-turn user message
+- runtime time-grounding facts (`today`, `yesterday`, local datetime, timezone, active working directory)
+- turn-varying shell/runtime hints
+- turn-varying skill-routing nudges
 
 This separation keeps the stable prefix stable for caching.
+
+## Temporal grounding
+
+Hermes treats current time as **runtime context**, not historical context.
+
+- The cached system prompt no longer stores a frozen "Conversation started" timestamp.
+- Relative-date grounding is injected per turn so long-running or resumed sessions do not keep answering from a stale startup clock.
+- Runtime facts explicitly outrank dates mentioned in memory, context files, Honcho recall, and earlier transcript text.
+- This keeps "today"/"yesterday"/"latest" tasks grounded in host reality without rebuilding the cached system prompt.
 
 ## Memory snapshots
 

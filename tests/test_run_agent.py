@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import uuid
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
@@ -680,10 +681,36 @@ class TestBuildSystemPrompt:
         prompt = agent._build_system_prompt()
         assert MEMORY_GUIDANCE not in prompt
 
-    def test_includes_datetime(self, agent):
+    def test_excludes_runtime_datetime(self, agent):
         prompt = agent._build_system_prompt()
-        # Should contain current date info like "Conversation started:"
-        assert "Conversation started:" in prompt
+        assert "Conversation started:" not in prompt
+
+
+class TestBuildRuntimeFactsNote:
+    def test_includes_runtime_date_timezone_and_authority_rule(self, agent):
+        mocked_now = datetime(2026, 4, 10, 22, 12, tzinfo=timezone.utc)
+
+        with (
+            patch("run_agent._hermes_now", return_value=mocked_now),
+            patch("run_agent._hermes_timezone_name", return_value="UTC"),
+            patch("run_agent.os.getcwd", return_value="/workspace/project"),
+            patch.dict(
+                "os.environ",
+                {"TERMINAL_CWD": "", "MESSAGING_CWD": ""},
+                clear=False,
+            ),
+        ):
+            note = agent._build_runtime_facts_note()
+
+        assert "Runtime facts for this turn" in note
+        assert "Today: 2026-04-10" in note
+        assert "Yesterday: 2026-04-09" in note
+        assert "Timezone: UTC" in note
+        assert "Active working directory:" in note
+        assert "workspace" in note
+        assert "project" in note
+        assert "outweigh" not in note
+        assert "outrank dates mentioned in memory" in note
 
 
 class TestBuildEnvironmentHint:
@@ -1434,6 +1461,27 @@ class TestHandleMaxIterations:
         kwargs = agent.client.chat.completions.create.call_args.kwargs
         assert "reasoning" not in kwargs.get("extra_body", {})
 
+    def test_summary_runtime_overlays_do_not_mutate_system_message(self, agent):
+        resp = _mock_response(content="Summary")
+        agent.client.chat.completions.create.return_value = resp
+        agent._cached_system_prompt = "Stable system prompt"
+        messages = [{"role": "user", "content": "do stuff"}]
+
+        with (
+            patch.object(agent, "_build_environment_hint", return_value="ENV HINT"),
+            patch.object(agent, "_build_runtime_facts_note", return_value="RUNTIME FACTS"),
+        ):
+            result = agent._handle_max_iterations(messages, 60)
+
+        assert result == "Summary"
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        api_messages = kwargs["messages"]
+        assert api_messages[0]["content"] == "Stable system prompt"
+        assert "ENV HINT" not in api_messages[0]["content"]
+        assert "RUNTIME FACTS" not in api_messages[0]["content"]
+        assert "ENV HINT" in api_messages[-1]["content"]
+        assert "RUNTIME FACTS" in api_messages[-1]["content"]
+
 
 class TestRunConversation:
     """Tests for the main run_conversation method.
@@ -1462,6 +1510,34 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_runtime_overlays_attach_to_user_message_not_system(self, agent):
+        self._setup_agent(agent)
+        agent._cached_system_prompt = "Stable system prompt"
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_build_environment_hint", return_value="ENV HINT"),
+            patch.object(agent, "_build_skill_routing_hint", return_value="SKILL HINT"),
+            patch.object(agent, "_build_runtime_facts_note", return_value="RUNTIME FACTS"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        call_kwargs = agent.client.chat.completions.create.call_args.kwargs
+        api_messages = call_kwargs["messages"]
+        assert api_messages[0]["role"] == "system"
+        assert api_messages[0]["content"] == "Stable system prompt"
+        current_user = api_messages[-1]
+        assert current_user["role"] == "user"
+        assert "hello" in current_user["content"]
+        assert "ENV HINT" in current_user["content"]
+        assert "SKILL HINT" in current_user["content"]
+        assert "RUNTIME FACTS" in current_user["content"]
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
@@ -2072,7 +2148,8 @@ class TestSystemPromptStability:
             result = agent.run_conversation("synthetic flush turn", sync_honcho=False)
 
         assert result["completed"] is True
-        assert captured["messages"][-1]["content"] == "synthetic flush turn"
+        current_user = captured["messages"][-1]["content"]
+        assert "synthetic flush turn" in current_user
         mock_sync.assert_not_called()
         mock_prefetch.assert_not_called()
 

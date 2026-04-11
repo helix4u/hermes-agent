@@ -25,24 +25,24 @@ from run_agent import AIAgent
 class TestFormatContextPressure:
     """CLI context pressure display (agent/display.py).
 
-    The bar shows progress toward the compaction threshold, not the
-    raw context window.  60% = 60% of the way to compaction.
+    The bar shows actual window usage, while the hint explains where the
+    compaction threshold sits.
     """
 
     def test_60_percent_uses_info_icon(self):
         line = format_context_pressure(0.60, 100_000, 0.50)
         assert "◐" in line
-        assert "60% to compaction" in line
+        assert "30% of window used" in line
 
     def test_85_percent_uses_warning_icon(self):
-        line = format_context_pressure(0.85, 100_000, 0.50)
+        line = format_context_pressure(0.95, 100_000, 0.50)
         assert "⚠" in line
-        assert "85% to compaction" in line
+        assert "47% of window used" in line
 
     def test_bar_length_scales_with_progress(self):
         line_60 = format_context_pressure(0.60, 100_000, 0.50)
-        line_85 = format_context_pressure(0.85, 100_000, 0.50)
-        assert line_85.count("▰") > line_60.count("▰")
+        line_95 = format_context_pressure(0.95, 100_000, 0.50)
+        assert line_95.count("▰") > line_60.count("▰")
 
     def test_shows_threshold_tokens(self):
         line = format_context_pressure(0.60, 100_000, 0.50)
@@ -53,19 +53,19 @@ class TestFormatContextPressure:
         assert "500" in line
 
     def test_shows_threshold_percent(self):
-        line = format_context_pressure(0.85, 100_000, 0.50)
+        line = format_context_pressure(0.95, 100_000, 0.50)
         assert "50%" in line  # threshold percent shown
 
     def test_imminent_hint_at_85(self):
-        line = format_context_pressure(0.85, 100_000, 0.50)
-        assert "compaction imminent" in line
+        line = format_context_pressure(0.95, 100_000, 0.50)
+        assert "about 2% left before compaction" in line
 
     def test_approaching_hint_below_85(self):
         line = format_context_pressure(0.60, 100_000, 0.80)
-        assert "approaching compaction" in line
+        assert "about 32% left before compaction" in line
 
     def test_no_compaction_when_disabled(self):
-        line = format_context_pressure(0.85, 100_000, 0.50, compression_enabled=False)
+        line = format_context_pressure(0.95, 100_000, 0.50, compression_enabled=False)
         assert "no auto-compaction" in line
 
     def test_returns_string(self):
@@ -76,7 +76,7 @@ class TestFormatContextPressure:
         """Progress > 1.0 should not break the bar."""
         line = format_context_pressure(1.05, 100_000, 0.50)
         assert "▰" in line
-        assert line.count("▰") == 20
+        assert line.count("▰") == 10
 
 
 class TestFormatContextPressureGateway:
@@ -84,16 +84,16 @@ class TestFormatContextPressureGateway:
 
     def test_60_percent_informational(self):
         msg = format_context_pressure_gateway(0.60, 0.50)
-        assert "60% to compaction" in msg
+        assert "30% of window used" in msg
         assert "50%" in msg  # threshold shown
 
     def test_85_percent_warning(self):
-        msg = format_context_pressure_gateway(0.85, 0.50)
-        assert "85% to compaction" in msg
-        assert "imminent" in msg
+        msg = format_context_pressure_gateway(0.95, 0.50)
+        assert "47% of window used" in msg
+        assert "About 2% remains before compaction." in msg
 
     def test_no_compaction_warning(self):
-        msg = format_context_pressure_gateway(0.85, 0.50, compression_enabled=False)
+        msg = format_context_pressure_gateway(0.95, 0.50, compression_enabled=False)
         assert "disabled" in msg
 
     def test_no_ansi_codes(self):
@@ -101,7 +101,7 @@ class TestFormatContextPressureGateway:
         assert "\033[" not in msg
 
     def test_has_progress_bar(self):
-        msg = format_context_pressure_gateway(0.85, 0.50)
+        msg = format_context_pressure_gateway(0.95, 0.50)
         assert "▰" in msg
 
 
@@ -163,7 +163,7 @@ class TestContextPressureFlags:
         cb.assert_called_once()
         args = cb.call_args[0]
         assert args[0] == "context_pressure"
-        assert "85% to compaction" in args[1]
+        assert "42% of window used" in args[1]
 
     def test_emit_no_callback_no_crash(self, agent):
         """No status_callback set — should not crash."""
@@ -189,7 +189,7 @@ class TestContextPressureFlags:
         agent._emit_context_pressure(0.85, compressor)
         captured = capsys.readouterr()
         assert "▰" in captured.out
-        assert "to compaction" in captured.out
+        assert "of window used" in captured.out
 
     def test_emit_skips_print_for_gateway_platform(self, agent, capsys):
         """Gateway platforms get the callback, not CLI print."""

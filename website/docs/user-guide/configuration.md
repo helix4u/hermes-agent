@@ -936,28 +936,29 @@ Budget pressure is enabled by default. The agent sees warnings naturally as part
 
 ## Context Pressure Warnings
 
-Separate from iteration budget pressure, context pressure tracks how close the conversation is to the **compaction threshold** — the point where context compression fires to summarize older messages. This helps both you and the agent understand when the conversation is getting long.
+Separate from iteration budget pressure, context pressure tracks how full the **actual context window** is and reminds you when auto-compaction will kick in. That keeps the status readable at a glance instead of making you mentally convert "percent to compaction" into real window usage.
 
 | Progress | Level | What happens |
 |----------|-------|-------------|
-| **≥ 60%** to threshold | Info | CLI shows a cyan progress bar; gateway sends an informational notice |
-| **≥ 85%** to threshold | Warning | CLI shows a bold yellow bar; gateway warns compaction is imminent |
+| **≥ 80%** to threshold | Info | CLI shows a cyan progress bar; gateway sends a heads-up that compaction is getting closer |
+| **≥ 95%** to threshold | Warning | CLI shows a bold yellow bar; gateway warns compaction is imminent |
 
 In the CLI, context pressure appears as a progress bar in the tool output feed:
 
 ```
-  ◐ context ████████████░░░░░░░░ 62% to compaction  48k threshold (50%) · approaching compaction
+  ◐ context ▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱ 53% of window used  compacts at 85% (108k tokens) · about 32% left before compaction
 ```
 
 On messaging platforms, a plain-text notification is sent:
 
 ```
-◐ Context: ████████████░░░░░░░░ 62% to compaction (threshold: 50% of window).
+ℹ️ Context: ▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱ 53% of window used
+Auto-compaction starts at 85% of the context window. About 32% remains before compaction.
 ```
 
 If auto-compression is disabled, the warning tells you context may be truncated instead.
 
-Context pressure is automatic — no configuration needed. It fires purely as a user-facing notification and does not modify the message stream or inject anything into the model's context.
+Context pressure is automatic — no configuration needed. Hermes only surfaces it once the conversation is materially close to the compaction point, and it remains a user-facing notification only: it does not modify the message stream or inject anything into the model's context.
 
 ## Auxiliary Models
 

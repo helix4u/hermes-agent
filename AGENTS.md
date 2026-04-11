@@ -343,6 +343,9 @@ Activate with `/skin cyberpunk` or `display.skin: cyberpunk` in config.yaml.
 ---
 
 ## Important Policies
+
+Hermes core should never carry user-specific behavior.
+
 ### Prompt Caching Must Not Break
 
 Hermes-Agent ensures caching remains valid throughout a conversation. **Do NOT implement changes that would:**
@@ -351,6 +354,13 @@ Hermes-Agent ensures caching remains valid throughout a conversation. **Do NOT i
 - Reload memories or rebuild system prompts mid-conversation
 
 Cache-breaking forces dramatically higher costs. The ONLY time we alter context is during context compression.
+
+### Temporal Grounding
+
+Resolve "today", "yesterday", "latest", "current", and "now" from runtime facts, not from narrative inference.
+- Treat dates inside `MEMORY.md`, `SOUL.md`, `AGENTS.md`, Honcho/context injections, wiki pages, and prior transcripts as historical context, not authoritative evidence of the current day.
+- Keep time/date grounding in API-call-time overlays or current-turn message notes so the cached system prompt remains stable.
+- When a task is date-sensitive, runtime-injected local date/time/timezone facts outrank remembered or inferred dates.
 
 ### Working Directory Behavior
 - **CLI**: Uses current directory (`.` → `os.getcwd()`)

@@ -42,8 +42,9 @@ import uuid
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
 import fire
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from hermes_time import now as _hermes_now, get_timezone_name as _hermes_timezone_name
 
 try:
     from hermes_cli.colors import strip_ansi as _strip_cli_ansi
@@ -381,6 +382,25 @@ def _inject_honcho_turn_context(content, turn_context: str):
         "input.]\n\n"
         f"{turn_context}"
     )
+
+    if isinstance(content, list):
+        return list(content) + [{"type": "text", "text": note}]
+
+    text = "" if content is None else str(content)
+    if not text.strip():
+        return note
+    return f"{text}\n\n{note}"
+
+
+def _append_api_only_user_note(content, note: str):
+    """Append a system-authored note to the current-turn user message.
+
+    The returned content is sent to the API for this turn only. Keeping
+    runtime overlays attached to the live user message avoids mutating the
+    cached system prompt, which preserves prefix-cache stability.
+    """
+    if not note:
+        return content
 
     if isinstance(content, list):
         return list(content) + [{"type": "text", "text": note}]
@@ -2440,7 +2460,7 @@ class AIAgent:
         #   3. Persistent memory (frozen snapshot)
         #   4. Skills guidance (if skills tools are loaded)
         #   5. Context files (AGENTS.md, .cursorrules — SOUL.md excluded here when used as identity)
-        #   6. Current date & time (frozen at build time)
+        #   6. Stable session metadata
         #   7. Platform-specific formatting hint
 
         # Try SOUL.md as primary identity (unless context files are skipped)
@@ -2566,16 +2586,15 @@ class AIAgent:
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
 
-        from hermes_time import now as _hermes_now
-        now = _hermes_now()
-        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
+        metadata_lines = []
         if self.pass_session_id and self.session_id:
-            timestamp_line += f"\nSession ID: {self.session_id}"
+            metadata_lines.append(f"Session ID: {self.session_id}")
         if self.model:
-            timestamp_line += f"\nModel: {self.model}"
+            metadata_lines.append(f"Model: {self.model}")
         if self.provider:
-            timestamp_line += f"\nProvider: {self.provider}"
-        prompt_parts.append(timestamp_line)
+            metadata_lines.append(f"Provider: {self.provider}")
+        if metadata_lines:
+            prompt_parts.append("\n".join(metadata_lines))
 
         # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
         # of the requested model. Inject explicit model identity into the system prompt
@@ -2594,6 +2613,85 @@ class AIAgent:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
 
         return "\n\n".join(prompt_parts)
+
+    def _runtime_workdir(self) -> str:
+        """Return the best current working directory hint for runtime notes."""
+        for candidate in (
+            os.getenv("TERMINAL_CWD", "").strip(),
+            os.getenv("MESSAGING_CWD", "").strip(),
+            os.getcwd(),
+        ):
+            if not candidate:
+                continue
+            try:
+                return str(Path(candidate).resolve())
+            except Exception:
+                return candidate
+        return ""
+
+    def _build_runtime_facts_note(self) -> str:
+        """Build a compact, per-turn time grounding note.
+
+        This note is injected at API-call time only so relative-date grounding
+        stays accurate without forcing a rebuild of the cached system prompt.
+        """
+        now = _hermes_now()
+        tz_name = _hermes_timezone_name().strip() or (now.tzname() or "server-local")
+        tz_suffix = now.tzname() or tz_name
+        timestamp = now.strftime("%Y-%m-%d %I:%M %p")
+        today = now.date().isoformat()
+        yesterday = (now.date() - timedelta(days=1)).isoformat()
+
+        lines = [
+            "[System note: Runtime facts for this turn. These facts outrank dates mentioned in memory, context files, Honcho recall, or earlier transcript text when resolving words like today, yesterday, latest, current, or now.]",
+            f"Local datetime: {timestamp} {tz_suffix}",
+            f"Timezone: {tz_name}",
+            f"Today: {today}",
+            f"Yesterday: {yesterday}",
+        ]
+
+        workdir = self._runtime_workdir()
+        if workdir:
+            lines.append(f"Active working directory: {workdir}")
+
+        return "\n".join(lines)
+
+    def _apply_current_turn_runtime_overlays(
+        self,
+        content,
+        user_message: str,
+        *,
+        include_honcho: bool = True,
+        include_skill_hint: bool = True,
+    ):
+        """Attach API-only runtime overlays to the live user message."""
+        updated = content
+
+        if include_honcho and self._honcho_turn_context:
+            updated = _inject_honcho_turn_context(updated, self._honcho_turn_context)
+
+        env_hint = self._build_environment_hint()
+        if env_hint:
+            updated = _append_api_only_user_note(
+                updated,
+                "[System note: Runtime shell/environment guidance for this turn only.]\n\n"
+                f"{env_hint}",
+            )
+
+        if include_skill_hint:
+            skill_routing_hint = self._build_skill_routing_hint(user_message)
+            if skill_routing_hint:
+                updated = _append_api_only_user_note(
+                    updated,
+                    "[System note: Tool/skill routing guidance for this turn only.]\n\n"
+                    f"{skill_routing_hint}",
+                )
+
+        runtime_facts = self._build_runtime_facts_note()
+        if runtime_facts:
+            updated = _append_api_only_user_note(updated, runtime_facts)
+
+        return updated
 
     # =========================================================================
     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
@@ -5836,7 +5934,17 @@ class AIAgent:
             "Please provide a final response summarizing what you've found and accomplished so far, "
             "without calling any more tools."
         )
-        messages.append({"role": "user", "content": summary_request})
+        messages.append(
+            {
+                "role": "user",
+                "content": self._apply_current_turn_runtime_overlays(
+                    summary_request,
+                    summary_request,
+                    include_honcho=False,
+                    include_skill_hint=False,
+                ),
+            }
+        )
 
         try:
             # Build API messages, stripping internal-only fields
@@ -5852,14 +5960,10 @@ class AIAgent:
                 api_messages.append(api_msg)
 
             effective_system = self._cached_system_prompt or ""
-            extra_ephemeral = []
             if self.ephemeral_system_prompt:
-                extra_ephemeral.append(self.ephemeral_system_prompt)
-            env_hint = self._build_environment_hint()
-            if env_hint:
-                extra_ephemeral.append(env_hint)
-            if extra_ephemeral:
-                effective_system = (effective_system + "\n\n" + "\n\n".join(extra_ephemeral)).strip()
+                effective_system = (
+                    effective_system + "\n\n" + self.ephemeral_system_prompt
+                ).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
             if self.prefill_messages:
@@ -6254,9 +6358,10 @@ class AIAgent:
             for idx, msg in enumerate(messages):
                 api_msg = msg.copy()
 
-                if idx == current_turn_user_idx and msg.get("role") == "user" and self._honcho_turn_context:
-                    api_msg["content"] = _inject_honcho_turn_context(
-                        api_msg.get("content", ""), self._honcho_turn_context
+                if idx == current_turn_user_idx and msg.get("role") == "user":
+                    api_msg["content"] = self._apply_current_turn_runtime_overlays(
+                        api_msg.get("content", ""),
+                        user_message,
                     )
 
                 # For ALL assistant messages, pass reasoning back to the API
@@ -6285,21 +6390,15 @@ class AIAgent:
                 api_messages.append(api_msg)
 
             # Build the final system message: cached prompt + ephemeral system prompt.
-            # Ephemeral additions are API-call-time only (not persisted to session DB).
-            # Honcho later-turn recall is intentionally kept OUT of the system prompt
-            # so the stable cache prefix remains unchanged.
+            # Only session-stable additions belong here. Turn-varying overlays
+            # (runtime facts, shell hints, skill routing, later-turn Honcho
+            # recall) are attached to the current-turn user message instead so
+            # the stable cache prefix remains unchanged.
             effective_system = active_system_prompt or ""
-            extra_ephemeral = []
             if self.ephemeral_system_prompt:
-                extra_ephemeral.append(self.ephemeral_system_prompt)
-            env_hint = self._build_environment_hint()
-            if env_hint:
-                extra_ephemeral.append(env_hint)
-            skill_routing_hint = self._build_skill_routing_hint(user_message)
-            if skill_routing_hint:
-                extra_ephemeral.append(skill_routing_hint)
-            if extra_ephemeral:
-                effective_system = (effective_system + "\n\n" + "\n\n".join(extra_ephemeral)).strip()
+                effective_system = (
+                    effective_system + "\n\n" + self.ephemeral_system_prompt
+                ).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -7480,18 +7579,24 @@ class AIAgent:
                     )
 
                     # ── Context pressure warnings (user-facing only) ──────────
-                    # Notify the user (NOT the LLM) as context approaches the
-                    # compaction threshold.  Thresholds are relative to where
-                    # compaction fires, not the raw context window.
+                    # Notify the user (NOT the LLM) only once the conversation
+                    # is materially close to compaction. The UI displays actual
+                    # context-window usage even though the internal math here is
+                    # still based on the compaction trigger.
                     # Does not inject into messages — just prints to CLI output
                     # and fires status_callback for gateway platforms.
                     if _compressor.threshold_tokens > 0:
+                        from agent.display import (
+                            CONTEXT_PRESSURE_INFO_PROGRESS,
+                            CONTEXT_PRESSURE_WARNING_PROGRESS,
+                        )
+
                         _compaction_progress = _estimated_next_prompt / _compressor.threshold_tokens
-                        if _compaction_progress >= 0.85 and not self._context_70_warned:
+                        if _compaction_progress >= CONTEXT_PRESSURE_WARNING_PROGRESS and not self._context_70_warned:
                             self._context_70_warned = True
                             self._context_50_warned = True  # skip first tier if we jumped past it
                             self._emit_context_pressure(_compaction_progress, _compressor)
-                        elif _compaction_progress >= 0.60 and not self._context_50_warned:
+                        elif _compaction_progress >= CONTEXT_PRESSURE_INFO_PROGRESS and not self._context_50_warned:
                             self._context_50_warned = True
                             self._emit_context_pressure(_compaction_progress, _compressor)
 
