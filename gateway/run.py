@@ -1882,13 +1882,90 @@ class GatewayRunner:
         session_record = session_record or {}
         return self._format_sidebar_source_label(session_record.get("source") or "")
 
-    def _list_sidebar_sessions(self, *, limit: int = 20) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _should_hide_sidebar_session(
+        session_id: str,
+        source_name: str,
+    ) -> bool:
+        normalized_source = str(source_name or "").strip().lower()
+        normalized_session_id = str(session_id or "").strip().lower()
+        if normalized_source == "cron":
+            return True
+        return normalized_session_id.startswith("cron_") or normalized_session_id.startswith("cron_manual_")
+
+    def _list_sidebar_sessions(
+        self,
+        *,
+        limit: int = 20,
+        preferred_session_key: str = "",
+    ) -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
         db = self.session_store._db
         if not db:
             return self._list_browser_bridge_sessions(limit=limit).get("sessions", [])
 
-        session_rows = db.search_sessions(limit=limit)
+        preferred_session_id = ""
+        preferred_active_entry = None
+        normalized_preferred_key = str(preferred_session_key or "").strip()
+        if normalized_preferred_key:
+            preferred_active_entry = self._get_active_session_entry_by_key_or_session_id(normalized_preferred_key)
+            preferred_session_id = (
+                preferred_active_entry.session_id
+                if preferred_active_entry
+                else normalized_preferred_key
+            )
+
+        session_rows: List[Dict[str, Any]] = []
+        seen_session_ids: set[str] = set()
+        offset = 0
+        batch_size = max(limit * 4, 50)
+
+        while len(session_rows) < limit:
+            fetched_rows = db.list_sessions_rich(limit=batch_size, offset=offset)
+            if not fetched_rows:
+                break
+
+            for row in fetched_rows:
+                session_id = str(row.get("id") or "").strip()
+                if not session_id or session_id in seen_session_ids:
+                    continue
+                if session_id != preferred_session_id and self._should_hide_sidebar_session(
+                    session_id,
+                    str(row.get("source") or ""),
+                ):
+                    continue
+                seen_session_ids.add(session_id)
+                session_rows.append(row)
+                if len(session_rows) >= limit:
+                    break
+
+            offset += len(fetched_rows)
+
+        if preferred_session_id and preferred_session_id not in seen_session_ids:
+            preferred_row = db.get_session(preferred_session_id) if db else None
+            preferred_source = ""
+            if preferred_row:
+                preferred_source = str(preferred_row.get("source") or "")
+            elif preferred_active_entry and preferred_active_entry.platform:
+                preferred_source = preferred_active_entry.platform.value
+
+            if not self._should_hide_sidebar_session(preferred_session_id, preferred_source):
+                session_rows.append(
+                    preferred_row
+                    or {
+                        "id": preferred_session_id,
+                        "source": preferred_source,
+                        "message_count": 0,
+                        "started_at": preferred_active_entry.updated_at.timestamp()
+                        if preferred_active_entry and preferred_active_entry.updated_at
+                        else 0,
+                        "last_active": preferred_active_entry.updated_at.timestamp()
+                        if preferred_active_entry and preferred_active_entry.updated_at
+                        else 0,
+                    }
+                )
+                seen_session_ids.add(preferred_session_id)
+
         sessions: List[Dict[str, Any]] = []
         for row in session_rows:
             session_id = str(row.get("id") or "").strip()
@@ -1906,8 +1983,8 @@ class GatewayRunner:
             updated_at = (
                 active_entry.updated_at.isoformat()
                 if active_entry and active_entry.updated_at
-                else datetime.fromtimestamp(float(row.get("started_at") or 0)).isoformat()
-                if row.get("started_at")
+                else datetime.fromtimestamp(float(row.get("last_active") or row.get("started_at") or 0)).isoformat()
+                if row.get("last_active") or row.get("started_at")
                 else ""
             )
 
@@ -1930,6 +2007,23 @@ class GatewayRunner:
                     "can_send": is_browser_session,
                 }
             )
+
+        sessions.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        if preferred_session_id:
+            preferred_index = next(
+                (
+                    index
+                    for index, session in enumerate(sessions)
+                    if str(session.get("session_id") or "").strip() == preferred_session_id
+                ),
+                None,
+            )
+            if preferred_index is not None and preferred_index > 0:
+                preferred_session = sessions.pop(preferred_index)
+                sessions.insert(0, preferred_session)
+
+        if len(sessions) > limit:
+            sessions = sessions[:limit]
 
         return sessions
 
@@ -2686,7 +2780,10 @@ class GatewayRunner:
             )
             return {
                 "ok": True,
-                "sessions": self._list_sidebar_sessions(limit=int(payload.get("limit") or 25)),
+                "sessions": self._list_sidebar_sessions(
+                    limit=int(payload.get("limit") or 25),
+                    preferred_session_key=active_session_key,
+                ),
                 "active_session_key": active_session_key,
                 **self._empty_sidebar_session_snapshot(),
             }

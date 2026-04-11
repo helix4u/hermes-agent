@@ -35,6 +35,7 @@ All notable user-visible changes to this project are documented here. Agents and
 - **Activity log**: Side panel includes a collapsible **Activity log** showing gateway tool/thinking progress (parity with Discord-style `gateway-progress` lines). Buffer on the server is up to **128** lines per session (`activity_log` / `recent_events` in bridge API).
 - **Options**: Added runtime configuration sections for provider/model selection, provider credential helpers, TTS/STT defaults, terminal backend and timeout controls, Windows shell preference, web backend/archive fallback settings, and delegation overrides. The old optional log-dashboard field is gone; **Open control room** is the primary local observability entry point. Existing extension settings for activity log, microphone device, themes, and sidecar prompt controls remain.
 - **Reply section actions**: Browser-side replies now expose separate actions for tagged `ʞᴎiʜƚ` blocks versus the main answer content, instead of forcing everything through one copy/read control.
+- **Session picker cron filtering**: Browser sidepanel/control-room session history now skips headless cron sessions and keeps the active browser sidecar session in the list even when newer cron runs or older session start times would otherwise push it out.
 
 ### Gateway
 

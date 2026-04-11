@@ -50,6 +50,43 @@ async def test_browser_bridge_list_includes_non_browser_sessions(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_browser_bridge_list_filters_cron_sessions_and_keeps_active_browser_session(tmp_path):
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+
+    browser_source = runner._build_browser_bridge_source("Chrome Extension", "panel-123")
+    browser_entry = runner.session_store.get_or_create_session(browser_source)
+    _append_exchange(runner, browser_entry.session_id, "Browser question", "Browser answer")
+
+    cli_entry = runner.session_store.get_or_create_session(SessionSource.local_cli())
+    _append_exchange(runner, cli_entry.session_id, "CLI question", "CLI answer")
+
+    for index in range(30):
+        runner.session_store._db.create_session(
+            session_id=f"cron_job_{index}",
+            source="cron",
+            user_id="scheduler",
+        )
+
+    result = await runner._handle_browser_bridge_session(
+        {
+            "action": "list",
+            "browserLabel": "Chrome Extension",
+            "clientSessionId": "panel-123",
+            "limit": 5,
+        }
+    )
+
+    session_ids = {session["session_id"] for session in result["sessions"]}
+    sources = {session["source"] for session in result["sessions"]}
+
+    assert result["active_session_key"] == browser_entry.session_key
+    assert browser_entry.session_id in session_ids
+    assert cli_entry.session_id in session_ids
+    assert "cron" not in sources
+    assert all(not session_id.startswith("cron_") for session_id in session_ids)
+
+
+@pytest.mark.asyncio
 async def test_browser_bridge_state_returns_read_only_snapshot_for_cli_session(tmp_path):
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
 
