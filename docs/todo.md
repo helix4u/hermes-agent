@@ -8,6 +8,7 @@ Working list for durable goals, in-flight implementation, and recently completed
 
 ## Next up
 
+- Expose tool-use budget metadata to the model in a safe, explicit form so the agent can see whether tool calls are still available on the current turn, what the effective budget is, and whether it is exhausted, without breaking prompt caching or surfacing misleading stale counters.
 - Expand the remaining docs beyond the README so setup, extension behavior, and control-room workflows are documented in dedicated docs instead of mostly living in code and changelog notes.
 - Consider exposing per-command shell selection in more first-class UI affordances beyond the tool schema and runtime config.
 - Consider adding a browser-side cron management panel if cron workflows become a frequent extension use case.

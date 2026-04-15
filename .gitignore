@@ -1,7 +1,10 @@
 /venv/
 /_pycache/
-*.pyc*
+# Python cache / bytecode
 __pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyc*
 .venv/
 .vscode/
 .env

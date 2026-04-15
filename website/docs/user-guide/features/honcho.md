@@ -48,7 +48,7 @@ hermes config set HONCHO_BASE_URL http://localhost:8000
 }
 ```
 
-Hermes auto-enables Honcho when either `apiKey` or `base_url` is present, so no further configuration is needed for a local instance.
+Hermes auto-enables Honcho when either `apiKey` or `base_url` is present, so no further configuration is needed for a local instance. If you want to keep a shared `~/.honcho/config.json` for other tools but disable Honcho only in Hermes, set `honcho.enabled: false` in `~/.hermes/config.yaml`.
 
 To run Honcho locally, refer to the [Honcho self-hosting docs](https://docs.honcho.dev).
 
@@ -161,7 +161,7 @@ Memory mode can be set globally or per-peer (user, agent1, agent2, etc):
 }
 ```
 
-To disable Honcho entirely, set `enabled: false` or remove the API key.
+To disable Honcho entirely, set `enabled: false` in `~/.honcho/config.json`, remove the API key, or set `honcho.enabled: false` in `~/.hermes/config.yaml` to disable it only for Hermes.
 
 ### Recall Modes
 
@@ -225,7 +225,8 @@ Resolution: `hosts.<tool>` field > root-level field > default. In this example, 
 Intentionally minimal — most configuration comes from `~/.honcho/config.json`:
 
 ```yaml
-honcho: {}
+honcho:
+  enabled: false  # Optional Hermes-local override; leaves shared ~/.honcho/config.json untouched
 ```
 
 ## How It Works

@@ -1,0 +1,5 @@
+name: youtube-intake
+version: 0.1.0
+description: Windows-safe YouTube transcript intake and digest prep with transcript-api first, yt-dlp fallback, and TMP scratch-dir cleanup.
+provides_tools:
+  - youtube_digest

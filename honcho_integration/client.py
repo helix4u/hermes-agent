@@ -47,6 +47,19 @@ def resolve_config_path() -> Path:
     return GLOBAL_CONFIG_PATH
 
 
+def _load_hermes_honcho_overrides() -> dict[str, Any]:
+    """Load Hermes-local Honcho overrides from ~/.hermes/config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        return {}
+
+    honcho_cfg = cfg.get("honcho", {})
+    return honcho_cfg if isinstance(honcho_cfg, dict) else {}
+
+
 _RECALL_MODE_ALIASES = {"auto": "hybrid"}
 _VALID_RECALL_MODES = {"hybrid", "context", "tools"}
 
@@ -217,6 +230,13 @@ class HonchoClientConfig:
         else:
             # Not explicitly set anywhere -> auto-enable if API key or base_url exists
             enabled = bool(api_key or base_url)
+
+        # Hermes-local config.yaml may explicitly disable Honcho without touching
+        # the shared ~/.honcho/config.json used by other tools.
+        local_overrides = _load_hermes_honcho_overrides()
+        local_enabled = local_overrides.get("enabled")
+        if local_enabled is not None:
+            enabled = bool(local_enabled)
 
         # write_frequency: accept int or string
         raw_wf = (

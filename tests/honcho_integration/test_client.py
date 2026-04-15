@@ -234,6 +234,23 @@ class TestFromGlobalConfig:
         config = HonchoClientConfig.from_global_config(config_path=config_file)
         assert config.base_url == "http://root:9000"
 
+    def test_hermes_config_can_disable_shared_honcho(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "apiKey": "shared-key",
+            "enabled": True,
+        }))
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("honcho:\n  enabled: false\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}, clear=False):
+            config = HonchoClientConfig.from_global_config(config_path=config_file)
+
+        assert config.api_key == "shared-key"
+        assert config.enabled is False
+
 
 class TestResolveSessionName:
     def test_manual_override(self):

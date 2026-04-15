@@ -715,7 +715,8 @@ delegation:
 # API key: HONCHO_API_KEY in ~/.hermes/.env or ~/.honcho/config.json
 #
 # Hermes-specific overrides (optional — most config comes from ~/.honcho/config.json):
-# honcho: {}
+# honcho:
+#   enabled: false    # Keep shared Honcho config for other tools, but disable it in Hermes
 
 # =============================================================================
 # Display
