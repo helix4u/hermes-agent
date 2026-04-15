@@ -376,6 +376,22 @@ class TestSendVoiceReply:
         mock_tts.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_long_text_is_not_pre_truncated(self, runner):
+        event = _make_event()
+        mock_adapter = AsyncMock()
+        runner.adapters[event.source.platform] = mock_adapter
+        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
+
+        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result) as mock_tts, \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.unlink"), \
+             patch("os.makedirs"):
+            await runner._send_voice_reply(event, "A" * 5000)
+
+        assert len(mock_tts.call_args.kwargs["text"]) == 5000
+
+    @pytest.mark.asyncio
     async def test_tts_failure_no_crash(self, runner):
         event = _make_event()
         mock_adapter = AsyncMock()
@@ -1287,19 +1303,17 @@ class TestAutoTtsEmptyTextGuard:
 
     def test_empty_after_strip_skips_tts(self):
         """Markdown-only content should not trigger TTS call."""
-        import re
-        text_content = "****"
-        speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
+        from tools.tts_tool import _strip_markdown_for_tts
+        text_content = "```python\nprint(1)\n```"
+        speech_text = _strip_markdown_for_tts(text_content)
         assert not speech_text, "Expected empty after stripping markdown chars"
 
     def test_code_block_response_skips_tts(self):
         """Code-only response results in empty speech text."""
-        import re
+        from tools.tts_tool import _strip_markdown_for_tts
         text_content = "```python\nprint(1)\n```"
-        speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
-        # Note: base.py regex only strips individual chars, not full code blocks
-        # So code blocks are partially stripped but may leave content
-        # The real fix is in base.py — empty check after strip
+        speech_text = _strip_markdown_for_tts(text_content)
+        assert speech_text == ""
 
     def test_base_empty_check_in_source(self):
         """base.py must check speech_text is non-empty before calling TTS."""

@@ -113,6 +113,36 @@ async def test_fetch_transcript_requires_url_or_video_id():
         )
 
 
+@pytest.mark.asyncio
+async def test_tts_bridge_passes_full_text_to_tool(monkeypatch, tmp_path):
+    runner = _make_runner()
+    audio_path = tmp_path / "bridge-tts.mp3"
+    audio_path.write_bytes(b"audio")
+    captured = {}
+
+    def _fake_tts(text: str):
+        captured["text"] = text
+        return (
+            '{"success": true, "file_path": "'
+            + str(audio_path).replace("\\", "\\\\")
+            + '", "provider": "edge"}'
+        )
+
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", _fake_tts)
+
+    long_text = "A" * 5000
+    result = await runner._handle_browser_bridge_session(
+        {
+            "action": "tts",
+            "text": long_text,
+        }
+    )
+
+    assert captured["text"] == long_text
+    assert result["provider"] == "edge"
+    assert result["audio_base64"]
+
+
 def test_ensure_gateway_python_package_prefers_uv(monkeypatch):
     real_import = builtins.__import__
     state = {"installed": False}

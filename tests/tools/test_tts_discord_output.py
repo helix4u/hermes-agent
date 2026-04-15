@@ -118,3 +118,40 @@ def test_check_tts_requirements_accepts_selected_kokoro_provider(monkeypatch):
     monkeypatch.delenv("F5TTS_SECRET_KEY", raising=False)
 
     assert tts_tool.check_tts_requirements() is True
+
+
+def test_tts_tool_stitches_long_openai_input(monkeypatch, tmp_path):
+    from tools import tts_tool
+
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {})
+    monkeypatch.setattr(tts_tool, "_get_provider", lambda _cfg: "openai")
+
+    chunk_calls = []
+
+    def _fake_generate_openai(text, output_path, _cfg):
+        chunk_calls.append(text)
+        with open(output_path, "wb") as f:
+            f.write(text.encode("utf-8"))
+        return output_path
+
+    def _fake_concat(paths, output_path):
+        assert len(paths) == len(chunk_calls)
+        with open(output_path, "wb") as f:
+            f.write(b"stitched")
+        return output_path
+
+    monkeypatch.setattr(tts_tool, "_generate_openai_tts", _fake_generate_openai)
+    monkeypatch.setattr(tts_tool, "_concatenate_audio_files_ffmpeg", _fake_concat)
+
+    long_text = ("Sentence one. " * 320).strip()
+    result = json.loads(
+        tts_tool.text_to_speech_tool(long_text, output_path=str(tmp_path / "long.mp3"))
+    )
+
+    assert result["success"] is True
+    assert result["overflow_detected"] is True
+    assert result["chunk_count"] == len(chunk_calls)
+    assert len(chunk_calls) > 1
+    assert result["truncated"] is False
+    assert result["input_chars"] == len(long_text)
+    assert result["synthesized_chars"] >= 4000

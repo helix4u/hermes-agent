@@ -28,6 +28,8 @@ Convert text to speech with four providers:
 | WhatsApp | Audio file attachment | MP3 |
 | CLI | Saved to `~/.hermes/audio_cache/` | MP3 |
 
+Long replies are chunked at the provider text limit and stitched back into one audio file before delivery. When Hermes needs to stitch compressed chunks from Edge, OpenAI, ElevenLabs, Kokoro, NeuTTS, or browser-side TTS playback, it uses `ffmpeg`; if `ffmpeg` is missing, Hermes falls back to the first chunk instead of failing the whole reply.
+
 ### Configuration
 
 ```yaml
@@ -70,6 +72,7 @@ sudo dnf install ffmpeg
 ```
 
 Without ffmpeg, Edge TTS and NeuTTS audio are sent as regular audio files (playable, but shown as a rectangular player instead of a voice bubble).
+Long browser-side and gateway TTS replies also rely on `ffmpeg` when Hermes has to stitch multiple chunks back into one audio file.
 
 :::tip
 If you want voice bubbles without installing ffmpeg, switch to the OpenAI or ElevenLabs provider.

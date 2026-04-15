@@ -208,9 +208,9 @@ def _split_long_token(token: str, max_length: int) -> list[str]:
     return [token[i:i + max_length] for i in range(0, len(token), max_length)]
 
 
-def _chunk_text_for_f5(text: str, max_length: int = DEFAULT_F5_MAX_TEXT_LENGTH) -> list[str]:
+def _chunk_text_for_tts(text: str, max_length: int = MAX_TEXT_LENGTH) -> list[str]:
     """
-    Split text into sentence-aware chunks that fit the F5 API limit.
+    Split text into sentence-aware chunks that fit a provider text limit.
 
     Falls back to whitespace or hard splits when a sentence/token alone exceeds
     the limit. Empty chunks are never returned.
@@ -273,6 +273,11 @@ def _chunk_text_for_f5(text: str, max_length: int = DEFAULT_F5_MAX_TEXT_LENGTH) 
     return chunks
 
 
+def _chunk_text_for_f5(text: str, max_length: int = DEFAULT_F5_MAX_TEXT_LENGTH) -> list[str]:
+    """Backward-compatible wrapper for the F5-specific chunking limit."""
+    return _chunk_text_for_tts(text, max_length=max_length)
+
+
 def _concatenate_wav_files(input_paths: list[str], output_path: str) -> str:
     """Concatenate PCM WAV files with matching parameters into one WAV file."""
     if not input_paths:
@@ -302,6 +307,70 @@ def _concatenate_wav_files(input_paths: list[str], output_path: str) -> str:
         out_file.setcomptype(reference_params.comptype, reference_params.compname)
         for frame_chunk in frames:
             out_file.writeframes(frame_chunk)
+
+    return output_path
+
+
+def _provider_text_limit(provider: str) -> int:
+    """Return the safe max text length before a provider needs chunking."""
+    if provider == "f5":
+        return DEFAULT_F5_MAX_TEXT_LENGTH
+    return MAX_TEXT_LENGTH
+
+
+def _ffmpeg_concat_codec_args(output_path: str) -> list[str]:
+    """Select an encoder that matches the requested stitched output format."""
+    suffix = Path(output_path).suffix.lower()
+    if suffix == ".ogg":
+        return ["-c:a", "libopus", "-b:a", "64k", "-vbr", "off"]
+    if suffix == ".mp3":
+        return ["-c:a", "libmp3lame", "-b:a", "128k"]
+    if suffix == ".wav":
+        return ["-c:a", "pcm_s16le"]
+    if suffix == ".m4a":
+        return ["-c:a", "aac", "-b:a", "128k"]
+    if suffix == ".flac":
+        return ["-c:a", "flac"]
+    return []
+
+
+def _concatenate_audio_files_ffmpeg(input_paths: list[str], output_path: str) -> str:
+    """Stitch multiple provider outputs into one file using ffmpeg."""
+    if not input_paths:
+        raise ValueError("No audio inputs were provided for ffmpeg concatenation")
+    if len(input_paths) == 1:
+        shutil.copyfile(input_paths[0], output_path)
+        return output_path
+    if not _has_ffmpeg():
+        raise FileNotFoundError("ffmpeg is required to stitch long TTS audio replies")
+
+    cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+    for path in input_paths:
+        cmd.extend(["-i", path])
+
+    filter_inputs = "".join(f"[{index}:a]" for index in range(len(input_paths)))
+    cmd.extend(
+        [
+            "-filter_complex",
+            f"{filter_inputs}concat=n={len(input_paths)}:v=0:a=1[out]",
+            "-map",
+            "[out]",
+        ]
+    )
+    cmd.extend(_ffmpeg_concat_codec_args(output_path))
+    cmd.append(output_path)
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("ffmpeg timed out while stitching TTS chunks") from exc
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="ignore")[:400]
+        raise RuntimeError(f"ffmpeg failed to stitch TTS chunks: {stderr or 'unknown error'}")
+
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError("ffmpeg did not produce stitched TTS output")
 
     return output_path
 
@@ -633,6 +702,128 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     return output_path
 
 
+def _synthesize_with_provider(
+    provider: str,
+    text: str,
+    output_path: str,
+    tts_config: Dict[str, Any],
+) -> str:
+    """Generate audio for one text chunk and return the actual provider used."""
+    if provider == "elevenlabs":
+        try:
+            _import_elevenlabs()
+        except ImportError as exc:
+            raise ValueError(
+                "ElevenLabs provider selected but 'elevenlabs' package not installed. "
+                "Run: pip install elevenlabs"
+            ) from exc
+        logger.info("Generating speech with ElevenLabs...")
+        _generate_elevenlabs(text, output_path, tts_config)
+        return provider
+
+    if provider == "openai":
+        try:
+            _import_openai_client()
+        except ImportError as exc:
+            raise ValueError(
+                "OpenAI provider selected but 'openai' package not installed."
+            ) from exc
+        logger.info("Generating speech with OpenAI TTS...")
+        _generate_openai_tts(text, output_path, tts_config)
+        return provider
+
+    if provider == "kokoro":
+        logger.info("Generating speech with Kokoro FastAPI...")
+        _generate_kokoro_tts(text, output_path, tts_config)
+        return provider
+
+    if provider == "neutts":
+        if not _check_neutts_available():
+            raise ValueError(
+                "NeuTTS provider selected but neutts is not installed. "
+                "Run hermes setup and choose NeuTTS, or install espeak-ng and run "
+                "python -m pip install -U neutts[all]."
+            )
+        logger.info("Generating speech with NeuTTS (local)...")
+        _generate_neutts(text, output_path, tts_config)
+        return provider
+
+    if provider == "f5":
+        logger.info("Generating speech with local F5 TTS...")
+        _generate_f5_tts(text, output_path, tts_config)
+        return provider
+
+    edge_available = True
+    try:
+        _import_edge_tts()
+    except ImportError:
+        edge_available = False
+
+    if edge_available:
+        logger.info("Generating speech with Edge TTS...")
+        try:
+            asyncio.get_running_loop()
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(
+                    lambda: asyncio.run(_generate_edge_tts(text, output_path, tts_config))
+                ).result(timeout=60)
+        except RuntimeError:
+            asyncio.run(_generate_edge_tts(text, output_path, tts_config))
+        return "edge"
+
+    if _check_neutts_available():
+        logger.info("Edge TTS not available, falling back to NeuTTS (local)...")
+        _generate_neutts(text, output_path, tts_config)
+        return "neutts"
+
+    raise ValueError(
+        "No TTS provider available. Install edge-tts (pip install edge-tts) "
+        "or set up NeuTTS for local synthesis."
+    )
+
+
+def _generate_chunked_tts(
+    provider: str,
+    text_chunks: list[str],
+    output_path: str,
+    tts_config: Dict[str, Any],
+) -> str:
+    """Generate per-chunk audio files and stitch them into one output."""
+    if not text_chunks:
+        raise ValueError("No text chunks were provided for TTS generation")
+    if len(text_chunks) == 1:
+        return _synthesize_with_provider(provider, text_chunks[0], output_path, tts_config)
+    if provider == "f5":
+        return _synthesize_with_provider(provider, " ".join(text_chunks), output_path, tts_config)
+
+    logger.info(
+        "TTS splitting long input into %d chunks for provider %s",
+        len(text_chunks),
+        provider,
+    )
+
+    suffix = Path(output_path).suffix or ".mp3"
+    chunk_paths: list[str] = []
+    actual_provider = provider
+
+    try:
+        for index, chunk in enumerate(text_chunks, start=1):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".chunk{index:03d}{suffix}") as temp_file:
+                chunk_path = temp_file.name
+            actual_provider = _synthesize_with_provider(actual_provider, chunk, chunk_path, tts_config)
+            chunk_paths.append(chunk_path)
+
+        _concatenate_audio_files_ffmpeg(chunk_paths, output_path)
+        return actual_provider
+    finally:
+        for path in chunk_paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 # ===========================================================================
 # Main tool function
 # ===========================================================================
@@ -660,13 +851,14 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return json.dumps({"success": False, "error": "Text is required"}, ensure_ascii=False)
 
-    # Truncate very long text with a warning
-    if len(text) > MAX_TEXT_LENGTH:
-        logger.warning("TTS text too long (%d chars), truncating to %d", len(text), MAX_TEXT_LENGTH)
-        text = text[:MAX_TEXT_LENGTH]
-
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
+    selected_provider = provider
+    provider_limit = _provider_text_limit(provider)
+    text_chunks = _chunk_text_for_tts(text, max_length=provider_limit)
+    overflow_detected = len(text_chunks) > 1
+    truncated = False
+    synthesized_text = " ".join(text_chunks)
 
     # Detect platform from gateway env var to choose the best output format.
     # Telegram and Discord both benefit from compressed audio. OpenAI,
@@ -697,76 +889,19 @@ def text_to_speech_tool(
     file_str = str(file_path)
 
     try:
-        # Generate audio with the configured provider
-        if provider == "elevenlabs":
-            try:
-                _import_elevenlabs()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "ElevenLabs provider selected but 'elevenlabs' package not installed. Run: pip install elevenlabs"
-                }, ensure_ascii=False)
-            logger.info("Generating speech with ElevenLabs...")
-            _generate_elevenlabs(text, file_str, tts_config)
+        if overflow_detected and provider != "f5" and not _has_ffmpeg():
+            logger.warning(
+                "TTS text too long for %s (%d chars, limit %d) and ffmpeg is unavailable; truncating",
+                provider,
+                len(text),
+                provider_limit,
+            )
+            text_chunks = [text_chunks[0]]
+            truncated = True
 
-        elif provider == "openai":
-            try:
-                _import_openai_client()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "OpenAI provider selected but 'openai' package not installed."
-                }, ensure_ascii=False)
-            logger.info("Generating speech with OpenAI TTS...")
-            _generate_openai_tts(text, file_str, tts_config)
+        synthesized_text = " ".join(text_chunks)
 
-        elif provider == "kokoro":
-            logger.info("Generating speech with Kokoro FastAPI...")
-            _generate_kokoro_tts(text, file_str, tts_config)
-
-        elif provider == "neutts":
-            if not _check_neutts_available():
-                return json.dumps({
-                    "success": False,
-                    "error": "NeuTTS provider selected but neutts is not installed. "
-                             "Run hermes setup and choose NeuTTS, or install espeak-ng and run python -m pip install -U neutts[all]."
-                }, ensure_ascii=False)
-            logger.info("Generating speech with NeuTTS (local)...")
-            _generate_neutts(text, file_str, tts_config)
-
-        elif provider == "f5":
-            logger.info("Generating speech with local F5 TTS...")
-            _generate_f5_tts(text, file_str, tts_config)
-
-        else:
-            # Default: Edge TTS (free), with NeuTTS as local fallback
-            edge_available = True
-            try:
-                _import_edge_tts()
-            except ImportError:
-                edge_available = False
-
-            if edge_available:
-                logger.info("Generating speech with Edge TTS...")
-                try:
-                    loop = asyncio.get_running_loop()
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        pool.submit(
-                            lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
-                        ).result(timeout=60)
-                except RuntimeError:
-                    asyncio.run(_generate_edge_tts(text, file_str, tts_config))
-            elif _check_neutts_available():
-                logger.info("Edge TTS not available, falling back to NeuTTS (local)...")
-                provider = "neutts"
-                _generate_neutts(text, file_str, tts_config)
-            else:
-                return json.dumps({
-                    "success": False,
-                    "error": "No TTS provider available. Install edge-tts (pip install edge-tts) "
-                             "or set up NeuTTS for local synthesis."
-                }, ensure_ascii=False)
+        provider = _generate_chunked_tts(provider, text_chunks, file_str, tts_config)
 
         # Check the file was actually created
         if not os.path.exists(file_str) or os.path.getsize(file_str) == 0:
@@ -799,7 +934,13 @@ def text_to_speech_tool(
             "file_path": file_str,
             "media_tag": media_tag,
             "provider": provider,
+            "selected_provider": selected_provider,
             "voice_compatible": voice_compatible,
+            "chunk_count": len(text_chunks),
+            "overflow_detected": overflow_detected,
+            "truncated": truncated,
+            "input_chars": len(text),
+            "synthesized_chars": len(synthesized_text),
         }, ensure_ascii=False)
 
     except ValueError as e:

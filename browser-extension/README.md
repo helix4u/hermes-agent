@@ -13,6 +13,8 @@ real Hermes chat session beside the active tab.
 - Include page title, URL, visible text, selection, and metadata when sharing
 - For YouTube watch pages: include the transcript the first time that video is
   shared in the current browser session
+- Play reply TTS through the browser bridge, including long replies that need
+  chunked synthesis plus audio stitching on the gateway side
 
 ## Load it in Chrome
 

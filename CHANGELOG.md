@@ -23,6 +23,7 @@ All notable user-visible changes to this project are documented here. Agents and
 - **Codex stream recovery**: Streaming Responses API calls now recover assistant output from `response.output_item.done` events or streamed text deltas when the final SDK response arrives with an empty `output` list, which fixes otherwise-valid Codex replies being rejected as malformed.
 - **Temporal grounding without cache churn**: Hermes no longer bakes a frozen "Conversation started" timestamp into the cached system prompt. Relative-date grounding now comes from a compact per-turn runtime facts note (`today`, `yesterday`, local datetime, timezone, active working directory) attached at API-call time, and those runtime facts explicitly outrank stale dates found in memory, context files, Honcho recall, or prior transcript text.
 - **Prompt-cache-safe runtime hints**: Turn-varying shell hints and skill-routing nudges now ride on the live user message instead of being concatenated onto the system prompt, which keeps Anthropic/OpenRouter prefix caching effective across turns.
+- **Long TTS reply stitching**: Hermes now detects provider text-limit overflow in the shared `text_to_speech` pipeline, synthesizes long replies in chunks, and stitches them back into one audio file with `ffmpeg` instead of silently dropping everything past the first 4000 characters. That applies to gateway/browser-bridge playback, auto-TTS voice replies, and CLI spoken replies as well.
 
 ### Browser sidecar (Chrome extension)
 
