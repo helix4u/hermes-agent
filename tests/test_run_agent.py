@@ -200,6 +200,38 @@ def test_compress_context_preserves_current_user_before_tool_tail(agent):
     ][-1] == latest_request
 
 
+def test_compress_context_resets_db_history_base_for_child_session(agent):
+    """A compression-created child session must flush from message 0, not parent history length."""
+    messages = [
+        {"role": "user", "content": "earlier question"},
+        {"role": "assistant", "content": "earlier answer"},
+        {"role": "user", "content": "latest question"},
+    ]
+
+    agent.session_id = "parent-session"
+    agent._db_history_base_len = len(messages) - 1
+    agent._persist_user_message_idx = 2
+    agent.context_compressor = MagicMock()
+    agent.context_compressor.compress.return_value = [
+        {"role": "assistant", "content": "[CONTEXT COMPACTION] summary"},
+        messages[-1].copy(),
+    ]
+    agent._todo_store = MagicMock()
+    agent._todo_store.format_for_injection.return_value = ""
+    agent._build_system_prompt = MagicMock(return_value="system prompt")
+    agent._cached_system_prompt = "old system prompt"
+
+    session_db = MagicMock()
+    session_db.get_session_title.return_value = None
+    agent._session_db = session_db
+
+    with patch.object(agent, "flush_memories"):
+        agent._compress_context(messages, "system prompt")
+
+    assert agent._db_history_base_len == 0
+    session_db.create_session.assert_called_once()
+
+
 def test_aiagent_reuses_existing_errors_log_handler():
     """Repeated AIAgent init should not accumulate duplicate errors.log handlers."""
     root_logger = logging.getLogger()

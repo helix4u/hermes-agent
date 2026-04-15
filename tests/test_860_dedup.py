@@ -158,6 +158,49 @@ class TestFlushDeduplication:
                 old_rows = db.get_messages(old_session)
                 assert len(old_rows) == 2
 
+    def test_flush_after_compression_ignores_stale_history_offset(self):
+        """A compression split must not reuse the parent session's history length."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            with SessionDB(db_path=db_path) as db:
+                agent = self._make_agent(db)
+
+                parent_history = [
+                    {"role": "user", "content": "old-1"},
+                    {"role": "assistant", "content": "old-2"},
+                    {"role": "user", "content": "old-3"},
+                    {"role": "assistant", "content": "old-4"},
+                ]
+
+                # Simulate a continuing run that started from a restored transcript.
+                agent._db_history_base_len = len(parent_history)
+                agent._last_flushed_db_idx = len(parent_history)
+
+                # Compression creates a new child session with no transcript rows yet.
+                agent.session_id = "compressed-session-child"
+                db.create_session(session_id=agent.session_id, source="test")
+                agent._last_flushed_db_idx = 0
+                agent._db_history_base_len = 0
+
+                compressed_messages = [
+                    {"role": "assistant", "content": "[CONTEXT COMPACTION] summary"},
+                    {"role": "user", "content": "latest question"},
+                    {"role": "assistant", "content": "latest answer"},
+                ]
+
+                # The caller still holds the original conversation_history list from
+                # before compression; persistence must not skip past the new session.
+                agent._flush_messages_to_session_db(compressed_messages, parent_history)
+
+                new_rows = db.get_messages(agent.session_id)
+                assert [row["content"] for row in new_rows] == [
+                    "[CONTEXT COMPACTION] summary",
+                    "latest question",
+                    "latest answer",
+                ]
+
 
 # ---------------------------------------------------------------------------
 # Test: append_to_transcript skip_db parameter

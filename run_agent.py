@@ -943,6 +943,7 @@ class AIAgent:
         self._session_db = session_db
         self._audit_store = None
         self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
+        self._db_history_base_len = 0  # messages already present in the active DB session
         if self._session_db:
             try:
                 self._session_db.create_session(
@@ -1619,7 +1620,9 @@ class AIAgent:
             return
         self._apply_persist_user_message_override(messages)
         try:
-            start_idx = len(conversation_history) if conversation_history else 0
+            start_idx = getattr(self, "_db_history_base_len", 0)
+            if conversation_history and not isinstance(start_idx, int):
+                start_idx = len(conversation_history)
             flush_from = max(start_idx, self._last_flushed_db_idx)
             for msg in messages[flush_from:]:
                 role = msg.get("role", "unknown")
@@ -5114,6 +5117,7 @@ class AIAgent:
                 self._session_db.update_system_prompt(self.session_id, new_system_prompt)
                 # Reset flush cursor — new session starts with no messages written
                 self._last_flushed_db_idx = 0
+                self._db_history_base_len = 0
             except Exception as e:
                 logger.debug("Session DB compression split failed: %s", e)
 
@@ -6146,7 +6150,8 @@ class AIAgent:
         
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
-        
+        self._db_history_base_len = len(conversation_history) if conversation_history else 0
+
         # Hydrate todo store from conversation history (gateway creates a fresh
         # AIAgent per message, so the in-memory store is empty -- we need to
         # recover the todo state from the most recent todo tool response in history)
