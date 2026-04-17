@@ -37,7 +37,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
 from urllib.parse import parse_qs, quote, urlparse
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -2551,25 +2551,50 @@ class GatewayRunner:
         target_dir.mkdir(parents=True, exist_ok=True)
         media_urls: List[str] = []
         media_types: List[str] = []
+        max_remote_bytes = 12 * 1024 * 1024
         for item in attachments:
             if not isinstance(item, dict):
                 continue
-            data_url = str(item.get("data_url") or "").strip()
-            if not data_url:
-                continue
             mime_type = str(item.get("mime_type") or "image/png").strip().lower()
-            if not mime_type.startswith("image/"):
-                continue
-            try:
-                if data_url.startswith("data:"):
-                    if "," not in data_url:
-                        continue
-                    _, encoded = data_url.split(",", 1)
-                else:
-                    encoded = data_url
-                raw_bytes = base64.b64decode(encoded, validate=False)
-            except Exception:
-                continue
+            raw_bytes = b""
+
+            data_url = str(item.get("data_url") or "").strip()
+            if data_url:
+                if not mime_type.startswith("image/"):
+                    continue
+                try:
+                    if data_url.startswith("data:"):
+                        if "," not in data_url:
+                            continue
+                        _, encoded = data_url.split(",", 1)
+                    else:
+                        encoded = data_url
+                    raw_bytes = base64.b64decode(encoded, validate=False)
+                except Exception:
+                    continue
+            else:
+                remote_url = str(item.get("url") or item.get("media_url") or "").strip()
+                if not remote_url.startswith(("http://", "https://")):
+                    continue
+                try:
+                    request = Request(
+                        remote_url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 HermesBrowserBridge/1.0",
+                            "Accept": "image/*;q=0.9,*/*;q=0.1",
+                            "Referer": "https://discord.com/",
+                        },
+                    )
+                    with urlopen(request, timeout=20) as response:
+                        detected_type = str(response.headers.get("Content-Type") or "").strip().lower()
+                        if detected_type.startswith("image/"):
+                            mime_type = detected_type
+                        raw_bytes = response.read(max_remote_bytes + 1)
+                except Exception:
+                    continue
+                if not mime_type.startswith("image/") or not raw_bytes or len(raw_bytes) > max_remote_bytes:
+                    continue
+
             ext = mimetypes.guess_extension(mime_type) or ".png"
             filename = f"sidecar_{uuid.uuid4().hex[:12]}{ext}"
             out_path = target_dir / filename

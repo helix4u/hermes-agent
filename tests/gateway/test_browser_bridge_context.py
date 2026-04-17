@@ -36,3 +36,31 @@ def test_slash_command_passthrough_ignores_page_context_wrapper():
         },
     )
     assert message == "/status"
+
+
+def test_context_message_includes_discord_thread_excerpt_and_image_refs():
+    message = build_browser_context_message(
+        {
+            "url": "https://discord.com/channels/1/2",
+            "title": "Hermes Support",
+            "metadata": {
+                "discordThreadTitle": "ffmpeg stitching issue",
+                "discordThreadMessageCount": 3,
+                "discordThreadImageCount": 1,
+                "discordThreadSource": "sidebar-thread",
+            },
+            "discordThreadText": "user\nAudio cuts out after 4k chars",
+            "discordThreadImages": [
+                {
+                    "url": "https://media.discordapp.net/attachments/123/screenshot.png",
+                    "alt_text": "Waveform screenshot",
+                }
+            ],
+        }
+    )
+
+    assert "Discord thread excerpt:" in message
+    assert "Audio cuts out after 4k chars" in message
+    assert "- discordThreadTitle: ffmpeg stitching issue" in message
+    assert "Discord thread image references:" in message
+    assert "Waveform screenshot" in message

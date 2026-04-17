@@ -491,6 +491,8 @@ function normalizeContextOptions(options) {
     includeUrl: next.includeUrl !== false,
     includeMetadata: next.includeMetadata !== false,
     includeSelection: next.includeSelection !== false,
+    includeDiscordThreadText: next.includeDiscordThreadText !== false,
+    includeDiscordThreadImages: next.includeDiscordThreadImages !== false,
     includePageText: next.includePageText !== false
   };
 }
@@ -503,6 +505,11 @@ function buildContextBundlePreview(context, transcriptAlreadyShared = false) {
   const transcriptChunkAvailable = transcriptReady || transcriptAlreadyShared;
   const metadataPreview = summarizeMetadataPreview(context);
   const contentKind = String(context?.contentKind || "").trim();
+  const discordThreadTextLength = getTextLength(context?.discordThreadText);
+  const discordThreadImageCount = Array.isArray(context?.discordThreadImages)
+    ? context.discordThreadImages.length
+    : 0;
+  const hasDiscordThreadBundle = discordThreadTextLength > 0;
   const pdfPreviewImageCount = Math.max(0, Number(context?.metadata?.pdfPreviewImageCount || 0));
   const pdfImagesAvailable =
     pdfPreviewImageCount > 0 || contentKind === "pdf-document" || contentKind === "pdf-embed";
@@ -544,14 +551,37 @@ function buildContextBundlePreview(context, transcriptAlreadyShared = false) {
         preview: clampPreviewText(context?.selection, 220),
         reason: "Usually the highest-signal chunk because you pointed at it directly."
       },
+      discordThreadText: {
+        key: "discordThreadText",
+        label: "Discord thread",
+        available: hasDiscordThreadBundle,
+        includedByDefault: hasDiscordThreadBundle,
+        length: discordThreadTextLength,
+        preview: clampPreviewText(context?.discordThreadText, 220),
+        reason: "Keeps Hermes focused on the active Discord conversation instead of the full app chrome."
+      },
+      discordThreadImages: {
+        key: "discordThreadImages",
+        label: "Discord thread images",
+        available: discordThreadImageCount > 0,
+        includedByDefault: discordThreadImageCount > 0,
+        length: discordThreadImageCount,
+        metricText: `${discordThreadImageCount} image${discordThreadImageCount === 1 ? "" : "s"}`,
+        preview: discordThreadImageCount > 0
+          ? "Images from the active Discord thread will be attached for vision analysis."
+          : "",
+        reason: "Lets Hermes inspect screenshots and attachment images from the active support thread."
+      },
       pageText: {
         key: "pageText",
-        label: "Page text",
+        label: hasDiscordThreadBundle ? "Full page text" : "Page text",
         available: Boolean(context?.pageText),
-        includedByDefault: Boolean(context?.pageText),
+        includedByDefault: hasDiscordThreadBundle ? false : Boolean(context?.pageText),
         length: getTextLength(context?.pageText),
         preview: clampPreviewText(context?.pageText, 220),
-        reason: "Gives Hermes the surrounding page context beyond the exact selection."
+        reason: hasDiscordThreadBundle
+          ? "Includes broader Discord app chrome like channel lists and other surrounding UI."
+          : "Gives Hermes the surrounding page context beyond the exact selection."
       },
       pdfImages: {
         key: "pdfImages",
@@ -600,6 +630,8 @@ function applyContextOptionsToPayload(context, options) {
     contentKind: normalized.includeMetadata ? String(context?.contentKind || "") : "",
     metadata: normalized.includeMetadata ? cloneContext(context?.metadata || {}) : {},
     selection: normalized.includeSelection ? String(context?.selection || "") : "",
+    discordThreadText: normalized.includeDiscordThreadText ? String(context?.discordThreadText || "") : "",
+    discordThreadImages: normalized.includeDiscordThreadImages ? cloneContext(context?.discordThreadImages || []) : [],
     pageText: normalized.includePageText ? String(context?.pageText || "") : ""
   };
 }
@@ -2138,6 +2170,32 @@ async function startChatMessage(
     sentPageTextLength = String(pageContext.payload.pageText || "").length;
     const sentTranscript = pageContext.payload.transcript || {};
     const sentTranscriptLength = String(sentTranscript.text || "").length;
+    const pageContextImages = Array.isArray(pageContext.payload.discordThreadImages)
+      ? pageContext.payload.discordThreadImages.filter((image) => image && typeof image === "object")
+      : [];
+    if (pageContextImages.length) {
+      const mergedAttachments = Array.isArray(body.attachments) ? body.attachments.slice() : [];
+      const seenAttachmentKeys = new Set(
+        mergedAttachments
+          .map((attachment) => String(attachment?.data_url || attachment?.url || "").trim())
+          .filter(Boolean)
+      );
+      for (const image of pageContextImages) {
+        const key = String(image?.data_url || image?.url || "").trim();
+        if (!key || seenAttachmentKeys.has(key)) {
+          continue;
+        }
+        seenAttachmentKeys.add(key);
+        mergedAttachments.push({
+          url: key,
+          mime_type: String(image?.mime_type || "image/png").trim().toLowerCase() || "image/png",
+          alt_text: String(image?.alt_text || "").trim()
+        });
+      }
+      if (mergedAttachments.length) {
+        body.attachments = mergedAttachments;
+      }
+    }
     console.debug(
       "[Hermes] Sending page context: pageText=" + sentPageTextLength + " chars, selection=" + sentSelectionLength + " chars" +
       (sentTranscriptLength ? ", transcript=" + sentTranscriptLength + " chars" : "") +

@@ -150,6 +150,9 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "title": _string(payload.get("title"), 512),
         "note": _string(payload.get("note") or payload.get("message"), 4000),
         "selection": _string(payload.get("selection"), 8000),
+        "discord_thread_text": _string(
+            payload.get("discordThreadText") or payload.get("discord_thread_text"), 24000
+        ),
         "page_text": _string(
             payload.get("pageText") or payload.get("page_text") or payload.get("content"), 24000
         ),
@@ -178,7 +181,30 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "video_id": _string(transcript.get("videoId") or transcript.get("video_id"), 64),
             "text": _string(transcript.get("text"), 30000),
         },
+        "discord_thread_images": [],
     }
+
+    discord_thread_images = (
+        payload.get("discordThreadImages")
+        or payload.get("discord_thread_images")
+        or []
+    )
+    if isinstance(discord_thread_images, list):
+        normalized_images = []
+        for item in discord_thread_images[:8]:
+            if not isinstance(item, dict):
+                continue
+            normalized_url = _string(item.get("url") or item.get("media_url"), 4096)
+            if not normalized_url:
+                continue
+            normalized_images.append(
+                {
+                    "url": normalized_url,
+                    "mime_type": _string(item.get("mime_type") or item.get("mimeType"), 128),
+                    "alt_text": _string(item.get("alt_text") or item.get("altText"), 256),
+                }
+            )
+        normalized["discord_thread_images"] = normalized_images
 
     def _normalize_pdf_url(value: Any) -> str:
         text = _string(value, 4096)
@@ -309,6 +335,7 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
             normalized["url"],
             normalized["title"],
             normalized["selection"],
+            normalized["discord_thread_text"],
             normalized["page_text"],
             normalized["description"],
             normalized["canonical_url"],
@@ -317,6 +344,7 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
             bool(metadata),
             bool(normalized["transcript"].get("text")),
             bool(normalized["transcript"].get("available")),
+            bool(normalized["discord_thread_images"]),
         ]
     )
     if not has_reference_material:
@@ -503,6 +531,10 @@ def build_browser_context_message(payload: dict[str, Any]) -> str:
             "publishedTime",
             "duration",
             "byline",
+            "discordThreadTitle",
+            "discordThreadMessageCount",
+            "discordThreadImageCount",
+            "discordThreadSource",
             "pdfUrl",
             "embeddedPdfUrl",
             "embeddedPdfTag",
@@ -516,6 +548,23 @@ def build_browser_context_message(payload: dict[str, Any]) -> str:
 
     if normalized["selection"]:
         sections.extend(["", "User-selected text from the page:", normalized["selection"]])
+
+    if normalized["discord_thread_text"]:
+        sections.extend(["", "Discord thread excerpt:", normalized["discord_thread_text"]])
+
+    if normalized["discord_thread_images"]:
+        image_lines = []
+        for index, image in enumerate(normalized["discord_thread_images"], start=1):
+            url = str(image.get("url") or "").strip()
+            if not url:
+                continue
+            alt_text = str(image.get("alt_text") or "").strip()
+            label = f"- Image {index}: {url}"
+            if alt_text:
+                label += f" ({alt_text})"
+            image_lines.append(label)
+        if image_lines:
+            sections.extend(["", "Discord thread image references:", *image_lines])
 
     if normalized["page_text"]:
         sections.extend(["", "Visible page text excerpt:", normalized["page_text"]])

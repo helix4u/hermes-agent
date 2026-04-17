@@ -90,6 +90,9 @@ function getCurrentContentKind() {
   if (isYouTubeWatchPage()) {
     return "youtube-watch";
   }
+  if (isDiscordChannelsPage()) {
+    return "discord-thread";
+  }
   if (isXOrTwitterHost()) {
     return "x-feed";
   }
@@ -199,6 +202,281 @@ function isXOrTwitterHost() {
   const url = getCurrentUrl();
   const host = (url?.hostname || "").toLowerCase();
   return host === "x.com" || host.endsWith(".x.com") || host === "twitter.com" || host.endsWith(".twitter.com");
+}
+
+function isDiscordHost() {
+  const url = getCurrentUrl();
+  const host = (url?.hostname || "").toLowerCase();
+  return host === "discord.com" || host === "ptb.discord.com" || host === "canary.discord.com";
+}
+
+function isDiscordChannelsPage() {
+  const url = getCurrentUrl();
+  if (!isDiscordHost()) {
+    return false;
+  }
+  return /^\/channels\/\d+\/\d+/i.test(url?.pathname || "");
+}
+
+function getNodeText(node, maxLength = 0) {
+  const text = collapseWhitespace(node?.innerText || node?.textContent || "");
+  return maxLength > 0 ? clamp(text, maxLength) : text;
+}
+
+function normalizeHttpUrl(rawUrl) {
+  const value = String(rawUrl || "").trim();
+  if (!value) {
+    return "";
+  }
+  try {
+    const parsed = new URL(value, window.location.href);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return "";
+    }
+    return parsed.toString();
+  } catch (_error) {
+    return "";
+  }
+}
+
+function guessMimeTypeFromUrl(rawUrl) {
+  const value = String(rawUrl || "").toLowerCase();
+  if (!value) {
+    return "image/png";
+  }
+  if (value.includes(".jpg") || value.includes(".jpeg")) {
+    return "image/jpeg";
+  }
+  if (value.includes(".gif")) {
+    return "image/gif";
+  }
+  if (value.includes(".webp")) {
+    return "image/webp";
+  }
+  return "image/png";
+}
+
+function getDiscordMessageItemNodes(root) {
+  if (!root) {
+    return [];
+  }
+  const nodes = Array.from(
+    root.querySelectorAll("li[id^='chat-messages-'], [id^='chat-messages-']")
+  );
+  const seen = new Set();
+  return nodes.filter((node) => {
+    if (!node || seen.has(node) || !isElementVisible(node)) {
+      return false;
+    }
+    seen.add(node);
+    return true;
+  });
+}
+
+function scoreDiscordMessageRoot(root) {
+  if (!root || !isElementVisible(root)) {
+    return -1;
+  }
+  const items = getDiscordMessageItemNodes(root);
+  if (!items.length) {
+    return -1;
+  }
+  const rect = root.getBoundingClientRect();
+  const container =
+    root.closest("aside, section, main, [role='complementary'], [aria-label]") || root.parentElement;
+  const headingText = getNodeText(
+    container?.querySelector("h1, h2, h3, header, [role='heading']") || container,
+    320
+  ).toLowerCase();
+
+  let score = items.length * 50 + Math.round(rect.height) + Math.round(rect.width / 10);
+  if (root.closest("aside")) {
+    score += 2000;
+  }
+  if (headingText.includes("thread")) {
+    score += 1200;
+  }
+  if (headingText.includes("reply")) {
+    score += 200;
+  }
+  return score;
+}
+
+function getBestDiscordMessageRoot() {
+  if (!isDiscordChannelsPage()) {
+    return null;
+  }
+  const candidates = Array.from(document.querySelectorAll("[data-list-id='chat-messages']"));
+  let bestRoot = null;
+  let bestScore = -1;
+  for (const candidate of candidates) {
+    const score = scoreDiscordMessageRoot(candidate);
+    if (score > bestScore) {
+      bestScore = score;
+      bestRoot = candidate;
+    }
+  }
+  return bestRoot;
+}
+
+function extractDiscordMessageText(item) {
+  if (!item) {
+    return "";
+  }
+  const author = getNodeText(
+    item.querySelector("h3 [id^='message-username-'], [class*='username'], [data-slate-string='true']"),
+    120
+  );
+  const timestamp = getNodeText(item.querySelector("time"), 80);
+  const parts = [];
+  const seen = new Set();
+  const contentSelectors = [
+    "[id^='message-content-']",
+    "blockquote",
+    "pre",
+    "code",
+    "[role='document']"
+  ];
+
+  for (const selector of contentSelectors) {
+    const nodes = item.querySelectorAll(selector);
+    for (const node of nodes) {
+      const text = getNodeText(node, 2200);
+      if (!text || seen.has(text)) {
+        continue;
+      }
+      seen.add(text);
+      parts.push(text);
+    }
+  }
+
+  let body = parts.join("\n").trim();
+  if (!body) {
+    body = getNodeText(item, 2600);
+  }
+  body = collapseWhitespace(body)
+    .replace(/\b(?:Reply|More|Edit|Delete|Mark Unread)\b/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  const header = [author, timestamp].filter(Boolean).join(" — ");
+  const lines = [];
+  if (header) {
+    lines.push(header);
+  }
+  if (body) {
+    lines.push(body);
+  }
+  return lines.join("\n").trim();
+}
+
+function isLikelyDiscordContentImage(image) {
+  if (!image || !isElementVisible(image)) {
+    return false;
+  }
+  const src = normalizeHttpUrl(image.currentSrc || image.src || "");
+  if (!src) {
+    return false;
+  }
+  const loweredSrc = src.toLowerCase();
+  const alt = String(image.alt || "").toLowerCase();
+  if (
+    loweredSrc.includes("/avatars/") ||
+    loweredSrc.includes("/icons/") ||
+    loweredSrc.includes("/role-icons/") ||
+    loweredSrc.includes("emoji") ||
+    loweredSrc.includes("twemoji") ||
+    loweredSrc.includes("/embed/avatars/") ||
+    alt.includes("avatar") ||
+    alt.includes("server icon") ||
+    alt.includes("emoji") ||
+    alt.includes("sticker")
+  ) {
+    return false;
+  }
+
+  const rect = image.getBoundingClientRect();
+  const width = Math.max(image.naturalWidth || 0, image.width || 0, rect.width || 0);
+  const height = Math.max(image.naturalHeight || 0, image.height || 0, rect.height || 0);
+  if ((width && width < 96) || (height && height < 96)) {
+    return false;
+  }
+
+  return (
+    loweredSrc.includes("cdn.discordapp.com") ||
+    loweredSrc.includes("media.discordapp.net") ||
+    loweredSrc.includes("images-ext-1.discordapp.net") ||
+    /\.(?:png|jpe?g|gif|webp)(?:[?#]|$)/i.test(loweredSrc)
+  );
+}
+
+function collectDiscordThreadContext() {
+  const root = getBestDiscordMessageRoot();
+  if (!root) {
+    return {
+      text: "",
+      images: [],
+      title: "",
+      messageCount: 0,
+      source: "",
+      isThread: false
+    };
+  }
+
+  const messageItems = getDiscordMessageItemNodes(root);
+  const messageParts = [];
+  const seenMessages = new Set();
+  const images = [];
+  const seenImages = new Set();
+
+  for (const item of messageItems) {
+    const text = extractDiscordMessageText(item);
+    if (text && !seenMessages.has(text)) {
+      seenMessages.add(text);
+      messageParts.push(text);
+    }
+
+    for (const image of item.querySelectorAll("img[src]")) {
+      if (!isLikelyDiscordContentImage(image)) {
+        continue;
+      }
+      const candidateUrl = normalizeHttpUrl(
+        image.closest("a[href]")?.href || image.currentSrc || image.src || ""
+      );
+      if (!candidateUrl) {
+        continue;
+      }
+      const imageKey = candidateUrl.split("?", 1)[0];
+      if (seenImages.has(imageKey)) {
+        continue;
+      }
+      seenImages.add(imageKey);
+      images.push({
+        url: candidateUrl,
+        mime_type: guessMimeTypeFromUrl(candidateUrl),
+        alt_text: clamp(String(image.alt || "").trim(), 160)
+      });
+      if (images.length >= 4) {
+        break;
+      }
+    }
+  }
+
+  const container =
+    root.closest("aside, section, main, [role='complementary'], [aria-label]") || root.parentElement;
+  const title = getNodeText(
+    container?.querySelector("h1, h2, h3, [role='heading']"),
+    200
+  );
+  const sourceText = getNodeText(container, 240).toLowerCase();
+  return {
+    text: clamp(messageParts.join("\n\n"), 24000),
+    images,
+    title,
+    messageCount: messageParts.length,
+    source: root.closest("aside") ? "sidebar-thread" : "main-chat",
+    isThread: sourceText.includes("thread") || Boolean(root.closest("aside"))
+  };
 }
 
 function isPdfUrlLike(value) {
@@ -1143,9 +1421,12 @@ async function collectPageContext(includeTranscriptText, waitForHydration = fals
   const selection = getSelectedText();
   let pageText = await getVisiblePageTextWithRetry();
   let contentKind = "web-page";
+  const discordThread = collectDiscordThreadContext();
   const embeddedPdf = getEmbeddedPdfInfo();
   if (isYouTubeWatchPage()) {
     contentKind = "youtube-watch";
+  } else if (discordThread.text) {
+    contentKind = discordThread.isThread ? "discord-thread" : "discord-chat";
   } else if (isXOrTwitterHost()) {
     contentKind = "x-feed";
   } else if (isPdfDocumentPage()) {
@@ -1182,6 +1463,11 @@ async function collectPageContext(includeTranscriptText, waitForHydration = fals
       document.querySelector("#info-strings, #title + yt-formatted-string, #description-inline-expander #info")?.textContent || ""
     );
     transcript = await fetchYouTubeTranscript(includeTranscriptText);
+  } else if (discordThread.text) {
+    metadata.discordThreadTitle = discordThread.title;
+    metadata.discordThreadMessageCount = discordThread.messageCount;
+    metadata.discordThreadImageCount = discordThread.images.length;
+    metadata.discordThreadSource = discordThread.source;
   } else if (isXOrTwitterHost()) {
     metadata.timelineItems = document.querySelectorAll("article").length;
   } else if (embeddedPdf) {
@@ -1214,6 +1500,8 @@ async function collectPageContext(includeTranscriptText, waitForHydration = fals
     canonicalUrl,
     siteName,
     selection,
+    discordThreadText: discordThread.text,
+    discordThreadImages: discordThread.images,
     pageText,
     contentKind,
     metadata,

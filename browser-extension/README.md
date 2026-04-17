@@ -11,6 +11,7 @@ real Hermes chat session beside the active tab.
 - Interrupt an in-flight sidecar response chain when you need Hermes to stop
 - Share the current page into the same conversation when you want more context
 - Include page title, URL, visible text, selection, and metadata when sharing
+- On Discord channel/thread pages, share just the active thread text and thread images instead of the whole Discord app frame when that is the higher-signal context
 - For YouTube watch pages: include the transcript the first time that video is
   shared in the current browser session
 - Play reply TTS through the browser bridge, including long replies that need
@@ -45,11 +46,14 @@ real Hermes chat session beside the active tab.
 2. Type a normal chat message to Hermes.
 3. Enable `Use the current page in this turn` whenever the active tab
    should be part of the turn.
-4. If the page is a YouTube video, optionally include the transcript the first
+4. On Discord support threads, leave `Discord thread` enabled and `Full page text`
+   disabled if you only want the active conversation and screenshots, not the
+   server/channel chrome around it.
+5. If the page is a YouTube video, optionally include the transcript the first
    time you share that video.
-5. Use `New chat` to reset just the sidecar session.
-6. Use `Interrupt` while Hermes is working if you need to stop the current turn.
-7. Use the `Session history` picker to jump between recent sidecar sessions.
+6. Use `New chat` to reset just the sidecar session.
+7. Use `Interrupt` while Hermes is working if you need to stop the current turn.
+8. Use the `Session history` picker to jump between recent sidecar sessions.
 
 ## Notes
 

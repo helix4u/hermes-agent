@@ -638,6 +638,8 @@ function createDefaultBundleSelectionState(preview) {
     includeUrl: Boolean(chunks.url?.includedByDefault),
     includeMetadata: Boolean(chunks.metadata?.includedByDefault),
     includeSelection: Boolean(chunks.selection?.includedByDefault),
+    includeDiscordThreadText: Boolean(chunks.discordThreadText?.includedByDefault),
+    includeDiscordThreadImages: Boolean(chunks.discordThreadImages?.includedByDefault),
     includePageText: Boolean(chunks.pageText?.includedByDefault)
   };
 }
@@ -661,6 +663,12 @@ function syncBundleSelectionState(preview, { preserveExisting = false } = {}) {
     includeSelection: preview?.bundle?.chunks?.selection?.available
       ? bundleSelectionState.includeSelection !== false
       : defaults.includeSelection,
+    includeDiscordThreadText: preview?.bundle?.chunks?.discordThreadText?.available
+      ? bundleSelectionState.includeDiscordThreadText !== false
+      : defaults.includeDiscordThreadText,
+    includeDiscordThreadImages: preview?.bundle?.chunks?.discordThreadImages?.available
+      ? bundleSelectionState.includeDiscordThreadImages !== false
+      : defaults.includeDiscordThreadImages,
     includePageText: preview?.bundle?.chunks?.pageText?.available
       ? bundleSelectionState.includePageText !== false
       : defaults.includePageText
@@ -689,6 +697,8 @@ function getContextOptionsForSend() {
     includeUrl: state.includeUrl !== false,
     includeMetadata: state.includeMetadata !== false,
     includeSelection: state.includeSelection !== false,
+    includeDiscordThreadText: state.includeDiscordThreadText !== false,
+    includeDiscordThreadImages: state.includeDiscordThreadImages !== false,
     includePageText: state.includePageText !== false
   };
 }
@@ -708,6 +718,12 @@ function listEnabledBundleChunks() {
   }
   if (chunks.selection?.available && state.includeSelection) {
     enabled.push(chunks.selection.label || "Selected text");
+  }
+  if (chunks.discordThreadText?.available && state.includeDiscordThreadText) {
+    enabled.push(chunks.discordThreadText.label || "Discord thread");
+  }
+  if (chunks.discordThreadImages?.available && state.includeDiscordThreadImages) {
+    enabled.push(chunks.discordThreadImages.label || "Discord thread images");
   }
   if (chunks.pageText?.available && state.includePageText) {
     enabled.push(chunks.pageText.label || "Page text");
@@ -1145,6 +1161,8 @@ function renderContextBundle() {
     { chunkKey: "url", stateKey: "includeUrl" },
     { chunkKey: "metadata", stateKey: "includeMetadata" },
     { chunkKey: "selection", stateKey: "includeSelection" },
+    { chunkKey: "discordThreadText", stateKey: "includeDiscordThreadText" },
+    { chunkKey: "discordThreadImages", stateKey: "includeDiscordThreadImages" },
     { chunkKey: "pageText", stateKey: "includePageText" },
     { chunkKey: "pdfImages", stateKey: null },
     { chunkKey: "transcript", stateKey: null }
