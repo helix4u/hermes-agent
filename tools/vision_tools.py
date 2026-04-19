@@ -367,9 +367,19 @@ async def vision_analyze_tool(
         if model:
             call_kwargs["model"] = model
         response = await async_call_llm(**call_kwargs)
-        
-        # Extract the analysis
-        analysis = response.choices[0].message.content.strip()
+
+        # Extract the analysis defensively. Some providers can complete the
+        # request successfully but still surface an empty visible message.
+        raw_analysis = getattr(response.choices[0].message, "content", "")
+        if isinstance(raw_analysis, str):
+            analysis = raw_analysis.strip()
+        elif raw_analysis is None:
+            analysis = ""
+        else:
+            analysis = str(raw_analysis).strip()
+
+        if not analysis:
+            raise RuntimeError("Vision model returned empty analysis content.")
         analysis_length = len(analysis)
         
         logger.info("Image analysis completed (%s characters)", analysis_length)

@@ -188,6 +188,8 @@ auxiliary:
   web_extract:
     provider: "auto"
     model: ""
+    timeout: 20                   # Per-call timeout for optional page summarization
+    max_retries: 2                # Keeps slow/failed summarizers from stalling web_extract
 
   compression:
     provider: "auto"
@@ -228,7 +230,7 @@ fallback_model:
   # base_url: http://localhost:8000/v1               # Optional custom endpoint
 ```
 
-All three — auxiliary, compression, fallback — work the same way: set `provider` to pick who handles the request, `model` to pick which model, and `base_url` to point at a custom endpoint (overrides provider).
+All three — auxiliary, compression, fallback — work the same way: set `provider` to pick who handles the request, `model` to pick which model, and `base_url` to point at a custom endpoint (overrides provider). `auxiliary.web_extract.timeout` and `auxiliary.web_extract.max_retries` additionally bound the post-extraction summarizer so slow providers do not leave `web_extract` hanging after the page content is already fetched.
 
 ### Provider Options for Auxiliary Tasks
 

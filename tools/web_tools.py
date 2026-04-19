@@ -55,6 +55,11 @@ from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_WEB_REQUEST_TIMEOUT = 20.0
+DEFAULT_WEB_EXTRACT_LLM_TIMEOUT = 20.0
+DEFAULT_WEB_EXTRACT_LLM_MAX_RETRIES = 2
+DEFAULT_WEB_EXTRACT_LLM_RETRY_DELAY = 2.0
+
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
 
@@ -75,6 +80,89 @@ def _load_archive_fallback_config() -> dict:
     web_cfg = _load_web_config()
     archive_cfg = web_cfg.get("archive_fallback", {})
     return archive_cfg if isinstance(archive_cfg, dict) else {}
+
+
+def _coerce_positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _coerce_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _get_web_request_timeout() -> float:
+    env_override = os.getenv("WEB_REQUEST_TIMEOUT", "").strip()
+    if env_override:
+        return _coerce_positive_float(env_override, DEFAULT_WEB_REQUEST_TIMEOUT)
+
+    web_cfg = _load_web_config()
+    return _coerce_positive_float(
+        web_cfg.get("request_timeout"),
+        DEFAULT_WEB_REQUEST_TIMEOUT,
+    )
+
+
+def _get_web_extract_llm_timeout() -> float:
+    env_override = os.getenv("AUXILIARY_WEB_EXTRACT_TIMEOUT", "").strip()
+    if env_override:
+        return _coerce_positive_float(env_override, DEFAULT_WEB_EXTRACT_LLM_TIMEOUT)
+
+    try:
+        from hermes_cli.config import load_config
+
+        auxiliary_cfg = load_config().get("auxiliary", {}).get("web_extract", {})
+    except (ImportError, Exception):
+        auxiliary_cfg = {}
+
+    if not isinstance(auxiliary_cfg, dict):
+        auxiliary_cfg = {}
+    return _coerce_positive_float(
+        auxiliary_cfg.get("timeout"),
+        DEFAULT_WEB_EXTRACT_LLM_TIMEOUT,
+    )
+
+
+def _get_web_extract_llm_max_retries() -> int:
+    env_override = os.getenv("AUXILIARY_WEB_EXTRACT_MAX_RETRIES", "").strip()
+    if env_override:
+        return _coerce_positive_int(env_override, DEFAULT_WEB_EXTRACT_LLM_MAX_RETRIES)
+
+    try:
+        from hermes_cli.config import load_config
+
+        auxiliary_cfg = load_config().get("auxiliary", {}).get("web_extract", {})
+    except (ImportError, Exception):
+        auxiliary_cfg = {}
+
+    if not isinstance(auxiliary_cfg, dict):
+        auxiliary_cfg = {}
+    return _coerce_positive_int(
+        auxiliary_cfg.get("max_retries"),
+        DEFAULT_WEB_EXTRACT_LLM_MAX_RETRIES,
+    )
+
+
+async def _firecrawl_call_with_timeout(method_name: str, **kwargs: Any) -> Any:
+    timeout = _get_web_request_timeout()
+    client = _get_firecrawl_client()
+    method = getattr(client, method_name)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(method, **kwargs),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(
+            f"Firecrawl {method_name} timed out after {timeout:.1f}s"
+        ) from exc
 
 
 def _normalize_archive_domains(value: Any) -> List[str]:
@@ -317,7 +405,9 @@ def _normalize_tavily_documents(response: dict, fallback_url: str = "") -> List[
     return documents
 
 
-DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION = 5000
+# Small/medium extracts are already manageable in-context and do not justify
+# an extra auxiliary-model roundtrip in gateway/browser flows.
+DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION = 12000
 
 # Allow per-task override via env var
 DEFAULT_SUMMARIZER_MODEL = os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
@@ -347,7 +437,7 @@ async def process_content_with_llm(
         url (str): The source URL (for context, optional)
         title (str): The page title (for context, optional)
         model (str): The model to use for processing (default: google/gemini-3-flash-preview)
-        min_length (int): Minimum content length to trigger processing (default: 5000)
+        min_length (int): Minimum content length to trigger processing (default: 12000)
         
     Returns:
         Optional[str]: Processed markdown content, or None if content too short or processing fails
@@ -471,9 +561,11 @@ Your goal is to preserve ALL important information while reducing length. Never 
 
 Create a markdown summary that captures all key information in a well-organized, scannable format. Include important quotes and code snippets in their original formatting. Focus on actionable information, specific details, and unique insights."""
 
-    # Call the LLM with retry logic
-    max_retries = 6
-    retry_delay = 2
+    # Keep web extraction responsive: if the auxiliary summarizer is unhealthy,
+    # return raw content instead of burning several minutes on retries.
+    max_retries = _get_web_extract_llm_max_retries()
+    retry_delay = DEFAULT_WEB_EXTRACT_LLM_RETRY_DELAY
+    timeout = _get_web_extract_llm_timeout()
     last_error = None
 
     for attempt in range(max_retries):
@@ -486,6 +578,7 @@ Create a markdown summary that captures all key information in a well-organized,
                 ],
                 "temperature": 0.1,
                 "max_tokens": max_tokens,
+                "timeout": timeout,
             }
             if model:
                 call_kwargs["model"] = model
@@ -907,7 +1000,7 @@ async def web_extract_tool(
         format (str): Desired output format ("markdown" or "html", optional)
         use_llm_processing (bool): Whether to process content with LLM for summarization (default: True)
         model (str): The model to use for LLM processing (default: google/gemini-3-flash-preview)
-        min_length (int): Minimum content length to trigger LLM processing (default: 5000)
+        min_length (int): Minimum content length to trigger LLM processing (default: 12000)
     
     Returns:
         str: JSON string containing extracted content. If LLM processing is enabled and successful,
@@ -996,7 +1089,8 @@ async def web_extract_tool(
 
                         try:
                             logger.info("Scraping: %s", attempt_url)
-                            scrape_result = _get_firecrawl_client().scrape(
+                            scrape_result = await _firecrawl_call_with_timeout(
+                                "scrape",
                                 url=attempt_url,
                                 formats=formats
                             )
@@ -1041,8 +1135,20 @@ async def web_extract_tool(
                             final_blocked = check_website_access(final_url)
                             if final_blocked:
                                 logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
-                                final_error = final_blocked["message"]
-                                continue
+                                results.append({
+                                    "url": final_url,
+                                    "title": title,
+                                    "content": "",
+                                    "raw_content": "",
+                                    "error": final_blocked["message"],
+                                    "blocked_by_policy": {
+                                        "host": final_blocked["host"],
+                                        "rule": final_blocked["rule"],
+                                        "source": final_blocked["source"],
+                                    },
+                                })
+                                final_error = ""
+                                break
 
                             chosen_content = content_markdown if (format == "markdown" or (format is None and content_markdown)) else content_html or content_markdown or ""
                             used_archive = attempt_url != url
@@ -1229,7 +1335,7 @@ async def web_crawl_tool(
         depth (str): Depth of extraction ("basic" or "advanced", default: "basic")
         use_llm_processing (bool): Whether to process content with LLM for summarization (default: True)
         model (str): The model to use for LLM processing (default: google/gemini-3-flash-preview)
-        min_length (int): Minimum content length to trigger LLM processing (default: 5000)
+        min_length (int): Minimum content length to trigger LLM processing (default: 12000)
     
     Returns:
         str: JSON string containing crawled content. If LLM processing is enabled and successful,
@@ -1390,7 +1496,8 @@ async def web_crawl_tool(
             return json.dumps({"error": "Interrupted", "success": False})
 
         try:
-            crawl_result = _get_firecrawl_client().crawl(
+            crawl_result = await _firecrawl_call_with_timeout(
+                "crawl",
                 url=url,
                 **crawl_params
             )

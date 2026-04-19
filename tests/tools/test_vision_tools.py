@@ -303,6 +303,31 @@ class TestErrorLoggingExcInfo:
             assert any(r.exc_info and r.exc_info[0] is not None for r in error_records)
 
     @pytest.mark.asyncio
+    async def test_empty_model_content_fails_cleanly(self, tmp_path):
+        """A provider returning None content should not crash with AttributeError."""
+        img = tmp_path / "sidecar_test.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+
+        mock_response = MagicMock()
+        mock_choice = MagicMock()
+        mock_choice.message.content = None
+        mock_response.choices = [mock_choice]
+
+        with (
+            patch("tools.vision_tools._image_to_base64_data_url", return_value="data:image/png;base64,abc"),
+            patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response),
+        ):
+            result = await vision_analyze_tool(
+                str(img),
+                "describe this",
+                "test/model",
+            )
+
+        data = json.loads(result)
+        assert data["success"] is False
+        assert "empty analysis content" in data["error"].lower()
+
+    @pytest.mark.asyncio
     async def test_cleanup_error_logs_exc_info(self, tmp_path, caplog):
         """Temp file cleanup failure should log warning with exc_info."""
         # Create a real temp file that will be "downloaded"

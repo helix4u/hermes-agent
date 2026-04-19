@@ -1391,6 +1391,7 @@ The `web_search`, `web_extract`, and `web_crawl` tools support three backend pro
 ```yaml
 web:
   backend: firecrawl    # firecrawl | parallel | tavily
+  request_timeout: 20   # Seconds before Firecrawl extract/crawl calls fail fast
 ```
 
 | Backend | Env Var | Search | Extract | Crawl |
@@ -1404,6 +1405,8 @@ web:
 **Self-hosted Firecrawl:** Set `FIRECRAWL_API_URL` to point at your own instance. When a custom URL is set, the API key becomes optional (set `USE_DB_AUTHENTICATION=false` on the server to disable auth).
 
 **Parallel search modes:** Set `PARALLEL_SEARCH_MODE` to control search behavior — `fast`, `one-shot`, or `agentic` (default: `agentic`).
+
+**Slow extract protection:** `web.request_timeout` caps the Firecrawl request itself, while `auxiliary.web_extract.timeout` and `auxiliary.web_extract.max_retries` cap the optional post-extraction LLM summarization path so `web_extract` returns raw content or a clear timeout instead of hanging for minutes.
 
 ## Browser
 

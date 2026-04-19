@@ -159,6 +159,7 @@ class _CodexCompletionsAdapter:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
         temperature = kwargs.get("temperature")
+        timeout = kwargs.get("timeout")
 
         # Separate system/instructions from conversation messages.
         # Convert chat.completions multimodal content blocks to Responses
@@ -182,6 +183,8 @@ class _CodexCompletionsAdapter:
             "input": input_msgs or [{"role": "user", "content": ""}],
             "store": False,
         }
+        if timeout is not None:
+            resp_kwargs["timeout"] = timeout
 
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
@@ -206,14 +209,39 @@ class _CodexCompletionsAdapter:
 
         # Stream and collect the response
         text_parts: List[str] = []
+        streamed_text_parts: List[str] = []
+        collected_output_items: List[Any] = []
         tool_calls_raw: List[Any] = []
         usage = None
 
         try:
             with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
-                    pass
+                for event in stream:
+                    event_type = getattr(event, "type", "")
+                    if event_type == "response.output_item.done":
+                        done_item = getattr(event, "item", None)
+                        if done_item is not None:
+                            collected_output_items.append(done_item)
+                    elif event_type == "response.output_text.delta" or "output_text.delta" in event_type:
+                        delta_text = getattr(event, "delta", "")
+                        if isinstance(delta_text, str) and delta_text:
+                            streamed_text_parts.append(delta_text)
                 final = stream.get_final_response()
+
+            output_items = getattr(final, "output", None)
+            if isinstance(output_items, list) and not output_items:
+                if collected_output_items:
+                    final.output = list(collected_output_items)
+                elif streamed_text_parts:
+                    assembled = "".join(streamed_text_parts)
+                    final.output = [
+                        SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text=assembled)],
+                        )
+                    ]
 
             # Extract text and tool calls from the Responses output
             for item in getattr(final, "output", []):
@@ -244,7 +272,14 @@ class _CodexCompletionsAdapter:
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
             raise
 
-        content = "".join(text_parts).strip() or None
+        content = "".join(text_parts).strip()
+        if not content and hasattr(final, "output_text"):
+            output_text = getattr(final, "output_text", "")
+            if isinstance(output_text, str):
+                content = output_text.strip()
+        if not content and streamed_text_parts:
+            content = "".join(streamed_text_parts).strip()
+        content = content or None
 
         # Build a response that looks like chat.completions
         message = SimpleNamespace(

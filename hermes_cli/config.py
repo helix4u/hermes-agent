@@ -170,6 +170,7 @@ DEFAULT_CONFIG = {
 
     "web": {
         "backend": "",
+        "request_timeout": 20,
         "archive_fallback": {
             "enabled": False,
             "service": "archive.today",
@@ -223,6 +224,8 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
+            "timeout": 20,
+            "max_retries": 2,
         },
         "compression": {
             "provider": "auto",
@@ -421,7 +424,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 12,
+    "_config_version": 13,
 }
 
 # =============================================================================

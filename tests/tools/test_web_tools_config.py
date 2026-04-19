@@ -8,7 +8,9 @@ Coverage:
   check_web_api_key() — unified availability check.
 """
 
+import json
 import os
+import time
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -329,3 +331,106 @@ class TestCheckWebApiKey:
         }):
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
+
+
+class TestWebTimeoutConfig:
+    """Test suite for configurable web timeouts and retry budgets."""
+
+    def test_web_request_timeout_comes_from_config(self):
+        from tools.web_tools import _get_web_request_timeout
+
+        with patch(
+            "tools.web_tools._load_web_config",
+            return_value={"request_timeout": 42},
+        ):
+            assert _get_web_request_timeout() == 42.0
+
+    def test_web_request_timeout_env_override_wins(self):
+        from tools.web_tools import _get_web_request_timeout
+
+        with patch.dict(os.environ, {"WEB_REQUEST_TIMEOUT": "7.5"}):
+            with patch(
+                "tools.web_tools._load_web_config",
+                return_value={"request_timeout": 42},
+            ):
+                assert _get_web_request_timeout() == 7.5
+
+    def test_web_extract_llm_timeout_and_retries_come_from_config(self):
+        from tools.web_tools import (
+            _get_web_extract_llm_max_retries,
+            _get_web_extract_llm_timeout,
+        )
+
+        config = {
+            "auxiliary": {
+                "web_extract": {
+                    "timeout": 18,
+                    "max_retries": 3,
+                }
+            }
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=config):
+            assert _get_web_extract_llm_timeout() == 18.0
+            assert _get_web_extract_llm_max_retries() == 3
+
+
+@pytest.mark.asyncio
+async def test_web_extract_times_out_slow_firecrawl_scrape(monkeypatch):
+    from tools import web_tools
+
+    class SlowFirecrawlClient:
+        def scrape(self, url, formats):
+            time.sleep(0.05)
+            return {"markdown": "late result", "metadata": {"sourceURL": url}}
+
+    monkeypatch.setattr(web_tools, "is_safe_url", lambda url: True)
+    monkeypatch.setattr(web_tools, "check_website_access", lambda url: None)
+    monkeypatch.setattr(web_tools, "_get_firecrawl_client", lambda: SlowFirecrawlClient())
+    monkeypatch.setattr(web_tools, "_get_web_request_timeout", lambda: 0.01)
+    monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+    result = json.loads(
+        await web_tools.web_extract_tool(
+            ["https://example.com"],
+            use_llm_processing=False,
+        )
+    )
+
+    assert "timed out" in result["results"][0]["error"].lower()
+    assert result["results"][0]["url"] == "https://example.com"
+
+
+@pytest.mark.asyncio
+async def test_web_extract_llm_retry_budget_is_bounded(monkeypatch):
+    from tools import web_tools
+
+    calls = []
+
+    async def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        raise TimeoutError("llm timeout")
+
+    async def fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(web_tools, "async_call_llm", fake_call_llm)
+    monkeypatch.setattr(web_tools, "_get_web_extract_llm_timeout", lambda: 9.0)
+    monkeypatch.setattr(web_tools, "_get_web_extract_llm_max_retries", lambda: 2)
+    monkeypatch.setattr(web_tools.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(TimeoutError, match="llm timeout"):
+        await web_tools._call_summarizer_llm("content", "", None)
+
+    assert len(calls) == 2
+    assert all(call["timeout"] == 9.0 for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_process_content_with_llm_skips_medium_content_by_default():
+    from tools.web_tools import process_content_with_llm
+
+    content = "x" * 8500
+    result = await process_content_with_llm(content)
+
+    assert result is None

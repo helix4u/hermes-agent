@@ -7,6 +7,12 @@ from gateway import status
 
 
 class TestGatewayPidState:
+    def test_windows_process_helpers_skip_procfs(self, monkeypatch):
+        monkeypatch.setattr(status.os, "name", "nt", raising=False)
+
+        assert status._get_process_start_time(12345) is None
+        assert status._read_process_cmdline(12345) is None
+
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

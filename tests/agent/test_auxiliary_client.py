@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -18,6 +19,24 @@ from agent.auxiliary_client import (
     _resolve_forced_provider,
     _resolve_auto,
 )
+
+
+class _FakeResponsesStream:
+    def __init__(self, events, final_response):
+        self._events = list(events)
+        self._final_response = final_response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        return iter(self._events)
+
+    def get_final_response(self):
+        return self._final_response
 
 
 @pytest.fixture(autouse=True)
@@ -734,6 +753,52 @@ class TestVisionClientFallback:
         from agent.auxiliary_client import CodexAuxiliaryClient
         assert isinstance(client, CodexAuxiliaryClient)
         assert model == "gpt-5.4"
+
+
+class TestCodexAuxiliaryResponsesAdapter:
+    def test_codex_adapter_backfills_output_from_done_events(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        done_item = SimpleNamespace(
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="done event text")],
+        )
+        stream_calls = {}
+        mock_client = MagicMock()
+        mock_client.responses.stream.side_effect = lambda **kwargs: (
+            stream_calls.setdefault("kwargs", kwargs) or True
+        ) and _FakeResponsesStream(
+            events=[SimpleNamespace(type="response.output_item.done", item=done_item)],
+            final_response=SimpleNamespace(output=[], usage=None),
+        )
+
+        adapter = _CodexCompletionsAdapter(mock_client, "gpt-5.4")
+        response = adapter.create(
+            messages=[{"role": "user", "content": "hello"}],
+            timeout=12.5,
+        )
+
+        assert response.choices[0].message.content == "done event text"
+        assert stream_calls["kwargs"]["timeout"] == 12.5
+
+    def test_codex_adapter_synthesizes_output_from_text_deltas(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        mock_client = MagicMock()
+        mock_client.responses.stream.return_value = _FakeResponsesStream(
+            events=[
+                SimpleNamespace(type="response.output_text.delta", delta="hello "),
+                SimpleNamespace(type="response.output_text.delta", delta="world"),
+            ],
+            final_response=SimpleNamespace(output=[], usage=None),
+        )
+
+        adapter = _CodexCompletionsAdapter(mock_client, "gpt-5.4")
+        response = adapter.create(messages=[{"role": "user", "content": "hello"}])
+
+        assert response.choices[0].message.content == "hello world"
 
 
 class TestGetAuxiliaryProvider:
